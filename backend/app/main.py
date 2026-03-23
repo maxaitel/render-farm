@@ -24,6 +24,7 @@ FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 INSPECT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 INSPECT_SESSION_MAX_AGE_SECONDS = 60 * 60
+INSPECT_SESSION_CLEANUP_INTERVAL_SECONDS = 5 * 60
 
 
 class AppState:
@@ -33,6 +34,7 @@ class AppState:
         self.runner = runner
         self.queue = queue
         self.worker_task: asyncio.Task[None] | None = None
+        self.inspect_cleanup_task: asyncio.Task[None] | None = None
 
 
 def sanitize_filename(filename: str) -> str:
@@ -132,6 +134,15 @@ async def worker_loop(state: AppState) -> None:
             state.queue.task_done()
 
 
+async def inspect_session_cleanup_loop(
+    settings: Settings,
+    interval_seconds: int = INSPECT_SESSION_CLEANUP_INTERVAL_SECONDS,
+) -> None:
+    while True:
+        cleanup_expired_inspect_sessions(settings)
+        await asyncio.sleep(interval_seconds)
+
+
 def mark_internal_failure(job: JobRecord, message: str) -> None:
     job.phase = JobPhase.failed
     job.finished_at = utc_now()
@@ -154,6 +165,7 @@ async def lifespan(app: FastAPI):
     state = AppState(settings, store, runner, queue)
     if not settings.disable_worker:
         state.worker_task = asyncio.create_task(worker_loop(state))
+    state.inspect_cleanup_task = asyncio.create_task(inspect_session_cleanup_loop(settings))
     app.state.runtime = state
     try:
         yield
@@ -162,6 +174,12 @@ async def lifespan(app: FastAPI):
             state.worker_task.cancel()
             try:
                 await state.worker_task
+            except asyncio.CancelledError:
+                pass
+        if state.inspect_cleanup_task:
+            state.inspect_cleanup_task.cancel()
+            try:
+                await state.inspect_cleanup_task
             except asyncio.CancelledError:
                 pass
         await store.close()
@@ -413,16 +431,21 @@ async def create_jobs_from_upload(
     for job in jobs[1:]:
         link_or_copy_file(first_source_path, Path(job.source_path))
 
-    snapshots: list[dict] = []
-    for job in jobs:
-        snapshot = await state.store.create(job)
-        state.queue.put_nowait(job.id)
-        snapshots.append(snapshot.model_dump(mode="json"))
+    job_roots = [state.settings.jobs_root / job.id for job in jobs]
+    try:
+        snapshots = await state.store.create_many(jobs)
+    except Exception:
+        for job_root in job_roots:
+            shutil.rmtree(job_root, ignore_errors=True)
+        raise
+
+    for snapshot in snapshots:
+        state.queue.put_nowait(snapshot.id)
 
     if session_root is not None:
         assert validated_inspect_token is not None
         delete_inspect_session(state.settings, validated_inspect_token)
-    return snapshots
+    return [snapshot.model_dump(mode="json") for snapshot in snapshots]
 
 
 @app.get("/api/jobs/{job_id}/download")

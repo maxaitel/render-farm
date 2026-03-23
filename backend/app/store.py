@@ -86,12 +86,17 @@ class JobStore:
             return job.model_copy(deep=True) if job else None
 
     async def create(self, job: JobRecord) -> JobRecord:
+        return (await self.create_many([job]))[0]
+
+    async def create_many(self, jobs: list[JobRecord]) -> list[JobRecord]:
+        snapshots = [job.model_copy(deep=True) for job in jobs]
+        await self._persist_many(snapshots)
         async with self._lock:
-            self._jobs[job.id] = job
-            snapshot = job.model_copy(deep=True)
-        await self._persist(snapshot)
-        await self._broadcast(snapshot)
-        return snapshot
+            for job, snapshot in zip(jobs, snapshots, strict=True):
+                self._jobs[job.id] = job
+        for snapshot in snapshots:
+            await self._broadcast(snapshot)
+        return snapshots
 
     async def mutate(self, job_id: str, mutator: Mutator) -> JobRecord:
         async with self._lock:
@@ -162,7 +167,29 @@ class JobStore:
         async with self._db_lock:
             await asyncio.to_thread(self._persist_sync, snapshot)
 
+    async def _persist_many(self, snapshots: list[JobRecord]) -> None:
+        if self._conn is None:
+            raise RuntimeError("JobStore database is not initialized.")
+
+        async with self._db_lock:
+            await asyncio.to_thread(self._persist_many_sync, snapshots)
+
     def _persist_sync(self, snapshot: JobRecord) -> None:
+        if self._conn is None:
+            raise RuntimeError("JobStore database is not initialized.")
+
+        with self._conn:
+            self._write_job_sync(snapshot)
+
+    def _persist_many_sync(self, snapshots: list[JobRecord]) -> None:
+        if self._conn is None:
+            raise RuntimeError("JobStore database is not initialized.")
+
+        with self._conn:
+            for snapshot in snapshots:
+                self._write_job_sync(snapshot)
+
+    def _write_job_sync(self, snapshot: JobRecord) -> None:
         if self._conn is None:
             raise RuntimeError("JobStore database is not initialized.")
 
@@ -187,7 +214,6 @@ class JobStore:
                 json.dumps(payload, indent=2),
             ),
         )
-        self._conn.commit()
 
     async def _import_legacy_jobs(self) -> None:
         if self._conn is None:

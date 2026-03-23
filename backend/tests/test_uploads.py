@@ -7,10 +7,11 @@ import sqlite3
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.main import app
+from app.main import app, inspect_session_cleanup_loop
 from app.models import JobRecord, RenderDevice, RenderMode, OutputFormat, utc_now
 from app.renderer import RenderRunner
 from app.store import JobStore
@@ -275,17 +276,10 @@ def test_saved_inspection_upload_is_kept_when_batch_job_creation_fails(tmp_path:
         )
 
         with TestClient(app, raise_server_exceptions=False) as client:
-            original_create = client.app.state.runtime.store.create
-            create_calls = 0
+            async def flaky_create_many(jobs: list[JobRecord]) -> list[JobRecord]:
+                raise RuntimeError("database write failed")
 
-            async def flaky_create(job: JobRecord) -> JobRecord:
-                nonlocal create_calls
-                create_calls += 1
-                if create_calls == 2:
-                    raise RuntimeError("database write failed")
-                return await original_create(job)
-
-            client.app.state.runtime.store.create = flaky_create
+            client.app.state.runtime.store.create_many = flaky_create_many
             response = client.post(
                 "/api/jobs/batch",
                 files=[
@@ -301,6 +295,58 @@ def test_saved_inspection_upload_is_kept_when_batch_job_creation_fails(tmp_path:
         assert inspect_root.exists()
     finally:
         _restore_env(previous)
+
+
+def test_store_create_many_is_atomic(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = JobStore(tmp_path / "renderfarm.sqlite3")
+        await store.load()
+        first_job = JobRecord(
+            id="job-a",
+            source_filename="scene.blend",
+            source_path=str(tmp_path / "jobs" / "job-a" / "input" / "scene.blend"),
+            output_directory=str(tmp_path / "jobs" / "job-a" / "outputs"),
+            render_mode=RenderMode.still,
+            output_format=OutputFormat.png,
+            requested_device=RenderDevice.auto,
+            frame=1,
+            total_frames=1,
+        )
+        second_job = JobRecord(
+            id="job-b",
+            source_filename="scene.blend",
+            source_path=str(tmp_path / "jobs" / "job-b" / "input" / "scene.blend"),
+            output_directory=str(tmp_path / "jobs" / "job-b" / "outputs"),
+            render_mode=RenderMode.still,
+            output_format=OutputFormat.png,
+            requested_device=RenderDevice.auto,
+            frame=1,
+            total_frames=1,
+        )
+        original_write_job_sync = store._write_job_sync
+        write_calls = 0
+
+        def flaky_write_job_sync(snapshot: JobRecord) -> None:
+            nonlocal write_calls
+            write_calls += 1
+            original_write_job_sync(snapshot)
+            if write_calls == 2:
+                raise sqlite3.OperationalError("disk I/O error")
+
+        store._write_job_sync = flaky_write_job_sync
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                await store.create_many([first_job, second_job])
+
+            assert await store.list_jobs() == []
+            conn = sqlite3.connect(tmp_path / "renderfarm.sqlite3")
+            count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            conn.close()
+            assert count == 0
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
 
 
 def test_release_blend_inspection_deletes_saved_upload(tmp_path: Path) -> None:
@@ -459,6 +505,45 @@ def test_expired_inspection_upload_is_reaped_on_next_scan(tmp_path: Path) -> Non
         assert not expired_root.exists()
     finally:
         _restore_env(previous)
+
+
+def test_inspect_session_cleanup_loop_reaps_expired_uploads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expired_root = tmp_path / "tmp" / "inspect" / "expiredtoken"
+    source_dir = expired_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "stale.blend").write_bytes(b"stale")
+    session_path = expired_root / "session.json"
+    session_path.write_text(
+        json.dumps(
+            {
+                "source_filename": "stale.blend",
+                "source_path": str(source_dir / "stale.blend"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    old_timestamp = time.time() - (2 * 60 * 60)
+    os.utime(expired_root, (old_timestamp, old_timestamp))
+    os.utime(session_path, (old_timestamp, old_timestamp))
+
+    async def cancel_after_first_iteration(_seconds: int) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.main.asyncio.sleep", cancel_after_first_iteration)
+    settings = Settings(
+        storage_root=tmp_path,
+        blender_binary="/bin/true",
+        default_device="AUTO",
+        gpu_order=["CPU"],
+        disable_worker=True,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(inspect_session_cleanup_loop(settings, interval_seconds=1))
+
+    assert not expired_root.exists()
 
 
 def test_existing_job_json_is_imported_into_sqlite(tmp_path: Path) -> None:
