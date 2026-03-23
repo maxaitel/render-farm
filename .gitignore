@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+.next/
+dist/
+build/
+
+# Python cache and virtualenvs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.pytest_cache/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Local Blender source/build artifacts
+backend/.blender-build_release_headless/
+backend/.blender-dist/
+backend/.blender-src/
+
+# Runtime job data
+data/*
+!data/.gitkeep

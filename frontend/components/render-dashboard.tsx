@@ -1,0 +1,760 @@
+"use client";
+
+import Image from "next/image";
+import type { FormEvent, ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  ChevronDown,
+  Cpu,
+  Download,
+  Server,
+  SquareTerminal,
+} from "lucide-react";
+
+import { fetchJobs, fetchSystemStatus, submitJobWithProgress } from "@/lib/api";
+import type { RenderJob, RenderMode, SystemStatus } from "@/lib/types";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
+import logoMark from "../public/logo.png";
+
+type JobFormState = {
+  renderMode: RenderMode;
+  frame: number;
+  startFrame: number;
+  endFrame: number;
+  outputFormat: "PNG" | "JPEG" | "OPEN_EXR";
+  devicePreference: "AUTO" | "CUDA" | "OPTIX" | "CPU";
+};
+
+const INITIAL_FORM: JobFormState = {
+  renderMode: "still",
+  frame: 1,
+  startFrame: 1,
+  endFrame: 24,
+  outputFormat: "PNG",
+  devicePreference: "AUTO",
+};
+
+function upsertJob(list: RenderJob[], nextJob: RenderJob) {
+  const without = list.filter((job) => job.id !== nextJob.id);
+  return [nextJob, ...without].sort(
+    (left, right) =>
+      new Date(right.created_at).getTime() -
+      new Date(left.created_at).getTime(),
+  );
+}
+
+function formatTimestamp(value: string | null) {
+  if (!value) {
+    return "Pending";
+  }
+  return new Date(value).toLocaleString();
+}
+
+function frameLabel(job: RenderJob) {
+  if (job.render_mode === "still") {
+    return `Frame ${job.frame ?? 1}`;
+  }
+  return `Frames ${job.start_frame ?? 1}-${job.end_frame ?? job.start_frame ?? 1}`;
+}
+
+function outputLabel(job: RenderJob) {
+  if (!job.outputs.length) {
+    return "No outputs yet";
+  }
+  return `${job.outputs.length} file${job.outputs.length === 1 ? "" : "s"} ready`;
+}
+
+function activePhase(job: RenderJob) {
+  return job.phase === "queued" || job.phase === "running";
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024 * 1024) {
+    return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  }
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function deviceSummary(system: SystemStatus | null) {
+  if (!system) {
+    return "Loading";
+  }
+
+  return [
+    system.cycles_devices.cuda.length
+      ? `CUDA ${system.cycles_devices.cuda.length}`
+      : null,
+    system.cycles_devices.optix.length
+      ? `OptiX ${system.cycles_devices.optix.length}`
+      : null,
+    system.cycles_devices.hip.length
+      ? `HIP ${system.cycles_devices.hip.length}`
+      : null,
+    system.cycles_devices.cpu.length
+      ? `CPU ${system.cycles_devices.cpu.length}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" • ");
+}
+
+function liveDetail(job: RenderJob) {
+  if (job.render_mode === "animation" && job.current_frame) {
+    return `Frame ${job.current_frame} of ${job.total_frames}`;
+  }
+
+  if (job.current_sample !== null && job.total_samples) {
+    return `Sample ${job.current_sample} of ${job.total_samples}`;
+  }
+
+  return job.resolved_device
+    ? `Running on ${job.resolved_device}`
+    : "Waiting for worker";
+}
+
+export function RenderDashboard() {
+  const [jobs, setJobs] = useState<RenderJob[]>([]);
+  const [system, setSystem] = useState<SystemStatus | null>(null);
+  const [form, setForm] = useState<JobFormState>(INITIAL_FORM);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const sourcesRef = useRef<Map<string, EventSource>>(new Map());
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      try {
+        const [systemPayload, jobsPayload] = await Promise.all([
+          fetchSystemStatus(),
+          fetchJobs(),
+        ]);
+        if (cancelled) {
+          return;
+        }
+        setSystem(systemPayload);
+        setJobs(jobsPayload);
+        setError(null);
+      } catch (loadError) {
+        if (!cancelled) {
+          setError(
+            loadError instanceof Error
+              ? loadError.message
+              : "Failed to load dashboard.",
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+
+    void load();
+    const intervalId = window.setInterval(() => {
+      void fetchSystemStatus()
+        .then(setSystem)
+        .catch(() => undefined);
+      void fetchJobs()
+        .then(setJobs)
+        .catch(() => undefined);
+    }, 15000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      sourcesRef.current.forEach((source) => source.close());
+      sourcesRef.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    const activeIds = new Set(jobs.filter(activePhase).map((job) => job.id));
+
+    sourcesRef.current.forEach((source, jobId) => {
+      if (!activeIds.has(jobId)) {
+        source.close();
+        sourcesRef.current.delete(jobId);
+      }
+    });
+
+    activeIds.forEach((jobId) => {
+      if (sourcesRef.current.has(jobId)) {
+        return;
+      }
+      const source = new EventSource(`backend/api/jobs/${jobId}/events`);
+      source.onmessage = (event) => {
+        const payload = JSON.parse(event.data) as RenderJob;
+        setJobs((current) => upsertJob(current, payload));
+      };
+      source.onerror = () => {
+        source.close();
+        sourcesRef.current.delete(jobId);
+      };
+      sourcesRef.current.set(jobId, source);
+    });
+  }, [jobs]);
+
+  const stats = useMemo(() => {
+    const running = jobs.filter((job) => job.phase === "running").length;
+    const queued = jobs.filter((job) => job.phase === "queued").length;
+    const completed = jobs.filter((job) => job.phase === "completed").length;
+    return { running, queued, completed };
+  }, [jobs]);
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedFile) {
+      setError("Choose a .blend file first.");
+      return;
+    }
+
+    const payload = new FormData();
+    payload.set("blend_file", selectedFile);
+    payload.set("render_mode", form.renderMode);
+    payload.set("output_format", form.outputFormat);
+    payload.set("device_preference", form.devicePreference);
+    if (form.renderMode === "still") {
+      payload.set("frame", String(form.frame));
+    } else {
+      payload.set("start_frame", String(form.startFrame));
+      payload.set("end_frame", String(form.endFrame));
+    }
+
+    setSubmitting(true);
+    setUploadProgress(0);
+    setError(null);
+    try {
+      const job = await submitJobWithProgress(payload, setUploadProgress);
+      setJobs((current) => upsertJob(current, job));
+      setSelectedFile(null);
+      setForm(INITIAL_FORM);
+      const fileInput = document.getElementById(
+        "blend-file",
+      ) as HTMLInputElement | null;
+      if (fileInput) {
+        fileInput.value = "";
+      }
+    } catch (submitError) {
+      setError(
+        submitError instanceof Error
+          ? submitError.message
+          : "Failed to queue render.",
+      );
+    } finally {
+      setSubmitting(false);
+      setUploadProgress(0);
+    }
+  }
+
+  const uploadStageLabel =
+    uploadProgress >= 100
+      ? "Upload complete. Registering render job."
+      : "Uploading blend file to the render host.";
+
+  return (
+    <main className="min-h-screen bg-paper text-ink">
+      <div className="mx-auto max-w-7xl px-4 py-4 sm:px-6 lg:px-8 lg:py-8">
+        <section className="dashboard-shell soft-surface overflow-hidden rounded-[2rem] border border-line p-4 shadow-panel md:p-6">
+          <div className="grid gap-6 xl:grid-cols-[minmax(0,1.25fr)_380px]">
+            <div className="space-y-6">
+              <section className="overflow-hidden rounded-[1.85rem] border border-line bg-white text-ink">
+                <div className="relative px-5 py-5 md:px-8 md:py-7">
+                  <div className="absolute inset-y-0 right-0 w-full bg-[radial-gradient(circle_at_top_right,rgba(207,32,46,0.08),transparent_34%)]" />
+                  <div className="relative z-10">
+                    <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                      <div>
+                        <Image
+                          alt="University of Canterbury logo"
+                          className="h-12 w-auto object-contain md:h-[3.4rem]"
+                          priority
+                          src={logoMark}
+                          unoptimized
+                          width={180}
+                          height={56}
+                        />
+                        <p className="eyebrow mt-3 text-steel">
+                          University of Canterbury
+                        </p>
+                      </div>
+                    </div>
+                    <div className="mt-3 grid gap-5 lg:grid-cols-[minmax(0,1fr)_17rem] lg:items-center">
+                      <div className="max-w-[34rem]">
+                        <h1 className="max-w-[8.5ch] font-display text-[2.15rem] leading-[0.95] tracking-[0] sm:text-[2.8rem] xl:text-[3.2rem]">
+                          Render Farm
+                        </h1>
+                      </div>
+                      <div className="rounded-[1.35rem] border border-line bg-mist p-5 lg:justify-self-end">
+                        <p className="font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
+                          Live Summary
+                        </p>
+                        <p className="mt-4 text-sm leading-6 text-ink">
+                          {loading
+                            ? "Syncing queue and system status."
+                            : `${jobs.length} job${jobs.length === 1 ? "" : "s"} tracked across the queue.`}
+                        </p>
+                        <p className="mt-4 font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
+                          {deviceSummary(system)}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="mt-7 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                      <Metric label="Running" value={String(stats.running)} />
+                      <Metric label="Queued" value={String(stats.queued)} />
+                      <Metric label="Finished" value={String(stats.completed)} />
+                      <Metric
+                        label="Workers"
+                        value={String(system?.active_jobs ?? 0)}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section className="space-y-4">
+                <div className="flex items-end justify-between gap-4 px-1">
+                  <div>
+                    <p className="eyebrow">Queue</p>
+                    <h2 className="mt-3 font-subheading text-[2rem] leading-[1.02] tracking-[-0.02em] sm:text-[2.35rem]">
+                      Active Jobs
+                    </h2>
+                  </div>
+                  <span className="font-subheading text-xs uppercase tracking-[0.08em] text-steel">
+                    {loading ? "Syncing" : `${jobs.length} total`}
+                  </span>
+                </div>
+
+                {jobs.length === 0 && !loading ? (
+                  <Card className="bg-mist">
+                    <p className="font-subheading text-[2rem] leading-[1.02] tracking-[-0.02em]">
+                      Queue is empty.
+                    </p>
+                    <p className="mt-3 max-w-md text-sm leading-6 text-steel">
+                      Submit a scene from the right-hand panel and it will show
+                      up here with progress, logs, and download access.
+                    </p>
+                  </Card>
+                ) : null}
+
+                {jobs.map((job) => (
+                  <Card className="space-y-5 overflow-hidden" key={job.id}>
+                    <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-3">
+                          <Badge phase={job.phase} />
+                          <p className="min-w-0 truncate font-subheading text-lg tracking-[0.005em] text-ink md:text-xl">
+                            {job.source_filename}
+                          </p>
+                        </div>
+                        <div className="mt-3 flex flex-wrap gap-x-5 gap-y-2 text-sm text-steel">
+                          <span>{frameLabel(job)}</span>
+                          <span>{job.output_format}</span>
+                          <span>Requested {job.requested_device}</span>
+                          <span>{liveDetail(job)}</span>
+                        </div>
+                      </div>
+
+                      {job.archive_path ? (
+                        <a href={`backend/api/jobs/${job.id}/download`}>
+                          <Button variant="secondary">
+                            <Download className="mr-2 h-4 w-4" />
+                            Download
+                          </Button>
+                        </a>
+                      ) : null}
+                    </div>
+
+                    <div>
+                      <div className="mb-2 flex items-center justify-between gap-4 text-sm text-steel">
+                        <span className="truncate">{job.status_message}</span>
+                        <span className="font-subheading text-xs uppercase tracking-[0.08em] text-ink">
+                          {Math.round(job.progress)}%
+                        </span>
+                      </div>
+                      <Progress value={job.progress} />
+                    </div>
+
+                    <div className="grid gap-3 md:grid-cols-4">
+                      <MetaBlock
+                        label="Created"
+                        value={formatTimestamp(job.created_at)}
+                      />
+                      <MetaBlock
+                        label="Started"
+                        value={formatTimestamp(job.started_at)}
+                      />
+                      <MetaBlock label="Outputs" value={outputLabel(job)} />
+                      <MetaBlock
+                        label="Device"
+                        value={job.resolved_device ?? "Pending"}
+                      />
+                    </div>
+
+                    {job.logs_tail.length ? (
+                      <details className="group rounded-[1.25rem] border border-line bg-mist px-4 py-3">
+                        <summary className="flex cursor-pointer items-center justify-between gap-3 font-subheading text-xs uppercase tracking-[0.08em] text-ink">
+                          Recent log lines
+                          <ChevronDown className="h-4 w-4 text-steel transition-transform duration-200 group-open:rotate-180" />
+                        </summary>
+                        <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-[1rem] bg-[#16181b] p-4 text-xs leading-6 text-[#dae4ea]">
+                          {job.logs_tail.slice(-8).join("\n")}
+                        </pre>
+                      </details>
+                    ) : null}
+
+                    {job.error ? (
+                      <div className="rounded-[1rem] border border-[#e7c6c6] bg-[#fff5f5] px-4 py-3 text-sm text-[#8e3535]">
+                        {job.error}
+                      </div>
+                    ) : null}
+                  </Card>
+                ))}
+              </section>
+            </div>
+
+            <aside className="space-y-4">
+              <Card>
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="eyebrow">New Job</p>
+                    <h2 className="mt-3 font-subheading text-[1.8rem] leading-[1.02] tracking-[-0.02em] sm:text-[2rem]">
+                      Submit Render
+                    </h2>
+                  </div>
+                </div>
+
+                <form className="mt-8 space-y-5" onSubmit={handleSubmit}>
+                  <Label title="Blend file">
+                    <input
+                      id="blend-file"
+                      accept=".blend"
+                      className="block w-full rounded-[1rem] border border-dashed border-line bg-white px-4 py-4 text-sm text-ink outline-none transition file:mr-4 file:rounded-full file:border-0 file:bg-ember file:px-4 file:py-2 file:text-sm file:font-semibold file:tracking-[0] file:text-white hover:border-ember/30 focus:border-ember"
+                      onChange={(event) =>
+                        setSelectedFile(event.target.files?.[0] ?? null)
+                      }
+                      type="file"
+                    />
+                  </Label>
+
+                  {selectedFile ? (
+                    <div className="rounded-[1.2rem] border border-line bg-white px-4 py-4">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                          <p className="truncate font-subheading text-sm tracking-[0] text-ink">
+                            {selectedFile.name}
+                          </p>
+                          <p className="mt-1 text-sm text-steel">
+                            {formatBytes(selectedFile.size)}
+                          </p>
+                        </div>
+                        <span className="rounded-full bg-sand px-3 py-1 font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
+                          {submitting ? "Uploading" : "Ready"}
+                        </span>
+                      </div>
+
+                      {submitting ? (
+                        <div className="mt-4">
+                          <div className="mb-2 flex items-center justify-between text-sm text-steel">
+                            <span>{uploadStageLabel}</span>
+                            <span>{Math.round(uploadProgress)}%</span>
+                          </div>
+                          <Progress value={uploadProgress} />
+                        </div>
+                      ) : (
+                        <p className="mt-4 text-sm leading-6 text-steel">
+                          Large scenes take a moment to transfer before they are
+                          visible in the queue.
+                        </p>
+                      )}
+                    </div>
+                  ) : null}
+
+                  <div>
+                    <span className="mb-2 block font-subheading text-[11px] uppercase tracking-[0.08em] text-ink/62">
+                      Render mode
+                    </span>
+                    <div className="grid grid-cols-2 gap-2 rounded-[1.15rem] bg-black/[0.04] p-1">
+                      <ModeButton
+                        active={form.renderMode === "still"}
+                        label="Still frame"
+                        onClick={() =>
+                          setForm((current) => ({
+                            ...current,
+                            renderMode: "still",
+                          }))
+                        }
+                      />
+                      <ModeButton
+                        active={form.renderMode === "animation"}
+                        label="Animation"
+                        onClick={() =>
+                          setForm((current) => ({
+                            ...current,
+                            renderMode: "animation",
+                          }))
+                        }
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <Label title="Output format">
+                      <select
+                        className="field"
+                        value={form.outputFormat}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            outputFormat: event.target
+                              .value as JobFormState["outputFormat"],
+                          }))
+                        }
+                      >
+                        <option value="PNG">PNG</option>
+                        <option value="JPEG">JPEG</option>
+                        <option value="OPEN_EXR">OpenEXR</option>
+                      </select>
+                    </Label>
+
+                    <Label title="Device preference">
+                      <select
+                        className="field"
+                        value={form.devicePreference}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            devicePreference: event.target
+                              .value as JobFormState["devicePreference"],
+                          }))
+                        }
+                      >
+                        <option value="AUTO">Auto</option>
+                        <option value="CUDA">CUDA</option>
+                        <option value="OPTIX">OptiX</option>
+                        <option value="CPU">CPU</option>
+                      </select>
+                    </Label>
+                  </div>
+
+                  {form.renderMode === "still" ? (
+                    <Label title="Frame">
+                      <input
+                        className="field"
+                        min={1}
+                        type="number"
+                        value={form.frame}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            frame: Number(event.target.value || 1),
+                          }))
+                        }
+                      />
+                    </Label>
+                  ) : (
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <Label title="Start frame">
+                        <input
+                          className="field"
+                          min={1}
+                          type="number"
+                          value={form.startFrame}
+                          onChange={(event) =>
+                            setForm((current) => ({
+                              ...current,
+                              startFrame: Number(event.target.value || 1),
+                            }))
+                          }
+                        />
+                      </Label>
+
+                      <Label title="End frame">
+                        <input
+                          className="field"
+                          min={form.startFrame}
+                          type="number"
+                          value={form.endFrame}
+                          onChange={(event) =>
+                            setForm((current) => ({
+                              ...current,
+                              endFrame: Number(
+                                event.target.value || current.startFrame,
+                              ),
+                            }))
+                          }
+                        />
+                      </Label>
+                    </div>
+                  )}
+
+                  {error ? (
+                    <div className="rounded-[1rem] border border-[#e5c6c6] bg-[#fff7f7] px-4 py-3 text-sm text-[#8a2e2e]">
+                      {error}
+                    </div>
+                  ) : null}
+
+                  <Button
+                    className="w-full"
+                    disabled={submitting || loading}
+                    type="submit"
+                  >
+                    {submitting
+                      ? uploadProgress >= 100
+                        ? "Creating render job"
+                        : `Uploading ${Math.round(uploadProgress)}%`
+                      : "Queue render"}
+                  </Button>
+                </form>
+              </Card>
+
+              <Card>
+                <p className="eyebrow">System</p>
+                <div className="mt-5 space-y-3">
+                  <StatusRow
+                    icon={<Server className="h-4 w-4" />}
+                    label="GPU runtime"
+                    value={system?.gpu ?? "Loading"}
+                  />
+                  <StatusRow
+                    icon={<SquareTerminal className="h-4 w-4" />}
+                    label="Blender"
+                    value={system?.blender ?? "Loading"}
+                  />
+                  <StatusRow
+                    icon={<Cpu className="h-4 w-4" />}
+                    label="Device policy"
+                    value={
+                      system
+                        ? `${system.device_policy.default} first, then ${system.device_policy.order.join(" / ")}`
+                        : "Loading"
+                    }
+                  />
+                  <StatusRow
+                    icon={<Cpu className="h-4 w-4" />}
+                    label="Detected devices"
+                    value={deviceSummary(system)}
+                  />
+                </div>
+              </Card>
+
+              <Card className="bg-mist">
+                <p className="font-subheading text-xs uppercase tracking-[0.08em] text-ink">
+                  Notes
+                </p>
+                <p className="mt-3 text-sm leading-6 text-steel">
+                  Jobs update automatically. Use the queue to watch progress,
+                  inspect recent logs, and download archives when they finish.
+                </p>
+              </Card>
+            </aside>
+          </div>
+        </section>
+      </div>
+    </main>
+  );
+}
+
+function Label({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <label className="block">
+      <span className="mb-2 block font-subheading text-[11px] uppercase tracking-[0.08em] text-ink/62">
+        {title}
+      </span>
+      {children}
+    </label>
+  );
+}
+
+function ModeButton({
+  active,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      className={
+        active
+          ? "rounded-[0.95rem] bg-ember px-3 py-3 font-subheading text-[11px] uppercase tracking-[0.08em] text-white transition"
+          : "rounded-[0.95rem] px-3 py-3 font-subheading text-[11px] uppercase tracking-[0.08em] text-steel transition hover:bg-white"
+      }
+      onClick={onClick}
+      type="button"
+    >
+      {label}
+    </button>
+  );
+}
+
+function Metric({
+  icon,
+  label,
+  value,
+}: {
+  icon?: ReactNode;
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="rounded-[1.35rem] border border-line bg-mist p-5">
+      {icon ? <div className="flex items-center gap-2 text-ember">{icon}</div> : null}
+      <p
+        className={`font-subheading text-[11px] uppercase tracking-[0.08em] text-steel ${icon ? "mt-5" : "mt-0"}`}
+      >
+        {label}
+      </p>
+      <p className="mt-3 font-subheading text-[1.9rem] leading-none tracking-[-0.03em] text-ink">
+        {value}
+      </p>
+    </div>
+  );
+}
+
+function StatusRow({
+  icon,
+  label,
+  value,
+}: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="rounded-[1.2rem] border border-line bg-white px-4 py-3">
+      <div className="flex items-center gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[rgba(207,32,46,0.08)] text-ember">
+          {icon}
+        </div>
+        <div className="min-w-0">
+          <p className="font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
+            {label}
+          </p>
+          <p className="truncate text-sm text-ink">{value}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MetaBlock({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-[1.1rem] border border-line bg-mist px-4 py-3">
+      <p className="font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
+        {label}
+      </p>
+      <p className="mt-2 text-sm text-ink">{value}</p>
+    </div>
+  );
+}

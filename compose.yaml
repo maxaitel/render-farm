@@ -1,0 +1,36 @@
+services:
+  api:
+    build:
+      context: ./backend
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    environment:
+      RENDER_STORAGE_ROOT: /data
+      BLENDER_BINARY: /usr/local/bin/blender-wrapper
+      BLENDER_CYCLES_DEVICE: AUTO
+      BLENDER_GPU_ORDER: CUDA,OPTIX,CPU
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./data:/data
+      - ./backend/.blender-build_release_headless:/blender:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        BACKEND_ORIGIN: http://api:8000
+    environment:
+      BACKEND_ORIGIN: http://api:8000
+      NODE_ENV: production
+    ports:
+      - "${WEB_PORT:-3100}:3000"
+    depends_on:
+      - api
