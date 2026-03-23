@@ -60,6 +60,21 @@ def link_or_copy_file(source: Path, destination: Path) -> None:
         shutil.copy2(source, destination)
 
 
+def inspect_session_root(settings: Settings, token: str) -> Path:
+    return settings.temp_root / "inspect" / token
+
+
+def inspect_session_meta_path(settings: Settings, token: str) -> Path:
+    return inspect_session_root(settings, token) / "session.json"
+
+
+def load_inspect_session(settings: Settings, token: str) -> dict:
+    meta_path = inspect_session_meta_path(settings, token)
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+    return json.loads(meta_path.read_text("utf-8"))
+
+
 async def save_upload(upload: UploadFile, destination: Path) -> None:
     async with aiofiles.open(destination, "wb") as out_file:
         while True:
@@ -165,7 +180,8 @@ async def get_job(job_id: str) -> dict:
 
 @app.post("/api/jobs")
 async def create_job(
-    blend_file: UploadFile = File(...),
+    blend_file: UploadFile | None = File(None),
+    inspect_token: str | None = Form(None),
     render_mode: RenderMode = Form(RenderMode.still),
     output_format: OutputFormat = Form(OutputFormat.png),
     device_preference: RenderDevice = Form(RenderDevice.auto),
@@ -176,6 +192,7 @@ async def create_job(
 ) -> dict:
     jobs = await create_jobs_from_upload(
         blend_file=blend_file,
+        inspect_token=inspect_token,
         render_mode=render_mode,
         output_format=output_format,
         device_preference=device_preference,
@@ -189,7 +206,8 @@ async def create_job(
 
 @app.post("/api/jobs/batch")
 async def create_jobs_batch(
-    blend_file: UploadFile = File(...),
+    blend_file: UploadFile | None = File(None),
+    inspect_token: str | None = Form(None),
     render_mode: RenderMode = Form(RenderMode.still),
     output_format: OutputFormat = Form(OutputFormat.png),
     device_preference: RenderDevice = Form(RenderDevice.auto),
@@ -200,6 +218,7 @@ async def create_jobs_batch(
 ) -> list[dict]:
     return await create_jobs_from_upload(
         blend_file=blend_file,
+        inspect_token=inspect_token,
         render_mode=render_mode,
         output_format=output_format,
         device_preference=device_preference,
@@ -220,16 +239,27 @@ async def inspect_blend_file(
     if not filename.lower().endswith(".blend"):
         raise HTTPException(status_code=400, detail="Only .blend files are accepted.")
 
-    inspect_root = state.settings.temp_root / "inspect" / uuid.uuid4().hex[:12]
+    inspection_token = uuid.uuid4().hex[:12]
+    inspect_root = inspect_session_root(state.settings, inspection_token)
     inspect_root.mkdir(parents=True, exist_ok=True)
-    source_path = inspect_root / filename
+    source_path = inspect_root / "source" / filename
+    source_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         await save_upload(blend_file, source_path)
-        return await state.runner.inspect_blend(source_path, preview_frame=frame)
+        payload = await state.runner.inspect_blend(source_path, preview_frame=frame)
+        inspect_session_meta_path(state.settings, inspection_token).write_text(
+            json.dumps(
+                {
+                    "source_filename": filename,
+                    "source_path": str(source_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        payload["inspection_token"] = inspection_token
+        return payload
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    finally:
-        shutil.rmtree(inspect_root, ignore_errors=True)
 
 
 @app.get("/api/jobs/{job_id}/events")
@@ -253,7 +283,8 @@ async def stream_job(job_id: str) -> StreamingResponse:
 
 async def create_jobs_from_upload(
     *,
-    blend_file: UploadFile,
+    blend_file: UploadFile | None,
+    inspect_token: str | None,
     render_mode: RenderMode,
     output_format: OutputFormat,
     device_preference: RenderDevice,
@@ -263,7 +294,23 @@ async def create_jobs_from_upload(
     end_frame: int | None,
 ) -> list[dict]:
     state = runtime_state()
-    filename = sanitize_filename(blend_file.filename or "project.blend")
+    has_blend_file = blend_file is not None
+    has_inspect_token = inspect_token is not None and inspect_token.strip() != ""
+    if has_blend_file == has_inspect_token:
+        raise HTTPException(status_code=400, detail="Provide either a blend file or a saved camera scan token.")
+
+    session_root: Path | None = None
+    prepared_source_path: Path | None = None
+    if has_inspect_token:
+        assert inspect_token is not None
+        session = load_inspect_session(state.settings, inspect_token)
+        filename = sanitize_filename(session["source_filename"])
+        prepared_source_path = Path(session["source_path"])
+        session_root = inspect_session_root(state.settings, inspect_token)
+    else:
+        assert blend_file is not None
+        filename = sanitize_filename(blend_file.filename or "project.blend")
+
     if not filename.lower().endswith(".blend"):
         raise HTTPException(status_code=400, detail="Only .blend files are accepted.")
 
@@ -310,10 +357,19 @@ async def create_jobs_from_upload(
 
     first_job = jobs[0]
     first_source_path = Path(first_job.source_path)
-    await save_upload(blend_file, first_source_path)
+    if prepared_source_path is not None:
+        if not prepared_source_path.exists():
+            raise HTTPException(status_code=404, detail="Saved camera scan source file is missing. Scan the blend file again.")
+        link_or_copy_file(prepared_source_path, first_source_path)
+    else:
+        assert blend_file is not None
+        await save_upload(blend_file, first_source_path)
 
     for job in jobs[1:]:
         link_or_copy_file(first_source_path, Path(job.source_path))
+
+    if session_root is not None:
+        shutil.rmtree(session_root, ignore_errors=True)
 
     snapshots: list[dict] = []
     for job in jobs:

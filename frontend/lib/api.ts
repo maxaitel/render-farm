@@ -66,18 +66,84 @@ export async function submitJobsWithProgress(
 
 export async function inspectBlendFile(
   file: File,
-  frame?: number,
+  frame: number | undefined,
+  onProgress: (progress: number) => void,
+  onPhaseChange: (phase: "uploading" | "processing") => void,
 ): Promise<BlendInspection> {
-  const formData = new FormData();
-  formData.set("blend_file", file, file.name);
-  if (frame) {
-    formData.set("frame", String(frame));
-  }
-  const response = await fetch("backend/api/blend-inspect", {
-    method: "POST",
-    body: formData,
+  return new Promise<BlendInspection>((resolve, reject) => {
+    const formData = new FormData();
+    formData.set("blend_file", file, file.name);
+    if (frame) {
+      formData.set("frame", String(frame));
+    }
+
+    const request = new XMLHttpRequest();
+    let processingTimer: number | null = null;
+    let currentProgress = 0;
+
+    const startProcessingProgress = () => {
+      onPhaseChange("processing");
+      currentProgress = Math.max(currentProgress, 90);
+      onProgress(currentProgress);
+      processingTimer = window.setInterval(() => {
+        currentProgress = Math.min(98, currentProgress + 1);
+        onProgress(currentProgress);
+      }, 350);
+    };
+
+    const clearProcessingProgress = () => {
+      if (processingTimer !== null) {
+        window.clearInterval(processingTimer);
+        processingTimer = null;
+      }
+    };
+
+    request.open("POST", "backend/api/blend-inspect");
+    request.responseType = "json";
+
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable || event.total === 0) {
+        return;
+      }
+      onPhaseChange("uploading");
+      currentProgress = Math.min(89, (event.loaded / event.total) * 89);
+      onProgress(currentProgress);
+    };
+
+    request.upload.onload = () => {
+      startProcessingProgress();
+    };
+
+    request.onload = () => {
+      clearProcessingProgress();
+      const payload =
+        request.response ??
+        (request.responseText
+          ? (JSON.parse(request.responseText) as BlendInspection | { detail?: string })
+          : null);
+
+      if (request.status >= 200 && request.status < 300 && payload) {
+        onProgress(100);
+        resolve(payload as BlendInspection);
+        return;
+      }
+
+      const detail = payload && "detail" in payload ? payload.detail : null;
+      reject(new Error(detail ?? "Request failed."));
+    };
+
+    request.onerror = () => {
+      clearProcessingProgress();
+      reject(new Error("Camera scan failed."));
+    };
+
+    request.onabort = () => {
+      clearProcessingProgress();
+      reject(new Error("Camera scan cancelled."));
+    };
+
+    request.send(formData);
   });
-  return parseResponse<BlendInspection>(response);
 }
 
 function submitWithProgress<T>(

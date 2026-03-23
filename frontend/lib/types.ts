@@ -56,5 +56,6 @@ export interface BlendCameraPreview {
 export interface BlendInspection {
   default_camera: string | null;
   frame: number;
+  inspection_token: string;
   cameras: BlendCameraPreview[];
 }

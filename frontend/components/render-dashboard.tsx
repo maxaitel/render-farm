@@ -8,6 +8,7 @@ import {
   ChevronDown,
   Cpu,
   Download,
+  LoaderCircle,
   Server,
   SquareTerminal,
 } from "lucide-react";
@@ -151,6 +152,10 @@ export function RenderDashboard() {
     useState<BlendInspection | null>(null);
   const [selectedCameraNames, setSelectedCameraNames] = useState<string[]>([]);
   const [inspectingCameras, setInspectingCameras] = useState(false);
+  const [cameraScanProgress, setCameraScanProgress] = useState(0);
+  const [cameraScanPhase, setCameraScanPhase] = useState<
+    "uploading" | "processing"
+  >("uploading");
   const [submitting, setSubmitting] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [activeUploadName, setActiveUploadName] = useState<string | null>(null);
@@ -259,6 +264,8 @@ export function RenderDashboard() {
     setSelectedFiles([]);
     setCameraInspection(null);
     setSelectedCameraNames([]);
+    setCameraScanProgress(0);
+    setCameraScanPhase("uploading");
     setError(null);
   }, [uploadSourceMode]);
 
@@ -288,7 +295,14 @@ export function RenderDashboard() {
     try {
       for (const [index, file] of selectedFiles.entries()) {
         const payload = new FormData();
-        payload.set("blend_file", file, file.name);
+        const canReuseInspectionUpload =
+          selectedFiles.length === 1 &&
+          Boolean(cameraInspection?.inspection_token);
+        if (canReuseInspectionUpload && cameraInspection) {
+          payload.set("inspect_token", cameraInspection.inspection_token);
+        } else {
+          payload.set("blend_file", file, file.name);
+        }
         payload.set("render_mode", form.renderMode);
         payload.set("output_format", form.outputFormat);
         payload.set("device_preference", form.devicePreference);
@@ -328,6 +342,8 @@ export function RenderDashboard() {
       setSelectedFiles([]);
       setCameraInspection(null);
       setSelectedCameraNames([]);
+      setCameraScanProgress(0);
+      setCameraScanPhase("uploading");
       setForm(INITIAL_FORM);
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
@@ -352,9 +368,16 @@ export function RenderDashboard() {
     }
 
     setInspectingCameras(true);
+    setCameraScanProgress(0);
+    setCameraScanPhase("uploading");
     setError(null);
     try {
-      const inspection = await inspectBlendFile(selectedFiles[0], previewFrame);
+      const inspection = await inspectBlendFile(
+        selectedFiles[0],
+        previewFrame,
+        setCameraScanProgress,
+        setCameraScanPhase,
+      );
       setCameraInspection(inspection);
       setSelectedCameraNames(
         inspection.default_camera
@@ -366,6 +389,8 @@ export function RenderDashboard() {
     } catch (inspectError) {
       setCameraInspection(null);
       setSelectedCameraNames([]);
+      setCameraScanProgress(0);
+      setCameraScanPhase("uploading");
       setError(
         inspectError instanceof Error
           ? inspectError.message
@@ -390,6 +415,14 @@ export function RenderDashboard() {
       : uploadProgress >= 100
         ? "Upload complete. Registering render job."
         : "Uploading blend file to the render host.";
+
+  const cameraScanLabel = inspectingCameras
+    ? cameraScanPhase === "uploading"
+      ? "Uploading the blend file for camera scanning."
+      : "Upload complete. Blender is generating low-res camera previews."
+    : cameraInspection?.cameras.length
+      ? `${cameraInspection.cameras.length} camera${cameraInspection.cameras.length === 1 ? "" : "s"} found.`
+      : "Scan the selected blend file to preview cameras and choose one or more render angles.";
 
   return (
     <main className="min-h-screen bg-paper text-ink">
@@ -604,6 +637,8 @@ export function RenderDashboard() {
                         setSelectedFiles(files);
                         setCameraInspection(null);
                         setSelectedCameraNames([]);
+                        setCameraScanProgress(0);
+                        setCameraScanPhase("uploading");
                         if (!files.length && event.target.files?.length) {
                           setError("Only .blend files are accepted.");
                         } else {
@@ -676,9 +711,14 @@ export function RenderDashboard() {
                           </p>
                           <p className="mt-1 text-sm text-steel">
                             {cameraScanAvailable
-                              ? "Scan the selected blend file to preview cameras and choose one or more render angles."
+                              ? cameraScanLabel
                               : "Camera previews are available when one blend file is selected at a time."}
                           </p>
+                          {cameraInspection ? (
+                            <p className="mt-1 text-sm text-steel">
+                              This scan upload will be reused when you queue the render.
+                            </p>
+                          ) : null}
                         </div>
                         {cameraScanAvailable ? (
                           <Button
@@ -688,13 +728,33 @@ export function RenderDashboard() {
                             variant="secondary"
                           >
                             {inspectingCameras
-                              ? "Scanning"
+                              ? "Scanning cameras"
                               : cameraInspection
                                 ? "Rescan cameras"
                                 : "Scan cameras"}
                           </Button>
                         ) : null}
                       </div>
+
+                      {inspectingCameras ? (
+                        <div className="mt-4 rounded-[1rem] border border-line bg-white px-4 py-3">
+                          <div className="flex items-center gap-3 text-sm text-ink">
+                            <LoaderCircle className="h-4 w-4 animate-spin text-ember" />
+                            <span>
+                              {cameraScanPhase === "uploading"
+                                ? "Uploading blend for camera scan."
+                                : "Generating preview thumbnails in Blender."}
+                            </span>
+                          </div>
+                          <div className="mt-3 flex items-center justify-between gap-3 text-sm text-steel">
+                            <span>{cameraScanLabel}</span>
+                            <span>{Math.round(cameraScanProgress)}%</span>
+                          </div>
+                          <div className="mt-3">
+                            <Progress value={cameraScanProgress} />
+                          </div>
+                        </div>
+                      ) : null}
 
                       {cameraInspection?.cameras.length ? (
                         <div className="mt-4 space-y-3">

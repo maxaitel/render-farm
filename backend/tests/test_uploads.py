@@ -202,9 +202,50 @@ def test_blend_inspect_returns_camera_payload(tmp_path: Path) -> None:
 
         assert response.status_code == 200
         payload = response.json()
+        assert payload["inspection_token"]
         assert payload["default_camera"] == "Camera_Main"
         assert payload["frame"] == 7
         assert payload["cameras"][0]["preview_data_url"].startswith("data:image/png;base64,")
+    finally:
+        _restore_env(previous)
+
+
+def test_batch_job_can_reuse_saved_inspection_upload(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        inspect_token = "inspect123abc"
+        inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
+        source_dir = inspect_root / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        source_path = source_dir / "scene.blend"
+        source_path.write_bytes(b"reused-upload")
+        (inspect_root / "session.json").write_text(
+            json.dumps(
+                {
+                    "source_filename": "scene.blend",
+                    "source_path": str(source_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with _client_for(tmp_path) as client:
+            response = client.post(
+                "/api/jobs/batch",
+                data={
+                    "inspect_token": inspect_token,
+                    "render_mode": "still",
+                    "frame": "2",
+                },
+            )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) == 1
+        source_file = tmp_path / "jobs" / payload[0]["id"] / "input" / "scene.blend"
+        assert source_file.exists()
+        assert source_file.read_bytes() == b"reused-upload"
+        assert not inspect_root.exists()
     finally:
         _restore_env(previous)
 
