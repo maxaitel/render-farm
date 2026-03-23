@@ -15,6 +15,7 @@ import {
 
 import {
   fetchJobs,
+  releaseBlendInspection,
   fetchSystemStatus,
   inspectBlendFile,
   submitJobWithProgress,
@@ -242,6 +243,16 @@ export function RenderDashboard() {
   }, []);
 
   useEffect(() => {
+    const inspectionToken = cameraInspection?.inspection_token;
+    return () => {
+      if (!inspectionToken) {
+        return;
+      }
+      void releaseBlendInspection(inspectionToken);
+    };
+  }, [cameraInspection?.inspection_token]);
+
+  useEffect(() => {
     const activeIds = new Set(jobs.filter(activePhase).map((job) => job.id));
 
     sourcesRef.current.forEach((source, jobId) => {
@@ -313,6 +324,10 @@ export function RenderDashboard() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (inspectingCameras) {
+      setError("Wait for camera scanning to finish before queueing the render.");
+      return;
+    }
     if (!selectedFiles.length) {
       setError(
         uploadSourceMode === "folder"
@@ -419,6 +434,7 @@ export function RenderDashboard() {
         requestId !== cameraScanRequestRef.current ||
         expectedScanKey !== cameraScanKeyRef.current
       ) {
+        void releaseBlendInspection(inspection.inspection_token);
         return;
       }
       setCameraInspection(inspection);
@@ -997,11 +1013,13 @@ export function RenderDashboard() {
 
                   <Button
                     className="w-full"
-                    disabled={submitting || loading}
+                    disabled={submitting || loading || inspectingCameras}
                     type="submit"
                   >
                     {submitting
                       ? `Uploading ${Math.round(uploadProgress)}%`
+                      : inspectingCameras
+                        ? `Scanning ${Math.round(cameraScanProgress)}%`
                       : selectedCameraNames.length > 1 && selectedFiles.length === 1
                         ? `Queue ${selectedCameraNames.length} camera renders`
                       : selectedFiles.length > 1

@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
 
 def choose_preview_engine() -> str:
     engines = bpy.context.scene.render.bl_rna.properties["engine"].enum_items.keys()
-    for candidate in ("BLENDER_WORKBENCH", "BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "CYCLES"):
+    for candidate in ("CYCLES", "BLENDER_WORKBENCH", "BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"):
         if candidate in engines:
             return candidate
     return bpy.context.scene.render.engine

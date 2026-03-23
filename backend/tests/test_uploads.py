@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -246,6 +247,72 @@ def test_batch_job_can_reuse_saved_inspection_upload(tmp_path: Path) -> None:
         assert source_file.exists()
         assert source_file.read_bytes() == b"reused-upload"
         assert not inspect_root.exists()
+    finally:
+        _restore_env(previous)
+
+
+def test_release_blend_inspection_deletes_saved_upload(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        inspect_token = "inspect-delete"
+        inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
+        source_dir = inspect_root / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "scene.blend").write_bytes(b"remove-me")
+        (inspect_root / "session.json").write_text(
+            json.dumps(
+                {
+                    "source_filename": "scene.blend",
+                    "source_path": str(source_dir / "scene.blend"),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with _client_for(tmp_path) as client:
+            response = client.delete(f"/api/blend-inspect/{inspect_token}")
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        assert not inspect_root.exists()
+    finally:
+        _restore_env(previous)
+
+
+def test_expired_inspection_upload_is_reaped_on_next_scan(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        expired_token = "expiredtoken"
+        expired_root = tmp_path / "tmp" / "inspect" / expired_token
+        source_dir = expired_root / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "stale.blend").write_bytes(b"stale")
+        session_path = expired_root / "session.json"
+        session_path.write_text(
+            json.dumps(
+                {
+                    "source_filename": "stale.blend",
+                    "source_path": str(source_dir / "stale.blend"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        old_timestamp = time.time() - (2 * 60 * 60)
+        os.utime(expired_root, (old_timestamp, old_timestamp))
+        os.utime(session_path, (old_timestamp, old_timestamp))
+
+        with _client_for(tmp_path) as client:
+            async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
+                return {"default_camera": None, "frame": 1, "cameras": []}
+
+            client.app.state.runtime.runner.inspect_blend = fake_inspect
+            response = client.post(
+                "/api/blend-inspect",
+                files={"blend_file": ("fresh.blend", b"fresh", "application/octet-stream")},
+            )
+
+        assert response.status_code == 200
+        assert not expired_root.exists()
     finally:
         _restore_env(previous)
 

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +22,7 @@ from .store import JobStore
 
 FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+INSPECT_SESSION_MAX_AGE_SECONDS = 60 * 60
 
 
 class AppState:
@@ -75,6 +77,29 @@ def load_inspect_session(settings: Settings, token: str) -> dict:
     return json.loads(meta_path.read_text("utf-8"))
 
 
+def delete_inspect_session(settings: Settings, token: str) -> None:
+    shutil.rmtree(inspect_session_root(settings, token), ignore_errors=True)
+
+
+def cleanup_expired_inspect_sessions(settings: Settings, max_age_seconds: int = INSPECT_SESSION_MAX_AGE_SECONDS) -> None:
+    inspect_root = settings.temp_root / "inspect"
+    if not inspect_root.exists():
+        return
+
+    cutoff = time.time() - max_age_seconds
+    for entry in inspect_root.iterdir():
+        try:
+            if not entry.is_dir():
+                continue
+            meta_path = entry / "session.json"
+            reference_path = meta_path if meta_path.exists() else entry
+            if reference_path.stat().st_mtime >= cutoff:
+                continue
+        except FileNotFoundError:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+
+
 async def save_upload(upload: UploadFile, destination: Path) -> None:
     async with aiofiles.open(destination, "wb") as out_file:
         while True:
@@ -111,6 +136,7 @@ async def lifespan(app: FastAPI):
     settings = load_settings()
     settings.jobs_root.mkdir(parents=True, exist_ok=True)
     settings.temp_root.mkdir(parents=True, exist_ok=True)
+    cleanup_expired_inspect_sessions(settings)
     store = JobStore(settings.database_path)
     await store.load()
     queue: asyncio.Queue[str] = asyncio.Queue()
@@ -239,6 +265,7 @@ async def inspect_blend_file(
     if not filename.lower().endswith(".blend"):
         raise HTTPException(status_code=400, detail="Only .blend files are accepted.")
 
+    cleanup_expired_inspect_sessions(state.settings)
     inspection_token = uuid.uuid4().hex[:12]
     inspect_root = inspect_session_root(state.settings, inspection_token)
     inspect_root.mkdir(parents=True, exist_ok=True)
@@ -259,7 +286,15 @@ async def inspect_blend_file(
         payload["inspection_token"] = inspection_token
         return payload
     except RuntimeError as exc:
+        delete_inspect_session(state.settings, inspection_token)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/blend-inspect/{inspection_token}")
+async def release_blend_inspection(inspection_token: str) -> dict:
+    state = runtime_state()
+    delete_inspect_session(state.settings, inspection_token)
+    return {"ok": True}
 
 
 @app.get("/api/jobs/{job_id}/events")
@@ -369,7 +404,7 @@ async def create_jobs_from_upload(
         link_or_copy_file(first_source_path, Path(job.source_path))
 
     if session_root is not None:
-        shutil.rmtree(session_root, ignore_errors=True)
+        delete_inspect_session(state.settings, inspect_token or "")
 
     snapshots: list[dict] = []
     for job in jobs:

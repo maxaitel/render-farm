@@ -146,6 +146,15 @@ export async function inspectBlendFile(
   });
 }
 
+export async function releaseBlendInspection(
+  inspectionToken: string,
+): Promise<void> {
+  await fetch(`backend/api/blend-inspect/${inspectionToken}`, {
+    method: "DELETE",
+    keepalive: true,
+  }).catch(() => undefined);
+}
+
 function submitWithProgress<T>(
   url: string,
   formData: FormData,
