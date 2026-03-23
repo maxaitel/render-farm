@@ -651,6 +651,9 @@ def test_touch_blend_inspection_refreshes_session_expiry(tmp_path: Path) -> None
             old_timestamp = time.time() - (2 * 60 * 60)
             os.utime(inspect_root, (old_timestamp, old_timestamp))
             os.utime(session_path, (old_timestamp, old_timestamp))
+            cleanup_expired_inspect_sessions(
+                Settings(tmp_path, "/bin/true", "AUTO", ["CPU"], True)
+            )
             response = client.post(f"/api/blend-inspect/{inspect_token}/touch")
 
         assert response.status_code == 200
@@ -682,7 +685,9 @@ def test_stale_processing_inspection_session_is_reaped(tmp_path: Path) -> None:
     os.utime(inspect_root, (old_timestamp, old_timestamp))
     os.utime(session_path, (old_timestamp, old_timestamp))
 
-    cleanup_expired_inspect_sessions(Settings(tmp_path, "/bin/true", "AUTO", ["CPU"], True))
+    settings = Settings(tmp_path, "/bin/true", "AUTO", ["CPU"], True)
+    cleanup_expired_inspect_sessions(settings)
+    cleanup_expired_inspect_sessions(settings)
 
     assert not inspect_root.exists()
 
@@ -1017,6 +1022,7 @@ def test_expired_inspection_upload_is_reaped_on_next_scan(tmp_path: Path) -> Non
         old_timestamp = time.time() - (2 * 60 * 60)
         os.utime(expired_root, (old_timestamp, old_timestamp))
         os.utime(session_path, (old_timestamp, old_timestamp))
+        cleanup_expired_inspect_sessions(Settings(tmp_path, "/bin/true", "AUTO", ["CPU"], True))
 
         with _client_for(tmp_path) as client:
             async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
@@ -1055,10 +1061,15 @@ def test_inspect_session_cleanup_loop_reaps_expired_uploads(
     os.utime(expired_root, (old_timestamp, old_timestamp))
     os.utime(session_path, (old_timestamp, old_timestamp))
 
-    async def cancel_after_first_iteration(_seconds: int) -> None:
-        raise asyncio.CancelledError
+    iterations = 0
 
-    monkeypatch.setattr("app.main.asyncio.sleep", cancel_after_first_iteration)
+    async def cancel_after_second_iteration(_seconds: int) -> None:
+        nonlocal iterations
+        iterations += 1
+        if iterations >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.main.asyncio.sleep", cancel_after_second_iteration)
     settings = Settings(
         storage_root=tmp_path,
         blender_binary="/bin/true",
@@ -1071,6 +1082,33 @@ def test_inspect_session_cleanup_loop_reaps_expired_uploads(
         asyncio.run(inspect_session_cleanup_loop(settings, interval_seconds=1))
 
     assert not expired_root.exists()
+
+
+def test_corrupted_inspect_session_is_deleted_when_loaded(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        inspect_token = "inspect-corrupted"
+        inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
+        source_dir = inspect_root / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "scene.blend").write_bytes(b"stale")
+        (inspect_root / "session.json").write_text("{", encoding="utf-8")
+
+        with _client_for(tmp_path) as client:
+            response = client.post(
+                "/api/jobs",
+                data={
+                    "inspect_token": inspect_token,
+                    "render_mode": "still",
+                    "frame": "1",
+                },
+            )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Saved camera scan was not found. Scan the blend file again."
+        assert not inspect_root.exists()
+    finally:
+        _restore_env(previous)
 
 
 def test_existing_job_json_is_imported_into_sqlite(tmp_path: Path) -> None:

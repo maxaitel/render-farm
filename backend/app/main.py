@@ -26,6 +26,7 @@ UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 INSPECT_SESSION_MAX_AGE_SECONDS = 60 * 60
 INSPECT_SESSION_CLEANUP_INTERVAL_SECONDS = 5 * 60
 INSPECT_SESSION_TOUCH_INTERVAL_SECONDS = 60
+INSPECT_SESSION_PENDING_DELETE_NAME = ".cleanup-pending"
 
 
 class AppState:
@@ -101,6 +102,14 @@ def inspect_session_meta_path(settings: Settings, token: str) -> Path:
     return inspect_session_root(settings, token) / "session.json"
 
 
+def inspect_session_pending_delete_path(settings: Settings, token: str) -> Path:
+    return inspect_session_root(settings, token) / INSPECT_SESSION_PENDING_DELETE_NAME
+
+
+def _clear_inspect_session_pending_delete(settings: Settings, token: str) -> None:
+    inspect_session_pending_delete_path(settings, token).unlink(missing_ok=True)
+
+
 def write_inspect_session(
     settings: Settings,
     token: str,
@@ -109,7 +118,11 @@ def write_inspect_session(
     source_path: Path,
     state: str,
 ) -> None:
-    inspect_session_meta_path(settings, token).write_text(
+    validated_token = validate_inspect_token(token)
+    meta_path = inspect_session_meta_path(settings, validated_token)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = meta_path.with_name(f"{meta_path.name}.tmp")
+    temp_path.write_text(
         json.dumps(
             {
                 "source_filename": source_filename,
@@ -119,14 +132,32 @@ def write_inspect_session(
         ),
         encoding="utf-8",
     )
+    temp_path.replace(meta_path)
+    _clear_inspect_session_pending_delete(settings, validated_token)
 
 
 def load_inspect_session(settings: Settings, token: str) -> dict:
-    meta_path = inspect_session_meta_path(settings, token)
+    validated_token = validate_inspect_token(token)
+    meta_path = inspect_session_meta_path(settings, validated_token)
     if not meta_path.exists():
         raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
-    touch_inspect_session(settings, token)
-    return json.loads(meta_path.read_text("utf-8"))
+    try:
+        payload = json.loads(meta_path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        delete_inspect_session(settings, validated_token)
+        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+
+    if not isinstance(payload, dict):
+        delete_inspect_session(settings, validated_token)
+        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+
+    required_keys = {"source_filename", "source_path"}
+    if not required_keys.issubset(payload):
+        delete_inspect_session(settings, validated_token)
+        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+
+    touch_inspect_session(settings, validated_token)
+    return payload
 
 
 def delete_inspect_session(settings: Settings, token: str) -> None:
@@ -134,8 +165,12 @@ def delete_inspect_session(settings: Settings, token: str) -> None:
 
 
 def touch_inspect_session(settings: Settings, token: str) -> None:
-    meta_path = inspect_session_meta_path(settings, token)
+    validated_token = validate_inspect_token(token)
+    meta_path = inspect_session_meta_path(settings, validated_token)
+    if not meta_path.exists():
+        raise FileNotFoundError(meta_path)
     meta_path.touch()
+    _clear_inspect_session_pending_delete(settings, validated_token)
 
 
 def cleanup_expired_inspect_sessions(settings: Settings, max_age_seconds: int = INSPECT_SESSION_MAX_AGE_SECONDS) -> None:
@@ -148,12 +183,24 @@ def cleanup_expired_inspect_sessions(settings: Settings, max_age_seconds: int = 
         try:
             if not entry.is_dir():
                 continue
+            if not INSPECT_TOKEN_RE.fullmatch(entry.name):
+                continue
             meta_path = entry / "session.json"
             reference_path = meta_path if meta_path.exists() else entry
-            if reference_path.stat().st_mtime >= cutoff:
+            pending_delete_path = entry / INSPECT_SESSION_PENDING_DELETE_NAME
+            reference_mtime = reference_path.stat().st_mtime
+            if reference_mtime >= cutoff:
+                pending_delete_path.unlink(missing_ok=True)
                 continue
-            current_reference_path = meta_path if meta_path.exists() else entry
-            if current_reference_path.stat().st_mtime >= cutoff:
+            if not pending_delete_path.exists():
+                pending_delete_path.touch()
+                continue
+        except FileNotFoundError:
+            continue
+
+        try:
+            if reference_path.stat().st_mtime > pending_delete_path.stat().st_mtime:
+                pending_delete_path.unlink(missing_ok=True)
                 continue
         except FileNotFoundError:
             continue
@@ -200,7 +247,10 @@ async def keep_inspect_session_alive(
     interval_seconds: int = INSPECT_SESSION_TOUCH_INTERVAL_SECONDS,
 ) -> None:
     while True:
-        touch_inspect_session(settings, token)
+        try:
+            touch_inspect_session(settings, token)
+        except FileNotFoundError:
+            return
         await asyncio.sleep(interval_seconds)
 
 
@@ -440,7 +490,10 @@ async def touch_blend_inspection(inspection_token: str) -> dict:
     token = validate_inspect_token(inspection_token)
     if not inspect_session_meta_path(state.settings, token).exists():
         raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
-    touch_inspect_session(state.settings, token)
+    try:
+        touch_inspect_session(state.settings, token)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.") from exc
     return {"ok": True}
 
 
