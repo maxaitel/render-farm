@@ -21,6 +21,7 @@ from .renderer import RenderRunner
 from .store import JobStore
 
 FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+INSPECT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 INSPECT_SESSION_MAX_AGE_SECONDS = 60 * 60
 
@@ -54,6 +55,13 @@ def unique_camera_names(camera_names: list[str] | None) -> list[str]:
     return names
 
 
+def validate_inspect_token(token: str) -> str:
+    cleaned = token.strip()
+    if not INSPECT_TOKEN_RE.fullmatch(cleaned):
+        raise HTTPException(status_code=400, detail="Invalid camera scan token.")
+    return cleaned
+
+
 def link_or_copy_file(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -63,7 +71,7 @@ def link_or_copy_file(source: Path, destination: Path) -> None:
 
 
 def inspect_session_root(settings: Settings, token: str) -> Path:
-    return settings.temp_root / "inspect" / token
+    return settings.temp_root / "inspect" / validate_inspect_token(token)
 
 
 def inspect_session_meta_path(settings: Settings, token: str) -> Path:
@@ -336,12 +344,14 @@ async def create_jobs_from_upload(
 
     session_root: Path | None = None
     prepared_source_path: Path | None = None
+    validated_inspect_token: str | None = None
     if has_inspect_token:
         assert inspect_token is not None
-        session = load_inspect_session(state.settings, inspect_token)
+        validated_inspect_token = validate_inspect_token(inspect_token)
+        session = load_inspect_session(state.settings, validated_inspect_token)
         filename = sanitize_filename(session["source_filename"])
         prepared_source_path = Path(session["source_path"])
-        session_root = inspect_session_root(state.settings, inspect_token)
+        session_root = inspect_session_root(state.settings, validated_inspect_token)
     else:
         assert blend_file is not None
         filename = sanitize_filename(blend_file.filename or "project.blend")
@@ -404,7 +414,8 @@ async def create_jobs_from_upload(
         link_or_copy_file(first_source_path, Path(job.source_path))
 
     if session_root is not None:
-        delete_inspect_session(state.settings, inspect_token or "")
+        assert validated_inspect_token is not None
+        delete_inspect_session(state.settings, validated_inspect_token)
 
     snapshots: list[dict] = []
     for job in jobs:

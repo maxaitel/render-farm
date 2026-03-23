@@ -279,6 +279,25 @@ def test_release_blend_inspection_deletes_saved_upload(tmp_path: Path) -> None:
         _restore_env(previous)
 
 
+def test_invalid_inspect_token_is_rejected(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with _client_for(tmp_path) as client:
+            response = client.post(
+                "/api/jobs",
+                data={
+                    "inspect_token": "../../outside",
+                    "render_mode": "still",
+                    "frame": "1",
+                },
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid camera scan token."
+    finally:
+        _restore_env(previous)
+
+
 def test_expired_inspection_upload_is_reaped_on_next_scan(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:

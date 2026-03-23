@@ -343,6 +343,7 @@ export function RenderDashboard() {
     setActiveUploadIndex(1);
     setActiveUploadName(fileLabel(selectedFiles[0]));
     setError(null);
+    let nextFileIndex = 0;
     try {
       for (const [index, file] of selectedFiles.entries()) {
         const payload = new FormData();
@@ -388,6 +389,7 @@ export function RenderDashboard() {
         submittedJobs.forEach((job) => {
           setJobs((current) => upsertJob(current, job));
         });
+        nextFileIndex = index + 1;
       }
 
       setSelectedFiles([]);
@@ -400,6 +402,9 @@ export function RenderDashboard() {
         fileInputRef.current.value = "";
       }
     } catch (submitError) {
+      if (selectedFiles.length > 1 && nextFileIndex > 0) {
+        setSelectedFiles(selectedFiles.slice(nextFileIndex));
+      }
       setError(
         submitError instanceof Error
           ? submitError.message
