@@ -185,6 +185,7 @@ export function RenderDashboard() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cameraScanRequestRef = useRef(0);
   const cameraScanKeyRef = useRef("");
+  const submittingInspectionTokenRef = useRef<string | null>(null);
 
   const primarySelectedFile = selectedFiles[0] ?? null;
   const cameraScanAvailable = selectedFiles.length === 1;
@@ -247,6 +248,9 @@ export function RenderDashboard() {
     const inspectionToken = cameraInspection?.inspection_token;
     return () => {
       if (!inspectionToken) {
+        return;
+      }
+      if (submittingInspectionTokenRef.current === inspectionToken) {
         return;
       }
       void releaseBlendInspection(inspectionToken);
@@ -351,6 +355,7 @@ export function RenderDashboard() {
           selectedFiles.length === 1 &&
           Boolean(cameraInspection?.inspection_token);
         if (canReuseInspectionUpload && cameraInspection) {
+          submittingInspectionTokenRef.current = cameraInspection.inspection_token;
           payload.set("inspect_token", cameraInspection.inspection_token);
         } else {
           payload.set("blend_file", file, file.name);
@@ -411,6 +416,7 @@ export function RenderDashboard() {
           : "Failed to queue render.",
       );
     } finally {
+      submittingInspectionTokenRef.current = null;
       setSubmitting(false);
       setUploadProgress(0);
       setActiveUploadIndex(0);
@@ -444,13 +450,7 @@ export function RenderDashboard() {
         return;
       }
       setCameraInspection(inspection);
-      setSelectedCameraNames(
-        inspection.default_camera
-          ? [inspection.default_camera]
-          : inspection.cameras[0]
-            ? [inspection.cameras[0].name]
-            : [],
-      );
+      setSelectedCameraNames([]);
     } catch (inspectError) {
       if (
         requestId !== cameraScanRequestRef.current ||
