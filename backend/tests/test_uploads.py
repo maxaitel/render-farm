@@ -186,6 +186,36 @@ def test_batch_upload_creates_one_job_per_camera(tmp_path: Path) -> None:
         _restore_env(previous)
 
 
+def test_folder_upload_preserves_relative_project_assets(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with _client_for(tmp_path) as client:
+            response = client.post(
+                "/api/jobs",
+                data={
+                    "blend_file_path": "project/scenes/scene.blend",
+                    "project_paths": ["project/textures/wood.png", "project/assets/shared.blend"],
+                    "render_mode": "still",
+                    "frame": "1",
+                },
+                files=[
+                    ("blend_file", ("scene.blend", b"blend-bytes", "application/octet-stream")),
+                    ("project_files", ("wood.png", b"png-bytes", "application/octet-stream")),
+                    ("project_files", ("shared.blend", b"linked-blend", "application/octet-stream")),
+                ],
+            )
+
+        assert response.status_code == 200
+        payload = response.json()
+        input_root = tmp_path / "jobs" / payload["id"] / "input"
+        assert payload["source_filename"] == "project/scenes/scene.blend"
+        assert (input_root / "project" / "scenes" / "scene.blend").read_bytes() == b"blend-bytes"
+        assert (input_root / "project" / "textures" / "wood.png").read_bytes() == b"png-bytes"
+        assert (input_root / "project" / "assets" / "shared.blend").read_bytes() == b"linked-blend"
+    finally:
+        _restore_env(previous)
+
+
 def test_blend_inspect_returns_camera_payload(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:

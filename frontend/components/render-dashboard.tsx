@@ -181,6 +181,7 @@ export function RenderDashboard() {
   const [uploadSourceMode, setUploadSourceMode] =
     useState<UploadSourceMode>("files");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [selectedProjectFiles, setSelectedProjectFiles] = useState<File[]>([]);
   const [cameraInspection, setCameraInspection] =
     useState<BlendInspection | null>(null);
   const [selectedCameraNames, setSelectedCameraNames] = useState<string[]>([]);
@@ -359,6 +360,7 @@ export function RenderDashboard() {
 
     input.value = "";
     setSelectedFiles([]);
+    setSelectedProjectFiles([]);
     setCameraInspection(null);
     setSelectedCameraNames([]);
     setCameraScanProgress(0);
@@ -412,6 +414,7 @@ export function RenderDashboard() {
       for (const [index, file] of selectedFiles.entries()) {
         const payload = new FormData();
         const canReuseInspectionUpload =
+          uploadSourceMode === "files" &&
           selectedFiles.length === 1 &&
           Boolean(cameraInspection?.inspection_token);
         if (canReuseInspectionUpload && cameraInspection) {
@@ -419,6 +422,18 @@ export function RenderDashboard() {
           payload.set("inspect_token", cameraInspection.inspection_token);
         } else {
           payload.set("blend_file", file, file.name);
+          if (uploadSourceMode === "folder") {
+            const blendPath = file.webkitRelativePath || file.name;
+            payload.set("blend_file_path", blendPath);
+            selectedProjectFiles.forEach((projectFile) => {
+              const projectPath = projectFile.webkitRelativePath || projectFile.name;
+              if (projectPath === blendPath) {
+                return;
+              }
+              payload.append("project_files", projectFile, projectFile.name);
+              payload.append("project_paths", projectPath);
+            });
+          }
         }
         payload.set("render_mode", form.renderMode);
         payload.set("output_format", form.outputFormat);
@@ -458,6 +473,7 @@ export function RenderDashboard() {
       }
 
       setSelectedFiles([]);
+      setSelectedProjectFiles([]);
       setCameraInspection(null);
       setSelectedCameraNames([]);
       setCameraScanProgress(0);
@@ -502,8 +518,24 @@ export function RenderDashboard() {
       const inspection = await inspectBlendFile(
         selectedFiles[0],
         previewFrame,
-        setCameraScanProgress,
-        setCameraScanPhase,
+        (progress) => {
+          if (
+            requestId !== cameraScanRequestRef.current ||
+            expectedScanKey !== cameraScanKeyRef.current
+          ) {
+            return;
+          }
+          setCameraScanProgress(progress);
+        },
+        (phase) => {
+          if (
+            requestId !== cameraScanRequestRef.current ||
+            expectedScanKey !== cameraScanKeyRef.current
+          ) {
+            return;
+          }
+          setCameraScanPhase(phase);
+        },
       );
       if (
         requestId !== cameraScanRequestRef.current ||
@@ -775,12 +807,14 @@ export function RenderDashboard() {
                       className="block w-full rounded-[1rem] border border-dashed border-line bg-white px-4 py-4 text-sm text-ink outline-none transition file:mr-4 file:rounded-full file:border-0 file:bg-ember file:px-4 file:py-2 file:text-sm file:font-semibold file:tracking-[0] file:text-white hover:border-ember/30 focus:border-ember"
                       multiple
                       onChange={(event) => {
-                        const files = Array.from(
-                          event.target.files ?? [],
-                        ).filter((file) =>
+                        const allFiles = Array.from(event.target.files ?? []);
+                        const files = allFiles.filter((file) =>
                           file.name.toLowerCase().endsWith(".blend"),
                         );
                         setSelectedFiles(files);
+                        setSelectedProjectFiles(
+                          uploadSourceMode === "folder" ? allFiles : files,
+                        );
                         setCameraInspection(null);
                         setSelectedCameraNames([]);
                         setCameraScanProgress(0);
@@ -806,7 +840,13 @@ export function RenderDashboard() {
                               : `${selectedFiles.length} blend files selected`}
                           </p>
                           <p className="mt-1 text-sm text-steel">
-                            {formatBytes(totalFileBytes(selectedFiles))}
+                            {formatBytes(
+                              totalFileBytes(
+                                uploadSourceMode === "folder"
+                                  ? selectedProjectFiles
+                                  : selectedFiles,
+                              ),
+                            )}
                           </p>
                         </div>
                         <span className="rounded-full bg-sand px-3 py-1 font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">

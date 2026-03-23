@@ -8,7 +8,7 @@ import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import aiofiles
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -43,6 +43,19 @@ def sanitize_filename(filename: str) -> str:
     return cleaned or "project.blend"
 
 
+def sanitize_relative_path(path_value: str) -> Path:
+    cleaned = path_value.strip().replace("\\", "/")
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Invalid project file path.")
+
+    path = PurePosixPath(cleaned)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise HTTPException(status_code=400, detail="Invalid project file path.")
+
+    sanitized_parts = [sanitize_filename(part) for part in path.parts]
+    return Path(*sanitized_parts)
+
+
 def unique_camera_names(camera_names: list[str] | None) -> list[str]:
     if not camera_names:
         return []
@@ -71,6 +84,14 @@ def link_or_copy_file(source: Path, destination: Path) -> None:
         os.link(source, destination)
     except OSError:
         shutil.copy2(source, destination)
+
+
+def link_or_copy_tree(source_root: Path, destination_root: Path) -> None:
+    for source in source_root.rglob("*"):
+        if not source.is_file():
+            continue
+        relative_path = source.relative_to(source_root)
+        link_or_copy_file(source, destination_root / relative_path)
 
 
 def inspect_session_root(settings: Settings, token: str) -> Path:
@@ -138,6 +159,7 @@ def cleanup_expired_inspect_sessions(settings: Settings, max_age_seconds: int = 
 
 
 async def save_upload(upload: UploadFile, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
     async with aiofiles.open(destination, "wb") as out_file:
         while True:
             chunk = await upload.read(UPLOAD_CHUNK_SIZE)
@@ -270,6 +292,9 @@ async def get_job(job_id: str) -> dict:
 @app.post("/api/jobs")
 async def create_job(
     blend_file: UploadFile | None = File(None),
+    blend_file_path: str | None = Form(None),
+    project_files: list[UploadFile] | None = File(None),
+    project_paths: list[str] | None = Form(None),
     inspect_token: str | None = Form(None),
     render_mode: RenderMode = Form(RenderMode.still),
     output_format: OutputFormat = Form(OutputFormat.png),
@@ -281,6 +306,9 @@ async def create_job(
 ) -> dict:
     jobs = await create_jobs_from_upload(
         blend_file=blend_file,
+        blend_file_path=blend_file_path,
+        project_files=project_files,
+        project_paths=project_paths,
         inspect_token=inspect_token,
         render_mode=render_mode,
         output_format=output_format,
@@ -296,6 +324,9 @@ async def create_job(
 @app.post("/api/jobs/batch")
 async def create_jobs_batch(
     blend_file: UploadFile | None = File(None),
+    blend_file_path: str | None = Form(None),
+    project_files: list[UploadFile] | None = File(None),
+    project_paths: list[str] | None = Form(None),
     inspect_token: str | None = Form(None),
     render_mode: RenderMode = Form(RenderMode.still),
     output_format: OutputFormat = Form(OutputFormat.png),
@@ -307,6 +338,9 @@ async def create_jobs_batch(
 ) -> list[dict]:
     return await create_jobs_from_upload(
         blend_file=blend_file,
+        blend_file_path=blend_file_path,
+        project_files=project_files,
+        project_paths=project_paths,
         inspect_token=inspect_token,
         render_mode=render_mode,
         output_format=output_format,
@@ -411,6 +445,9 @@ async def stream_job(job_id: str) -> StreamingResponse:
 async def create_jobs_from_upload(
     *,
     blend_file: UploadFile | None,
+    blend_file_path: str | None,
+    project_files: list[UploadFile] | None,
+    project_paths: list[str] | None,
     inspect_token: str | None,
     render_mode: RenderMode,
     output_format: OutputFormat,
@@ -429,6 +466,7 @@ async def create_jobs_from_upload(
     session_root: Path | None = None
     prepared_source_path: Path | None = None
     validated_inspect_token: str | None = None
+    relative_source_path: Path | None = None
     if has_inspect_token:
         assert inspect_token is not None
         validated_inspect_token = validate_inspect_token(inspect_token)
@@ -438,10 +476,20 @@ async def create_jobs_from_upload(
         session_root = inspect_session_root(state.settings, validated_inspect_token)
     else:
         assert blend_file is not None
-        filename = sanitize_filename(blend_file.filename or "project.blend")
+        relative_source_path = (
+            sanitize_relative_path(blend_file_path)
+            if blend_file_path and blend_file_path.strip()
+            else Path(sanitize_filename(blend_file.filename or "project.blend"))
+        )
+        filename = relative_source_path.as_posix()
 
     if not filename.lower().endswith(".blend"):
         raise HTTPException(status_code=400, detail="Only .blend files are accepted.")
+
+    normalized_project_files = project_files or []
+    normalized_project_paths = project_paths or []
+    if normalized_project_files and len(normalized_project_files) != len(normalized_project_paths):
+        raise HTTPException(status_code=400, detail="Project files are missing relative paths.")
 
     if render_mode == RenderMode.still:
         frame = frame or 1
@@ -487,14 +535,15 @@ async def create_jobs_from_upload(
         )
 
     first_job = jobs[0]
+    first_input_root = job_roots[0] / "input"
     first_source_path = Path(first_job.source_path)
     if prepared_source_path is not None:
         if not prepared_source_path.exists():
             raise HTTPException(status_code=404, detail="Saved camera scan source file is missing. Scan the blend file again.")
         try:
             link_or_copy_file(prepared_source_path, first_source_path)
-            for job in jobs[1:]:
-                link_or_copy_file(first_source_path, Path(job.source_path))
+            for job_root in job_roots[1:]:
+                link_or_copy_tree(first_input_root, job_root / "input")
         except Exception:
             for job_root in job_roots:
                 shutil.rmtree(job_root, ignore_errors=True)
@@ -503,8 +552,14 @@ async def create_jobs_from_upload(
         assert blend_file is not None
         try:
             await save_upload(blend_file, first_source_path)
-            for job in jobs[1:]:
-                link_or_copy_file(first_source_path, Path(job.source_path))
+            for upload, path_value in zip(normalized_project_files, normalized_project_paths, strict=True):
+                relative_project_path = sanitize_relative_path(path_value)
+                if relative_source_path and relative_project_path == relative_source_path:
+                    await upload.close()
+                    continue
+                await save_upload(upload, first_input_root / relative_project_path)
+            for job_root in job_roots[1:]:
+                link_or_copy_tree(first_input_root, job_root / "input")
         except Exception:
             for job_root in job_roots:
                 shutil.rmtree(job_root, ignore_errors=True)
