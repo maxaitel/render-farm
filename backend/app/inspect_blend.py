@@ -39,8 +39,13 @@ def camera_payload(camera: bpy.types.Object, preview_path: Path | None) -> dict:
     }
 
 
-def render_preview(scene: bpy.types.Scene, camera: bpy.types.Object, preview_dir: Path) -> Path | None:
-    output_path = preview_dir / f"{safe_name(camera.name)}.png"
+def render_preview(
+    scene: bpy.types.Scene,
+    camera: bpy.types.Object,
+    preview_dir: Path,
+    preview_stem: str,
+) -> Path | None:
+    output_path = preview_dir / f"{preview_stem}.png"
 
     original_camera = scene.camera
     original_engine = scene.render.engine
@@ -101,8 +106,13 @@ def main() -> None:
         "frame": scene.frame_current,
         "cameras": [],
     }
-    for camera in cameras:
-        preview_path = render_preview(scene, camera, preview_dir)
+    for index, camera in enumerate(cameras, start=1):
+        preview_path = render_preview(
+            scene,
+            camera,
+            preview_dir,
+            f"{index:03d}-{safe_name(camera.name)}",
+        )
         payload["cameras"].append(camera_payload(camera, preview_path))
 
     Path(args.output_json).write_text(json.dumps(payload), encoding="utf-8")

@@ -104,6 +104,23 @@ function totalFileBytes(files: File[]) {
   return files.reduce((total, file) => total + file.size, 0);
 }
 
+function cameraScanKey(
+  file: File | null,
+  renderMode: RenderMode,
+  previewFrame: number,
+) {
+  if (!file) {
+    return "";
+  }
+  return [
+    file.name,
+    file.size,
+    file.lastModified,
+    renderMode,
+    previewFrame,
+  ].join(":");
+}
+
 function deviceSummary(system: SystemStatus | null) {
   if (!system) {
     return "Loading";
@@ -164,9 +181,17 @@ export function RenderDashboard() {
   const [error, setError] = useState<string | null>(null);
   const sourcesRef = useRef<Map<string, EventSource>>(new Map());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const cameraScanRequestRef = useRef(0);
+  const cameraScanKeyRef = useRef("");
 
+  const primarySelectedFile = selectedFiles[0] ?? null;
   const cameraScanAvailable = selectedFiles.length === 1;
   const previewFrame = form.renderMode === "still" ? form.frame : form.startFrame;
+  const activeCameraScanKey = cameraScanKey(
+    primarySelectedFile,
+    form.renderMode,
+    previewFrame,
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -268,6 +293,16 @@ export function RenderDashboard() {
     setCameraScanPhase("uploading");
     setError(null);
   }, [uploadSourceMode]);
+
+  useEffect(() => {
+    cameraScanRequestRef.current += 1;
+    cameraScanKeyRef.current = activeCameraScanKey;
+    setInspectingCameras(false);
+    setCameraInspection(null);
+    setSelectedCameraNames([]);
+    setCameraScanProgress(0);
+    setCameraScanPhase("uploading");
+  }, [activeCameraScanKey]);
 
   const stats = useMemo(() => {
     const running = jobs.filter((job) => job.phase === "running").length;
@@ -371,6 +406,8 @@ export function RenderDashboard() {
     setCameraScanProgress(0);
     setCameraScanPhase("uploading");
     setError(null);
+    const requestId = cameraScanRequestRef.current;
+    const expectedScanKey = activeCameraScanKey;
     try {
       const inspection = await inspectBlendFile(
         selectedFiles[0],
@@ -378,6 +415,12 @@ export function RenderDashboard() {
         setCameraScanProgress,
         setCameraScanPhase,
       );
+      if (
+        requestId !== cameraScanRequestRef.current ||
+        expectedScanKey !== cameraScanKeyRef.current
+      ) {
+        return;
+      }
       setCameraInspection(inspection);
       setSelectedCameraNames(
         inspection.default_camera
@@ -387,6 +430,12 @@ export function RenderDashboard() {
             : [],
       );
     } catch (inspectError) {
+      if (
+        requestId !== cameraScanRequestRef.current ||
+        expectedScanKey !== cameraScanKeyRef.current
+      ) {
+        return;
+      }
       setCameraInspection(null);
       setSelectedCameraNames([]);
       setCameraScanProgress(0);
@@ -397,7 +446,12 @@ export function RenderDashboard() {
           : "Failed to inspect cameras.",
       );
     } finally {
-      setInspectingCameras(false);
+      if (
+        requestId === cameraScanRequestRef.current &&
+        expectedScanKey === cameraScanKeyRef.current
+      ) {
+        setInspectingCameras(false);
+      }
     }
   }
 
