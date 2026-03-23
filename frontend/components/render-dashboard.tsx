@@ -46,6 +46,30 @@ type JobFormState = {
 
 type UploadSourceMode = "files" | "folder";
 
+const SCENE_DIRECTORY_NAMES = new Set([
+  "scene",
+  "scenes",
+  "shot",
+  "shots",
+  "render",
+  "renders",
+]);
+
+const AUXILIARY_DIRECTORY_NAMES = new Set([
+  "asset",
+  "assets",
+  "lib",
+  "libs",
+  "library",
+  "libraries",
+  "link",
+  "linked",
+  "texture",
+  "textures",
+  "cache",
+  "caches",
+]);
+
 const INITIAL_FORM: JobFormState = {
   renderMode: "still",
   frame: 1,
@@ -121,6 +145,51 @@ function folderProjectUploadEntries(
       return [{ file: projectFile, path }];
     }),
   };
+}
+
+function folderRenderTargets(projectFiles: File[]) {
+  const blendFiles = projectFiles.filter((file) =>
+    file.name.toLowerCase().endsWith(".blend"),
+  );
+  if (!blendFiles.length) {
+    return [];
+  }
+
+  const rankedFiles = blendFiles.map((file) => {
+    const directories = fileLabel(file)
+      .split("/")
+      .slice(0, -1)
+      .map((part) => part.toLowerCase());
+    const auxiliaryScore = directories.filter((part) =>
+      AUXILIARY_DIRECTORY_NAMES.has(part),
+    ).length;
+    const sceneScore = directories.some((part) => SCENE_DIRECTORY_NAMES.has(part))
+      ? 0
+      : 1;
+
+    return {
+      file,
+      auxiliaryScore,
+      sceneScore,
+    };
+  });
+
+  const bestAuxiliaryScore = Math.min(
+    ...rankedFiles.map(({ auxiliaryScore }) => auxiliaryScore),
+  );
+  const bestSceneScore = Math.min(
+    ...rankedFiles
+      .filter(({ auxiliaryScore }) => auxiliaryScore === bestAuxiliaryScore)
+      .map(({ sceneScore }) => sceneScore),
+  );
+
+  return rankedFiles
+    .filter(
+      ({ auxiliaryScore, sceneScore }) =>
+        auxiliaryScore === bestAuxiliaryScore &&
+        sceneScore === bestSceneScore,
+    )
+    .map(({ file }) => file);
 }
 
 function totalFileBytes(files: File[]) {
@@ -435,7 +504,6 @@ export function RenderDashboard() {
       for (const [index, file] of selectedFiles.entries()) {
         const payload = new FormData();
         const canReuseInspectionUpload =
-          uploadSourceMode === "files" &&
           selectedFiles.length === 1 &&
           Boolean(cameraInspection?.inspection_token);
         if (canReuseInspectionUpload && cameraInspection) {
@@ -838,9 +906,12 @@ export function RenderDashboard() {
                       multiple
                       onChange={(event) => {
                         const allFiles = Array.from(event.target.files ?? []);
-                        const files = allFiles.filter((file) =>
-                          file.name.toLowerCase().endsWith(".blend"),
-                        );
+                        const files =
+                          uploadSourceMode === "folder"
+                            ? folderRenderTargets(allFiles)
+                            : allFiles.filter((file) =>
+                                file.name.toLowerCase().endsWith(".blend"),
+                              );
                         setSelectedFiles(files);
                         setSelectedProjectFiles(
                           uploadSourceMode === "folder" ? allFiles : files,
@@ -911,7 +982,7 @@ export function RenderDashboard() {
                       ) : (
                         <p className="mt-4 text-sm leading-6 text-steel">
                           {uploadSourceMode === "folder"
-                            ? "Every .blend file in the selected folder will be queued as its own render job."
+                            ? "Detected scene .blend files in the selected folder will be queued, while sibling assets stay attached to each job."
                             : "Large scenes take a moment to transfer before they are visible in the queue."}
                         </p>
                       )}
