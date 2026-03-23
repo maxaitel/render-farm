@@ -605,9 +605,6 @@ async def create_jobs_from_upload(
     for snapshot in snapshots:
         state.queue.put_nowait(snapshot.id)
 
-    if session_root is not None:
-        assert validated_inspect_token is not None
-        delete_inspect_session(state.settings, validated_inspect_token)
     return [snapshot.model_dump(mode="json") for snapshot in snapshots]
 
 

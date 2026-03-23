@@ -503,7 +503,7 @@ def test_batch_job_can_reuse_saved_inspection_upload(tmp_path: Path) -> None:
             input_root / "Project Files" / "textures" / "Wood Floor.png"
         ).read_bytes() == b"texture"
         assert payload[0]["source_filename"] == "Project Files/scenes/Scene 1.blend"
-        assert not inspect_root.exists()
+        assert inspect_root.exists()
     finally:
         _restore_env(previous)
 

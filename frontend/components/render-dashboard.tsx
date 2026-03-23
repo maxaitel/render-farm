@@ -193,14 +193,16 @@ function folderRenderTargets(projectFiles: File[]) {
       .map(({ depth }) => depth),
   );
 
-  return rankedFiles
+  const primaryCandidates = rankedFiles
     .filter(
       ({ auxiliaryScore, sceneScore, depth }) =>
         auxiliaryScore === bestAuxiliaryScore &&
         sceneScore === bestSceneScore &&
         depth === bestDepth,
     )
-    .map(({ file }) => file);
+    .sort((left, right) => fileLabel(left.file).localeCompare(fileLabel(right.file)));
+
+  return primaryCandidates.length ? [primaryCandidates[0].file] : [];
 }
 
 function totalFileBytes(files: File[]) {
@@ -527,6 +529,7 @@ export function RenderDashboard() {
     setActiveUploadName(fileLabel(selectedFiles[0]));
     setError(null);
     let nextFileIndex = 0;
+    let submittedInspectionToken: string | null = null;
     try {
       for (const [index, file] of selectedFiles.entries()) {
         const payload = new FormData();
@@ -535,6 +538,7 @@ export function RenderDashboard() {
           Boolean(cameraInspection?.inspection_token);
         if (canReuseInspectionUpload && cameraInspection) {
           submittingInspectionTokenRef.current = cameraInspection.inspection_token;
+          submittedInspectionToken = cameraInspection.inspection_token;
           payload.set("inspect_token", cameraInspection.inspection_token);
         } else {
           payload.set("blend_file", file, file.name);
@@ -587,6 +591,9 @@ export function RenderDashboard() {
         nextFileIndex = index + 1;
       }
 
+      if (submittedInspectionToken) {
+        await releaseBlendInspection(submittedInspectionToken);
+      }
       setSelectedFiles([]);
       setSelectedProjectFiles([]);
       setCameraInspection(null);
@@ -1016,7 +1023,7 @@ export function RenderDashboard() {
                       ) : (
                         <p className="mt-4 text-sm leading-6 text-steel">
                           {uploadSourceMode === "folder"
-                            ? "Detected scene .blend files in the selected folder will be queued, while sibling assets stay attached to each job."
+                            ? "Using the primary scene .blend from the selected folder, while sibling assets stay attached to the job."
                             : "Large scenes take a moment to transfer before they are visible in the queue."}
                         </p>
                       )}
