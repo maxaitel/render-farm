@@ -193,25 +193,34 @@ def test_folder_upload_preserves_relative_project_assets(tmp_path: Path) -> None
             response = client.post(
                 "/api/jobs",
                 data={
-                    "blend_file_path": "project/scenes/scene.blend",
-                    "project_paths": ["project/textures/wood.png", "project/assets/shared.blend"],
+                    "blend_file_path": "Project Files/scenes/Scene 1.blend",
+                    "project_paths": [
+                        "Project Files/textures/Wood Floor.png",
+                        "Project Files/assets/linked/Shared Scene.blend",
+                    ],
                     "render_mode": "still",
                     "frame": "1",
                 },
                 files=[
-                    ("blend_file", ("scene.blend", b"blend-bytes", "application/octet-stream")),
-                    ("project_files", ("wood.png", b"png-bytes", "application/octet-stream")),
-                    ("project_files", ("shared.blend", b"linked-blend", "application/octet-stream")),
+                    ("blend_file", ("Scene 1.blend", b"blend-bytes", "application/octet-stream")),
+                    ("project_files", ("Wood Floor.png", b"png-bytes", "application/octet-stream")),
+                    ("project_files", ("Shared Scene.blend", b"linked-blend", "application/octet-stream")),
                 ],
             )
 
         assert response.status_code == 200
         payload = response.json()
         input_root = tmp_path / "jobs" / payload["id"] / "input"
-        assert payload["source_filename"] == "project/scenes/scene.blend"
-        assert (input_root / "project" / "scenes" / "scene.blend").read_bytes() == b"blend-bytes"
-        assert (input_root / "project" / "textures" / "wood.png").read_bytes() == b"png-bytes"
-        assert (input_root / "project" / "assets" / "shared.blend").read_bytes() == b"linked-blend"
+        assert payload["source_filename"] == "Project Files/scenes/Scene 1.blend"
+        assert (
+            input_root / "Project Files" / "scenes" / "Scene 1.blend"
+        ).read_bytes() == b"blend-bytes"
+        assert (
+            input_root / "Project Files" / "textures" / "Wood Floor.png"
+        ).read_bytes() == b"png-bytes"
+        assert (
+            input_root / "Project Files" / "assets" / "linked" / "Shared Scene.blend"
+        ).read_bytes() == b"linked-blend"
     finally:
         _restore_env(previous)
 
@@ -247,6 +256,58 @@ def test_blend_inspect_returns_camera_payload(tmp_path: Path) -> None:
         assert payload["default_camera"] == "Camera_Main"
         assert payload["frame"] == 7
         assert payload["cameras"][0]["preview_data_url"].startswith("data:image/png;base64,")
+    finally:
+        _restore_env(previous)
+
+
+def test_blend_inspect_uploads_full_folder_tree_for_camera_scan(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with _client_for(tmp_path) as client:
+            async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
+                source_root = source_path.parents[2]
+                assert source_path == (
+                    source_root / "Project Files" / "scenes" / "Scene 1.blend"
+                )
+                assert (
+                    source_root / "Project Files" / "textures" / "Wood Floor.png"
+                ).read_bytes() == b"png-bytes"
+                assert (
+                    source_root
+                    / "Project Files"
+                    / "linked"
+                    / "Shared Library.blend"
+                ).read_bytes() == b"linked-blend"
+                return {"default_camera": None, "frame": 1, "cameras": []}
+
+            client.app.state.runtime.runner.inspect_blend = fake_inspect
+            response = client.post(
+                "/api/blend-inspect",
+                data={
+                    "blend_file_path": "Project Files/scenes/Scene 1.blend",
+                    "project_paths": [
+                        "Project Files/textures/Wood Floor.png",
+                        "Project Files/linked/Shared Library.blend",
+                    ],
+                },
+                files=[
+                    ("blend_file", ("Scene 1.blend", b"inspect-me", "application/octet-stream")),
+                    ("project_files", ("Wood Floor.png", b"png-bytes", "application/octet-stream")),
+                    (
+                        "project_files",
+                        ("Shared Library.blend", b"linked-blend", "application/octet-stream"),
+                    ),
+                ],
+            )
+
+        assert response.status_code == 200
+        payload = response.json()
+        inspect_root = tmp_path / "tmp" / "inspect" / payload["inspection_token"]
+        session_payload = json.loads((inspect_root / "session.json").read_text("utf-8"))
+        assert session_payload["source_filename"] == "Project Files/scenes/Scene 1.blend"
+        assert session_payload["source_path"] == str(
+            inspect_root / "source" / "Project Files" / "scenes" / "Scene 1.blend"
+        )
     finally:
         _restore_env(previous)
 
@@ -300,12 +361,15 @@ def test_batch_job_can_reuse_saved_inspection_upload(tmp_path: Path) -> None:
         inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
         source_dir = inspect_root / "source"
         source_dir.mkdir(parents=True, exist_ok=True)
-        source_path = source_dir / "scene.blend"
+        source_path = source_dir / "Project Files" / "scenes" / "Scene 1.blend"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
         source_path.write_bytes(b"reused-upload")
+        (source_dir / "Project Files" / "textures").mkdir(parents=True, exist_ok=True)
+        (source_dir / "Project Files" / "textures" / "Wood Floor.png").write_bytes(b"texture")
         (inspect_root / "session.json").write_text(
             json.dumps(
                 {
-                    "source_filename": "scene.blend",
+                    "source_filename": "Project Files/scenes/Scene 1.blend",
                     "source_path": str(source_path),
                 }
             ),
@@ -325,9 +389,14 @@ def test_batch_job_can_reuse_saved_inspection_upload(tmp_path: Path) -> None:
         assert response.status_code == 200
         payload = response.json()
         assert len(payload) == 1
-        source_file = tmp_path / "jobs" / payload[0]["id"] / "input" / "scene.blend"
+        input_root = tmp_path / "jobs" / payload[0]["id"] / "input"
+        source_file = input_root / "Project Files" / "scenes" / "Scene 1.blend"
         assert source_file.exists()
         assert source_file.read_bytes() == b"reused-upload"
+        assert (
+            input_root / "Project Files" / "textures" / "Wood Floor.png"
+        ).read_bytes() == b"texture"
+        assert payload[0]["source_filename"] == "Project Files/scenes/Scene 1.blend"
         assert not inspect_root.exists()
     finally:
         _restore_env(previous)

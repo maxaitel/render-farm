@@ -52,8 +52,7 @@ def sanitize_relative_path(path_value: str) -> Path:
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise HTTPException(status_code=400, detail="Invalid project file path.")
 
-    sanitized_parts = [sanitize_filename(part) for part in path.parts]
-    return Path(*sanitized_parts)
+    return Path(*path.parts)
 
 
 def unique_camera_names(camera_names: list[str] | None) -> list[str]:
@@ -355,22 +354,42 @@ async def create_jobs_batch(
 @app.post("/api/blend-inspect")
 async def inspect_blend_file(
     blend_file: UploadFile = File(...),
+    blend_file_path: str | None = Form(None),
+    project_files: list[UploadFile] | None = File(None),
+    project_paths: list[str] | None = Form(None),
     frame: int | None = Form(None),
 ) -> dict:
     state = runtime_state()
-    filename = sanitize_filename(blend_file.filename or "project.blend")
+    relative_source_path = (
+        sanitize_relative_path(blend_file_path)
+        if blend_file_path and blend_file_path.strip()
+        else Path(sanitize_filename(blend_file.filename or "project.blend"))
+    )
+    filename = relative_source_path.as_posix()
     if not filename.lower().endswith(".blend"):
         raise HTTPException(status_code=400, detail="Only .blend files are accepted.")
+
+    normalized_project_files = project_files or []
+    normalized_project_paths = project_paths or []
+    if normalized_project_files and len(normalized_project_files) != len(normalized_project_paths):
+        raise HTTPException(status_code=400, detail="Project files are missing relative paths.")
 
     cleanup_expired_inspect_sessions(state.settings)
     inspection_token = uuid.uuid4().hex[:12]
     inspect_root = inspect_session_root(state.settings, inspection_token)
     inspect_root.mkdir(parents=True, exist_ok=True)
-    source_path = inspect_root / "source" / filename
+    source_root = inspect_root / "source"
+    source_path = source_root / relative_source_path
     source_path.parent.mkdir(parents=True, exist_ok=True)
     keepalive_task: asyncio.Task[None] | None = None
     try:
         await save_upload(blend_file, source_path)
+        for upload, path_value in zip(normalized_project_files, normalized_project_paths, strict=True):
+            relative_project_path = sanitize_relative_path(path_value)
+            if relative_project_path == relative_source_path:
+                await upload.close()
+                continue
+            await save_upload(upload, source_root / relative_project_path)
         write_inspect_session(
             state.settings,
             inspection_token,
@@ -471,7 +490,8 @@ async def create_jobs_from_upload(
         assert inspect_token is not None
         validated_inspect_token = validate_inspect_token(inspect_token)
         session = load_inspect_session(state.settings, validated_inspect_token)
-        filename = sanitize_filename(session["source_filename"])
+        relative_source_path = sanitize_relative_path(session["source_filename"])
+        filename = relative_source_path.as_posix()
         prepared_source_path = Path(session["source_path"])
         session_root = inspect_session_root(state.settings, validated_inspect_token)
     else:
@@ -541,7 +561,15 @@ async def create_jobs_from_upload(
         if not prepared_source_path.exists():
             raise HTTPException(status_code=404, detail="Saved camera scan source file is missing. Scan the blend file again.")
         try:
-            link_or_copy_file(prepared_source_path, first_source_path)
+            if session_root is not None:
+                link_or_copy_tree(session_root / "source", first_input_root)
+                if not first_source_path.exists():
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Saved camera scan source file is missing. Scan the blend file again.",
+                    )
+            else:
+                link_or_copy_file(prepared_source_path, first_source_path)
             for job_root in job_roots[1:]:
                 link_or_copy_tree(first_input_root, job_root / "input")
         except Exception:

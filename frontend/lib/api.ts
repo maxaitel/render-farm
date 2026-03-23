@@ -1,5 +1,10 @@
 import type { BlendInspection, RenderJob, SystemStatus } from "@/lib/types";
 
+export type ProjectUploadEntry = {
+  file: File;
+  path: string;
+};
+
 async function parseResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ detail: "Request failed." }));
@@ -69,10 +74,21 @@ export async function inspectBlendFile(
   frame: number | undefined,
   onProgress: (progress: number) => void,
   onPhaseChange: (phase: "uploading" | "processing") => void,
+  options?: {
+    blendFilePath?: string;
+    projectFiles?: ProjectUploadEntry[];
+  },
 ): Promise<BlendInspection> {
   return new Promise<BlendInspection>((resolve, reject) => {
     const formData = new FormData();
     formData.set("blend_file", file, file.name);
+    if (options?.blendFilePath) {
+      formData.set("blend_file_path", options.blendFilePath);
+    }
+    options?.projectFiles?.forEach(({ file: projectFile, path }) => {
+      formData.append("project_files", projectFile, projectFile.name);
+      formData.append("project_paths", path);
+    });
     if (frame) {
       formData.set("frame", String(frame));
     }

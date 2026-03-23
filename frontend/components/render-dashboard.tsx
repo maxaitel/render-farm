@@ -18,6 +18,7 @@ import {
   releaseBlendInspection,
   fetchSystemStatus,
   inspectBlendFile,
+  type ProjectUploadEntry,
   submitJobWithProgress,
   submitJobsWithProgress,
   touchBlendInspection,
@@ -100,6 +101,26 @@ function formatBytes(bytes: number) {
 
 function fileLabel(file: File) {
   return file.webkitRelativePath || file.name;
+}
+
+function folderProjectUploadEntries(
+  blendFile: File,
+  projectFiles: File[],
+): {
+  blendPath: string;
+  projectEntries: ProjectUploadEntry[];
+} {
+  const blendPath = fileLabel(blendFile);
+  return {
+    blendPath,
+    projectEntries: projectFiles.flatMap((projectFile) => {
+      const path = fileLabel(projectFile);
+      if (path === blendPath) {
+        return [];
+      }
+      return [{ file: projectFile, path }];
+    }),
+  };
 }
 
 function totalFileBytes(files: File[]) {
@@ -423,15 +444,14 @@ export function RenderDashboard() {
         } else {
           payload.set("blend_file", file, file.name);
           if (uploadSourceMode === "folder") {
-            const blendPath = file.webkitRelativePath || file.name;
+            const { blendPath, projectEntries } = folderProjectUploadEntries(
+              file,
+              selectedProjectFiles,
+            );
             payload.set("blend_file_path", blendPath);
-            selectedProjectFiles.forEach((projectFile) => {
-              const projectPath = projectFile.webkitRelativePath || projectFile.name;
-              if (projectPath === blendPath) {
-                return;
-              }
+            projectEntries.forEach(({ file: projectFile, path }) => {
               payload.append("project_files", projectFile, projectFile.name);
-              payload.append("project_paths", projectPath);
+              payload.append("project_paths", path);
             });
           }
         }
@@ -515,6 +535,10 @@ export function RenderDashboard() {
     const requestId = cameraScanRequestRef.current;
     const expectedScanKey = activeCameraScanKey;
     try {
+      const folderUploadOptions =
+        uploadSourceMode === "folder"
+          ? folderProjectUploadEntries(selectedFiles[0], selectedProjectFiles)
+          : undefined;
       const inspection = await inspectBlendFile(
         selectedFiles[0],
         previewFrame,
@@ -536,6 +560,12 @@ export function RenderDashboard() {
           }
           setCameraScanPhase(phase);
         },
+        folderUploadOptions
+          ? {
+              blendFilePath: folderUploadOptions.blendPath,
+              projectFiles: folderUploadOptions.projectEntries,
+            }
+          : undefined,
       );
       if (
         requestId !== cameraScanRequestRef.current ||
