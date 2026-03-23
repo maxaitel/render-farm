@@ -80,6 +80,26 @@ def inspect_session_meta_path(settings: Settings, token: str) -> Path:
     return inspect_session_root(settings, token) / "session.json"
 
 
+def write_inspect_session(
+    settings: Settings,
+    token: str,
+    *,
+    source_filename: str,
+    source_path: Path,
+    state: str,
+) -> None:
+    inspect_session_meta_path(settings, token).write_text(
+        json.dumps(
+            {
+                "source_filename": source_filename,
+                "source_path": str(source_path),
+                "state": state,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def load_inspect_session(settings: Settings, token: str) -> dict:
     meta_path = inspect_session_meta_path(settings, token)
     if not meta_path.exists():
@@ -108,6 +128,13 @@ def cleanup_expired_inspect_sessions(settings: Settings, max_age_seconds: int = 
             if not entry.is_dir():
                 continue
             meta_path = entry / "session.json"
+            if meta_path.exists():
+                try:
+                    payload = json.loads(meta_path.read_text("utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    payload = None
+                if payload and payload.get("state") == "processing":
+                    continue
             reference_path = meta_path if meta_path.exists() else entry
             if reference_path.stat().st_mtime >= cutoff:
                 continue
@@ -305,15 +332,20 @@ async def inspect_blend_file(
     source_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         await save_upload(blend_file, source_path)
+        write_inspect_session(
+            state.settings,
+            inspection_token,
+            source_filename=filename,
+            source_path=source_path,
+            state="processing",
+        )
         payload = await state.runner.inspect_blend(source_path, preview_frame=frame)
-        inspect_session_meta_path(state.settings, inspection_token).write_text(
-            json.dumps(
-                {
-                    "source_filename": filename,
-                    "source_path": str(source_path),
-                }
-            ),
-            encoding="utf-8",
+        write_inspect_session(
+            state.settings,
+            inspection_token,
+            source_filename=filename,
+            source_path=source_path,
+            state="ready",
         )
         payload["inspection_token"] = inspection_token
         return payload
@@ -409,6 +441,7 @@ async def create_jobs_from_upload(
     requested_cameras = unique_camera_names(camera_names)
     job_camera_names: list[str | None] = requested_cameras or [None]
     jobs: list[JobRecord] = []
+    job_roots: list[Path] = []
 
     for camera_name in job_camera_names:
         job_id = uuid.uuid4().hex[:12]
@@ -417,6 +450,7 @@ async def create_jobs_from_upload(
         output_dir = job_root / "outputs"
         input_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
+        job_roots.append(job_root)
         jobs.append(
             JobRecord(
                 id=job_id,
@@ -439,15 +473,25 @@ async def create_jobs_from_upload(
     if prepared_source_path is not None:
         if not prepared_source_path.exists():
             raise HTTPException(status_code=404, detail="Saved camera scan source file is missing. Scan the blend file again.")
-        link_or_copy_file(prepared_source_path, first_source_path)
+        try:
+            link_or_copy_file(prepared_source_path, first_source_path)
+            for job in jobs[1:]:
+                link_or_copy_file(first_source_path, Path(job.source_path))
+        except Exception:
+            for job_root in job_roots:
+                shutil.rmtree(job_root, ignore_errors=True)
+            raise
     else:
         assert blend_file is not None
-        await save_upload(blend_file, first_source_path)
+        try:
+            await save_upload(blend_file, first_source_path)
+            for job in jobs[1:]:
+                link_or_copy_file(first_source_path, Path(job.source_path))
+        except Exception:
+            for job_root in job_roots:
+                shutil.rmtree(job_root, ignore_errors=True)
+            raise
 
-    for job in jobs[1:]:
-        link_or_copy_file(first_source_path, Path(job.source_path))
-
-    job_roots = [state.settings.jobs_root / job.id for job in jobs]
     try:
         snapshots = await state.store.create_many(jobs)
     except Exception:

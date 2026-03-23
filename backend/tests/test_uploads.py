@@ -216,6 +216,28 @@ def test_blend_inspect_returns_camera_payload(tmp_path: Path) -> None:
         _restore_env(previous)
 
 
+def test_blend_inspect_persists_processing_session_before_runner_finishes(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with _client_for(tmp_path) as client:
+            async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
+                inspect_root = source_path.parents[1]
+                payload = json.loads((inspect_root / "session.json").read_text("utf-8"))
+                assert payload["state"] == "processing"
+                assert payload["source_path"] == str(source_path)
+                return {"default_camera": None, "frame": 1, "cameras": []}
+
+            client.app.state.runtime.runner.inspect_blend = fake_inspect
+            response = client.post(
+                "/api/blend-inspect",
+                files={"blend_file": ("scene.blend", b"inspect-me", "application/octet-stream")},
+            )
+
+        assert response.status_code == 200
+    finally:
+        _restore_env(previous)
+
+
 def test_batch_job_can_reuse_saved_inspection_upload(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:
@@ -408,6 +430,33 @@ def test_touch_blend_inspection_refreshes_session_expiry(tmp_path: Path) -> None
         _restore_env(previous)
 
 
+def test_processing_inspection_session_is_not_reaped(tmp_path: Path) -> None:
+    inspect_token = "inspect-processing"
+    inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
+    source_dir = inspect_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source_path = source_dir / "scene.blend"
+    source_path.write_bytes(b"keep-me")
+    session_path = inspect_root / "session.json"
+    session_path.write_text(
+        json.dumps(
+            {
+                "source_filename": "scene.blend",
+                "source_path": str(source_path),
+                "state": "processing",
+            }
+        ),
+        encoding="utf-8",
+    )
+    old_timestamp = time.time() - (2 * 60 * 60)
+    os.utime(inspect_root, (old_timestamp, old_timestamp))
+    os.utime(session_path, (old_timestamp, old_timestamp))
+
+    cleanup_expired_inspect_sessions(Settings(tmp_path, "/bin/true", "AUTO", ["CPU"], True))
+
+    assert inspect_root.exists()
+
+
 def test_invalid_inspect_token_is_rejected(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:
@@ -423,6 +472,48 @@ def test_invalid_inspect_token_is_rejected(tmp_path: Path) -> None:
 
         assert response.status_code == 400
         assert response.json()["detail"] == "Invalid camera scan token."
+    finally:
+        _restore_env(previous)
+
+
+def test_failed_secondary_copy_cleans_up_prepared_job_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        copy_calls = 0
+        created_job_ids: list[str] = []
+
+        from app import main as main_module
+
+        original_link_or_copy = main_module.link_or_copy_file
+
+        def flaky_link_or_copy(source: Path, destination: Path) -> None:
+            nonlocal copy_calls
+            copy_calls += 1
+            created_job_ids.append(destination.parents[1].name)
+            if copy_calls == 1:
+                raise OSError("disk full")
+            original_link_or_copy(source, destination)
+
+        monkeypatch.setattr(main_module, "link_or_copy_file", flaky_link_or_copy)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            response = client.post(
+                "/api/jobs/batch",
+                files=[
+                    ("blend_file", ("scene.blend", b"camera-job-data", "application/octet-stream")),
+                    ("render_mode", (None, "still")),
+                    ("frame", (None, "5")),
+                    ("camera_names", (None, "Cam_A")),
+                    ("camera_names", (None, "Cam_B")),
+                ],
+        )
+
+        assert response.status_code == 500
+        for job_id in created_job_ids:
+            assert not (tmp_path / "jobs" / job_id).exists()
+        assert not any((tmp_path / "jobs").iterdir())
     finally:
         _restore_env(previous)
 

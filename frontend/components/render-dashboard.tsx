@@ -161,6 +161,17 @@ function liveDetail(job: RenderJob) {
     : "Waiting for worker";
 }
 
+function formatElapsedDuration(milliseconds: number) {
+  const totalSeconds = milliseconds / 1000;
+  if (totalSeconds < 60) {
+    return `${totalSeconds.toFixed(1)}s`;
+  }
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds.toFixed(1)}s`;
+}
+
 const INSPECTION_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
 
 export function RenderDashboard() {
@@ -178,6 +189,12 @@ export function RenderDashboard() {
   const [cameraScanPhase, setCameraScanPhase] = useState<
     "uploading" | "processing"
   >("uploading");
+  const [cameraScanStartedAt, setCameraScanStartedAt] = useState<number | null>(
+    null,
+  );
+  const [cameraScanElapsedMs, setCameraScanElapsedMs] = useState<number | null>(
+    null,
+  );
   const [submitting, setSubmitting] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [activeUploadName, setActiveUploadName] = useState<string | null>(null);
@@ -261,6 +278,21 @@ export function RenderDashboard() {
   }, [cameraInspection?.inspection_token]);
 
   useEffect(() => {
+    if (!inspectingCameras || cameraScanStartedAt === null) {
+      return;
+    }
+
+    setCameraScanElapsedMs(Date.now() - cameraScanStartedAt);
+    const intervalId = window.setInterval(() => {
+      setCameraScanElapsedMs(Date.now() - cameraScanStartedAt);
+    }, 200);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [inspectingCameras, cameraScanStartedAt]);
+
+  useEffect(() => {
     const inspectionToken = cameraInspection?.inspection_token;
     if (!inspectionToken) {
       return;
@@ -331,6 +363,8 @@ export function RenderDashboard() {
     setSelectedCameraNames([]);
     setCameraScanProgress(0);
     setCameraScanPhase("uploading");
+    setCameraScanStartedAt(null);
+    setCameraScanElapsedMs(null);
     setError(null);
   }, [uploadSourceMode]);
 
@@ -342,6 +376,8 @@ export function RenderDashboard() {
     setSelectedCameraNames([]);
     setCameraScanProgress(0);
     setCameraScanPhase("uploading");
+    setCameraScanStartedAt(null);
+    setCameraScanElapsedMs(null);
   }, [activeCameraScanKey]);
 
   const stats = useMemo(() => {
@@ -456,6 +492,9 @@ export function RenderDashboard() {
     setInspectingCameras(true);
     setCameraScanProgress(0);
     setCameraScanPhase("uploading");
+    const scanStartedAt = Date.now();
+    setCameraScanStartedAt(scanStartedAt);
+    setCameraScanElapsedMs(0);
     setError(null);
     const requestId = cameraScanRequestRef.current;
     const expectedScanKey = activeCameraScanKey;
@@ -475,6 +514,7 @@ export function RenderDashboard() {
       }
       setCameraInspection(inspection);
       setSelectedCameraNames([]);
+      setCameraScanElapsedMs(Date.now() - scanStartedAt);
     } catch (inspectError) {
       if (
         requestId !== cameraScanRequestRef.current ||
@@ -486,6 +526,8 @@ export function RenderDashboard() {
       setSelectedCameraNames([]);
       setCameraScanProgress(0);
       setCameraScanPhase("uploading");
+      setCameraScanStartedAt(null);
+      setCameraScanElapsedMs(null);
       setError(
         inspectError instanceof Error
           ? inspectError.message
@@ -523,6 +565,10 @@ export function RenderDashboard() {
     : cameraInspection?.cameras.length
       ? `${cameraInspection.cameras.length} camera${cameraInspection.cameras.length === 1 ? "" : "s"} found.`
       : "Scan the selected blend file to preview cameras and choose one or more render angles.";
+  const cameraScanElapsedLabel =
+    cameraScanElapsedMs !== null
+      ? formatElapsedDuration(cameraScanElapsedMs)
+      : null;
 
   return (
     <main className="min-h-screen bg-paper text-ink">
@@ -848,7 +894,12 @@ export function RenderDashboard() {
                           </div>
                           <div className="mt-3 flex items-center justify-between gap-3 text-sm text-steel">
                             <span>{cameraScanLabel}</span>
-                            <span>{Math.round(cameraScanProgress)}%</span>
+                            <div className="text-right">
+                              {cameraScanElapsedLabel ? (
+                                <p>{cameraScanElapsedLabel}</p>
+                              ) : null}
+                              <p>{Math.round(cameraScanProgress)}%</p>
+                            </div>
                           </div>
                           <div className="mt-3">
                             <Progress value={cameraScanProgress} />
@@ -862,6 +913,9 @@ export function RenderDashboard() {
                             Preview frame {cameraInspection.frame}. Selected{" "}
                             {selectedCameraNames.length || 0} camera
                             {selectedCameraNames.length === 1 ? "" : "s"}.
+                            {cameraScanElapsedLabel
+                              ? ` Scan took ${cameraScanElapsedLabel}.`
+                              : ""}
                           </p>
                           <div className="grid gap-3 sm:grid-cols-2">
                             {cameraInspection.cameras.map((camera) => {
@@ -912,6 +966,9 @@ export function RenderDashboard() {
                       ) : cameraInspection ? (
                         <p className="mt-4 text-sm text-steel">
                           No cameras were found in this blend file.
+                          {cameraScanElapsedLabel
+                            ? ` Scan took ${cameraScanElapsedLabel}.`
+                            : ""}
                         </p>
                       ) : null}
                     </div>
