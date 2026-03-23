@@ -27,6 +27,32 @@ def choose_preview_engine() -> str:
     return bpy.context.scene.render.engine
 
 
+def configure_cycles_cpu_preview(scene: bpy.types.Scene) -> None:
+    cycles = getattr(scene, "cycles", None)
+    if cycles and hasattr(cycles, "device"):
+        try:
+            cycles.device = "CPU"
+        except Exception:
+            pass
+
+    try:
+        cycles_addon = bpy.context.preferences.addons.get("cycles")
+    except Exception:
+        cycles_addon = None
+    preferences = getattr(cycles_addon, "preferences", None)
+    if preferences and hasattr(preferences, "compute_device_type"):
+        try:
+            preferences.compute_device_type = "NONE"
+        except Exception:
+            pass
+        refresh_devices = getattr(preferences, "refresh_devices", None)
+        if callable(refresh_devices):
+            try:
+                refresh_devices()
+            except Exception:
+                pass
+
+
 def safe_name(value: str) -> str:
     cleaned = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in value)
     return cleaned.strip("-_") or "camera"
@@ -60,6 +86,8 @@ def render_preview(
     try:
         scene.camera = camera
         scene.render.engine = choose_preview_engine()
+        if scene.render.engine == "CYCLES":
+            configure_cycles_cpu_preview(scene)
         scene.render.filepath = str(output_path)
         scene.render.image_settings.file_format = "PNG"
         scene.render.image_settings.color_mode = "RGB"

@@ -84,11 +84,17 @@ def load_inspect_session(settings: Settings, token: str) -> dict:
     meta_path = inspect_session_meta_path(settings, token)
     if not meta_path.exists():
         raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+    touch_inspect_session(settings, token)
     return json.loads(meta_path.read_text("utf-8"))
 
 
 def delete_inspect_session(settings: Settings, token: str) -> None:
     shutil.rmtree(inspect_session_root(settings, token), ignore_errors=True)
+
+
+def touch_inspect_session(settings: Settings, token: str) -> None:
+    meta_path = inspect_session_meta_path(settings, token)
+    meta_path.touch()
 
 
 def cleanup_expired_inspect_sessions(settings: Settings, max_age_seconds: int = INSPECT_SESSION_MAX_AGE_SECONDS) -> None:
@@ -320,6 +326,16 @@ async def inspect_blend_file(
 async def release_blend_inspection(inspection_token: str) -> dict:
     state = runtime_state()
     delete_inspect_session(state.settings, inspection_token)
+    return {"ok": True}
+
+
+@app.post("/api/blend-inspect/{inspection_token}/touch")
+async def touch_blend_inspection(inspection_token: str) -> dict:
+    state = runtime_state()
+    token = validate_inspect_token(inspection_token)
+    if not inspect_session_meta_path(state.settings, token).exists():
+        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+    touch_inspect_session(state.settings, token)
     return {"ok": True}
 
 

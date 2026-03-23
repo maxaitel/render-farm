@@ -20,6 +20,7 @@ import {
   inspectBlendFile,
   submitJobWithProgress,
   submitJobsWithProgress,
+  touchBlendInspection,
 } from "@/lib/api";
 import type {
   BlendInspection,
@@ -160,6 +161,8 @@ function liveDetail(job: RenderJob) {
     : "Waiting for worker";
 }
 
+const INSPECTION_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
+
 export function RenderDashboard() {
   const [jobs, setJobs] = useState<RenderJob[]>([]);
   const [system, setSystem] = useState<SystemStatus | null>(null);
@@ -254,6 +257,27 @@ export function RenderDashboard() {
         return;
       }
       void releaseBlendInspection(inspectionToken);
+    };
+  }, [cameraInspection?.inspection_token]);
+
+  useEffect(() => {
+    const inspectionToken = cameraInspection?.inspection_token;
+    if (!inspectionToken) {
+      return;
+    }
+    if (submittingInspectionTokenRef.current === inspectionToken) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      if (submittingInspectionTokenRef.current === inspectionToken) {
+        return;
+      }
+      void touchBlendInspection(inspectionToken);
+    }, INSPECTION_TOUCH_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
     };
   }, [cameraInspection?.inspection_token]);
 

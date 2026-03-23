@@ -155,6 +155,15 @@ export async function releaseBlendInspection(
   }).catch(() => undefined);
 }
 
+export async function touchBlendInspection(
+  inspectionToken: string,
+): Promise<void> {
+  await fetch(`backend/api/blend-inspect/${inspectionToken}/touch`, {
+    method: "POST",
+    keepalive: true,
+  }).catch(() => undefined);
+}
+
 function submitWithProgress<T>(
   url: string,
   formData: FormData,

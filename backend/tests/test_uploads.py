@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.main import app, inspect_session_cleanup_loop
+from app.main import app, cleanup_expired_inspect_sessions, inspect_session_cleanup_loop
 from app.models import JobRecord, RenderDevice, RenderMode, OutputFormat, utc_now
 from app.renderer import RenderRunner
 from app.store import JobStore
@@ -373,6 +373,37 @@ def test_release_blend_inspection_deletes_saved_upload(tmp_path: Path) -> None:
         assert response.status_code == 200
         assert response.json()["ok"] is True
         assert not inspect_root.exists()
+    finally:
+        _restore_env(previous)
+
+
+def test_touch_blend_inspection_refreshes_session_expiry(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        inspect_token = "inspect-touch"
+        with _client_for(tmp_path) as client:
+            inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
+            source_dir = inspect_root / "source"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            (source_dir / "scene.blend").write_bytes(b"keep-me")
+            session_path = inspect_root / "session.json"
+            session_path.write_text(
+                json.dumps(
+                    {
+                        "source_filename": "scene.blend",
+                        "source_path": str(source_dir / "scene.blend"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            old_timestamp = time.time() - (2 * 60 * 60)
+            os.utime(inspect_root, (old_timestamp, old_timestamp))
+            os.utime(session_path, (old_timestamp, old_timestamp))
+            response = client.post(f"/api/blend-inspect/{inspect_token}/touch")
+
+        assert response.status_code == 200
+        cleanup_expired_inspect_sessions(Settings(tmp_path, "/bin/true", "AUTO", ["CPU"], True))
+        assert inspect_root.exists()
     finally:
         _restore_env(previous)
 
