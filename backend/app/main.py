@@ -374,7 +374,7 @@ async def inspect_blend_file(
 
     normalized_project_files = project_files or []
     normalized_project_paths = project_paths or []
-    if normalized_project_files and len(normalized_project_files) != len(normalized_project_paths):
+    if len(normalized_project_files) != len(normalized_project_paths):
         raise HTTPException(status_code=400, detail="Project files are missing relative paths.")
 
     cleanup_expired_inspect_sessions(state.settings)
@@ -510,7 +510,7 @@ async def create_jobs_from_upload(
 
     normalized_project_files = project_files or []
     normalized_project_paths = project_paths or []
-    if normalized_project_files and len(normalized_project_files) != len(normalized_project_paths):
+    if len(normalized_project_files) != len(normalized_project_paths):
         raise HTTPException(status_code=400, detail="Project files are missing relative paths.")
 
     if render_mode == RenderMode.still:

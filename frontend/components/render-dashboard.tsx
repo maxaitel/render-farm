@@ -156,14 +156,14 @@ function folderRenderTargets(projectFiles: File[]) {
   }
 
   const rankedFiles = blendFiles.map((file) => {
-    const directories = fileLabel(file)
-      .split("/")
-      .slice(0, -1)
-      .map((part) => part.toLowerCase());
+    const directories = fileLabel(file).split("/").slice(0, -1);
+    const normalizedDirectories = directories.map((part) => part.toLowerCase());
     const auxiliaryScore = directories.filter((part) =>
-      AUXILIARY_DIRECTORY_NAMES.has(part),
+      AUXILIARY_DIRECTORY_NAMES.has(part.toLowerCase()),
     ).length;
-    const sceneScore = directories.some((part) => SCENE_DIRECTORY_NAMES.has(part))
+    const sceneScore = normalizedDirectories.some((part) =>
+      SCENE_DIRECTORY_NAMES.has(part),
+    )
       ? 0
       : 1;
 
@@ -171,6 +171,7 @@ function folderRenderTargets(projectFiles: File[]) {
       file,
       auxiliaryScore,
       sceneScore,
+      depth: directories.length,
     };
   });
 
@@ -182,12 +183,22 @@ function folderRenderTargets(projectFiles: File[]) {
       .filter(({ auxiliaryScore }) => auxiliaryScore === bestAuxiliaryScore)
       .map(({ sceneScore }) => sceneScore),
   );
+  const bestDepth = Math.min(
+    ...rankedFiles
+      .filter(
+        ({ auxiliaryScore, sceneScore }) =>
+          auxiliaryScore === bestAuxiliaryScore &&
+          sceneScore === bestSceneScore,
+      )
+      .map(({ depth }) => depth),
+  );
 
   return rankedFiles
     .filter(
-      ({ auxiliaryScore, sceneScore }) =>
+      ({ auxiliaryScore, sceneScore, depth }) =>
         auxiliaryScore === bestAuxiliaryScore &&
-        sceneScore === bestSceneScore,
+        sceneScore === bestSceneScore &&
+        depth === bestDepth,
     )
     .map(({ file }) => file);
 }

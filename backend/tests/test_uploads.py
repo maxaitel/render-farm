@@ -228,6 +228,29 @@ def test_folder_upload_preserves_relative_project_assets(tmp_path: Path) -> None
         _restore_env(previous)
 
 
+def test_job_upload_rejects_project_paths_without_project_files(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with _client_for(tmp_path) as client:
+            response = client.post(
+                "/api/jobs",
+                data={
+                    "blend_file_path": "Project Files/scenes/Scene 1.blend",
+                    "project_paths": ["Project Files/textures/Wood Floor.png"],
+                    "render_mode": "still",
+                    "frame": "1",
+                },
+                files={
+                    "blend_file": ("Scene 1.blend", b"blend-bytes", "application/octet-stream"),
+                },
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Project files are missing relative paths."
+    finally:
+        _restore_env(previous)
+
+
 def test_blend_inspect_returns_camera_payload(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:
@@ -259,6 +282,27 @@ def test_blend_inspect_returns_camera_payload(tmp_path: Path) -> None:
         assert payload["default_camera"] == "Camera_Main"
         assert payload["frame"] == 7
         assert payload["cameras"][0]["preview_data_url"].startswith("data:image/png;base64,")
+    finally:
+        _restore_env(previous)
+
+
+def test_blend_inspect_rejects_project_paths_without_project_files(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with _client_for(tmp_path) as client:
+            response = client.post(
+                "/api/blend-inspect",
+                data={
+                    "blend_file_path": "Project Files/scenes/Scene 1.blend",
+                    "project_paths": ["Project Files/textures/Wood Floor.png"],
+                },
+                files={
+                    "blend_file": ("Scene 1.blend", b"inspect-me", "application/octet-stream"),
+                },
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Project files are missing relative paths."
     finally:
         _restore_env(previous)
 
