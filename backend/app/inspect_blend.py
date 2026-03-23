@@ -65,6 +65,22 @@ def camera_payload(camera: bpy.types.Object, preview_path: Path | None) -> dict:
     }
 
 
+def capped_preview_dimensions(
+    width: int,
+    height: int,
+    *,
+    max_width: int = 640,
+    max_height: int = 360,
+) -> tuple[int, int]:
+    safe_width = max(int(width), 1)
+    safe_height = max(int(height), 1)
+    scale = min(max_width / safe_width, max_height / safe_height, 1.0)
+    return (
+        max(1, int(round(safe_width * scale))),
+        max(1, int(round(safe_height * scale))),
+    )
+
+
 def render_preview(
     scene: bpy.types.Scene,
     camera: bpy.types.Object,
@@ -93,10 +109,12 @@ def render_preview(
         scene.render.image_settings.color_mode = "RGB"
         scene.render.use_file_extension = True
 
-        width = max(320, min(scene.render.resolution_x, 640))
-        height = max(180, int(width * (scene.render.resolution_y / max(scene.render.resolution_x, 1))))
+        width, height = capped_preview_dimensions(
+            scene.render.resolution_x,
+            scene.render.resolution_y,
+        )
         scene.render.resolution_x = width
-        scene.render.resolution_y = min(height, 360)
+        scene.render.resolution_y = height
         scene.render.resolution_percentage = 100
 
         cycles = getattr(scene, "cycles", None)
@@ -145,5 +163,5 @@ def main() -> None:
 
     Path(args.output_json).write_text(json.dumps(payload), encoding="utf-8")
 
-
-main()
+if __name__ == "__main__":
+    main()

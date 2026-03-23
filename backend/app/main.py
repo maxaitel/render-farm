@@ -152,6 +152,9 @@ def cleanup_expired_inspect_sessions(settings: Settings, max_age_seconds: int = 
             reference_path = meta_path if meta_path.exists() else entry
             if reference_path.stat().st_mtime >= cutoff:
                 continue
+            current_reference_path = meta_path if meta_path.exists() else entry
+            if current_reference_path.stat().st_mtime >= cutoff:
+                continue
         except FileNotFoundError:
             continue
         shutil.rmtree(entry, ignore_errors=True)

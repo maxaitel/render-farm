@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 import sqlite3
+import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -682,6 +685,49 @@ def test_keepalive_inspection_session_refreshes_processing_mtime(
     assert session_path.stat().st_mtime > old_timestamp
 
 
+def test_cleanup_skips_session_touched_after_expiry_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inspect_token = "inspect-race"
+    inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
+    source_dir = inspect_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source_path = source_dir / "scene.blend"
+    source_path.write_bytes(b"keep-me")
+    session_path = inspect_root / "session.json"
+    session_path.write_text(
+        json.dumps(
+            {
+                "source_filename": "scene.blend",
+                "source_path": str(source_path),
+                "state": "ready",
+            }
+        ),
+        encoding="utf-8",
+    )
+    old_timestamp = time.time() - (2 * 60 * 60)
+    os.utime(inspect_root, (old_timestamp, old_timestamp))
+    os.utime(session_path, (old_timestamp, old_timestamp))
+    stale_stat = session_path.stat()
+    original_stat = Path.stat
+    first_session_stat = True
+
+    def racy_stat(self: Path, *args, **kwargs):
+        nonlocal first_session_stat
+        if self == session_path and first_session_stat:
+            first_session_stat = False
+            refreshed = time.time()
+            os.utime(session_path, (refreshed, refreshed))
+            return stale_stat
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", racy_stat)
+
+    cleanup_expired_inspect_sessions(Settings(tmp_path, "/bin/true", "AUTO", ["CPU"], True))
+
+    assert inspect_root.exists()
+
+
 def test_invalid_inspect_token_is_rejected(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:
@@ -814,6 +860,57 @@ def test_blend_inspection_runs_prepare_render_before_camera_scan(tmp_path: Path)
             os.environ.pop("RENDER_CAMERA_NAME", None)
         else:
             os.environ["RENDER_CAMERA_NAME"] = previous_camera_name
+
+
+def test_preview_render_preserves_aspect_ratio_when_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_bpy = types.SimpleNamespace(
+        context=types.SimpleNamespace(scene=None, preferences=types.SimpleNamespace(addons={})),
+        ops=types.SimpleNamespace(render=types.SimpleNamespace(render=None)),
+        types=types.SimpleNamespace(Scene=object, Object=object),
+    )
+    monkeypatch.setitem(sys.modules, "bpy", fake_bpy)
+    sys.modules.pop("app.inspect_blend", None)
+    inspect_blend = importlib.import_module("app.inspect_blend")
+
+    captured: dict[str, tuple[int, int]] = {}
+    scene = types.SimpleNamespace(
+        camera=None,
+        render=types.SimpleNamespace(
+            engine="BLENDER_EEVEE",
+            filepath="",
+            image_settings=types.SimpleNamespace(file_format="OPEN_EXR", color_mode="RGBA"),
+            resolution_x=1080,
+            resolution_y=1920,
+            resolution_percentage=50,
+            use_file_extension=False,
+        ),
+    )
+    fake_bpy.context.scene = scene
+
+    def fake_render(*, write_still: bool) -> None:
+        captured["resolution"] = (scene.render.resolution_x, scene.render.resolution_y)
+        Path(scene.render.filepath).write_bytes(b"preview")
+
+    fake_bpy.ops.render.render = fake_render
+    monkeypatch.setattr(inspect_blend, "choose_preview_engine", lambda: "CYCLES")
+    monkeypatch.setattr(inspect_blend, "configure_cycles_cpu_preview", lambda _scene: None)
+
+    preview_path = inspect_blend.render_preview(
+        scene,
+        types.SimpleNamespace(name="PortraitCam"),
+        tmp_path,
+        "portrait-preview",
+    )
+
+    assert preview_path == tmp_path / "portrait-preview.png"
+    width, height = captured["resolution"]
+    assert height == 360
+    assert abs((width / height) - (1080 / 1920)) < 0.01
+    assert scene.render.resolution_x == 1080
+    assert scene.render.resolution_y == 1920
+    assert scene.render.resolution_percentage == 50
 
 
 def test_expired_inspection_upload_is_reaped_on_next_scan(tmp_path: Path) -> None:
