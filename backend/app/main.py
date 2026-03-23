@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,6 +20,7 @@ from .renderer import RenderRunner
 from .store import JobStore
 
 FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 
 
 class AppState:
@@ -34,10 +37,33 @@ def sanitize_filename(filename: str) -> str:
     return cleaned or "project.blend"
 
 
+def unique_camera_names(camera_names: list[str] | None) -> list[str]:
+    if not camera_names:
+        return []
+
+    seen: set[str] = set()
+    names: list[str] = []
+    for camera_name in camera_names:
+        cleaned = camera_name.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        names.append(cleaned)
+    return names
+
+
+def link_or_copy_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
 async def save_upload(upload: UploadFile, destination: Path) -> None:
     async with aiofiles.open(destination, "wb") as out_file:
         while True:
-            chunk = await upload.read(1024 * 1024)
+            chunk = await upload.read(UPLOAD_CHUNK_SIZE)
             if not chunk:
                 break
             await out_file.write(chunk)
@@ -70,14 +96,15 @@ async def lifespan(app: FastAPI):
     settings = load_settings()
     settings.jobs_root.mkdir(parents=True, exist_ok=True)
     settings.temp_root.mkdir(parents=True, exist_ok=True)
-    store = JobStore(settings.jobs_root)
+    store = JobStore(settings.database_path)
     await store.load()
     queue: asyncio.Queue[str] = asyncio.Queue()
     for job_id in await store.queued_job_ids():
         queue.put_nowait(job_id)
     runner = RenderRunner(settings, store)
     state = AppState(settings, store, runner, queue)
-    state.worker_task = asyncio.create_task(worker_loop(state))
+    if not settings.disable_worker:
+        state.worker_task = asyncio.create_task(worker_loop(state))
     app.state.runtime = state
     try:
         yield
@@ -88,6 +115,7 @@ async def lifespan(app: FastAPI):
                 await state.worker_task
             except asyncio.CancelledError:
                 pass
+        await store.close()
 
 
 app = FastAPI(title="Render Farm", lifespan=lifespan)
@@ -141,54 +169,67 @@ async def create_job(
     render_mode: RenderMode = Form(RenderMode.still),
     output_format: OutputFormat = Form(OutputFormat.png),
     device_preference: RenderDevice = Form(RenderDevice.auto),
+    camera_name: str | None = Form(None),
     frame: int | None = Form(None),
     start_frame: int | None = Form(None),
     end_frame: int | None = Form(None),
+) -> dict:
+    jobs = await create_jobs_from_upload(
+        blend_file=blend_file,
+        render_mode=render_mode,
+        output_format=output_format,
+        device_preference=device_preference,
+        camera_names=[camera_name] if camera_name else None,
+        frame=frame,
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
+    return jobs[0]
+
+
+@app.post("/api/jobs/batch")
+async def create_jobs_batch(
+    blend_file: UploadFile = File(...),
+    render_mode: RenderMode = Form(RenderMode.still),
+    output_format: OutputFormat = Form(OutputFormat.png),
+    device_preference: RenderDevice = Form(RenderDevice.auto),
+    camera_names: list[str] | None = Form(None),
+    frame: int | None = Form(None),
+    start_frame: int | None = Form(None),
+    end_frame: int | None = Form(None),
+) -> list[dict]:
+    return await create_jobs_from_upload(
+        blend_file=blend_file,
+        render_mode=render_mode,
+        output_format=output_format,
+        device_preference=device_preference,
+        camera_names=camera_names,
+        frame=frame,
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
+
+
+@app.post("/api/blend-inspect")
+async def inspect_blend_file(
+    blend_file: UploadFile = File(...),
+    frame: int | None = Form(None),
 ) -> dict:
     state = runtime_state()
     filename = sanitize_filename(blend_file.filename or "project.blend")
     if not filename.lower().endswith(".blend"):
         raise HTTPException(status_code=400, detail="Only .blend files are accepted.")
 
-    if render_mode == RenderMode.still:
-        frame = frame or 1
-        start_frame = None
-        end_frame = None
-        total_frames = 1
-    else:
-        start_frame = start_frame or 1
-        end_frame = end_frame or start_frame
-        if end_frame < start_frame:
-            raise HTTPException(status_code=400, detail="End frame must be greater than or equal to start frame.")
-        frame = None
-        total_frames = end_frame - start_frame + 1
-
-    job_id = uuid.uuid4().hex[:12]
-    job_root = state.settings.jobs_root / job_id
-    input_dir = job_root / "input"
-    output_dir = job_root / "outputs"
-    input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    source_path = input_dir / filename
-    await save_upload(blend_file, source_path)
-
-    job = JobRecord(
-        id=job_id,
-        source_filename=filename,
-        source_path=str(source_path),
-        output_directory=str(output_dir),
-        render_mode=render_mode,
-        output_format=output_format,
-        requested_device=device_preference,
-        frame=frame,
-        start_frame=start_frame,
-        end_frame=end_frame,
-        total_frames=total_frames,
-    )
-    snapshot = await state.store.create(job)
-    state.queue.put_nowait(job_id)
-    return snapshot.model_dump(mode="json")
+    inspect_root = state.settings.temp_root / "inspect" / uuid.uuid4().hex[:12]
+    inspect_root.mkdir(parents=True, exist_ok=True)
+    source_path = inspect_root / filename
+    try:
+        await save_upload(blend_file, source_path)
+        return await state.runner.inspect_blend(source_path, preview_frame=frame)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        shutil.rmtree(inspect_root, ignore_errors=True)
 
 
 @app.get("/api/jobs/{job_id}/events")
@@ -208,6 +249,78 @@ async def stream_job(job_id: str) -> StreamingResponse:
             await state.store.unsubscribe(job_id, queue)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+async def create_jobs_from_upload(
+    *,
+    blend_file: UploadFile,
+    render_mode: RenderMode,
+    output_format: OutputFormat,
+    device_preference: RenderDevice,
+    camera_names: list[str] | None,
+    frame: int | None,
+    start_frame: int | None,
+    end_frame: int | None,
+) -> list[dict]:
+    state = runtime_state()
+    filename = sanitize_filename(blend_file.filename or "project.blend")
+    if not filename.lower().endswith(".blend"):
+        raise HTTPException(status_code=400, detail="Only .blend files are accepted.")
+
+    if render_mode == RenderMode.still:
+        frame = frame or 1
+        start_frame = None
+        end_frame = None
+        total_frames = 1
+    else:
+        start_frame = start_frame or 1
+        end_frame = end_frame or start_frame
+        if end_frame < start_frame:
+            raise HTTPException(status_code=400, detail="End frame must be greater than or equal to start frame.")
+        frame = None
+        total_frames = end_frame - start_frame + 1
+
+    requested_cameras = unique_camera_names(camera_names)
+    job_camera_names: list[str | None] = requested_cameras or [None]
+    jobs: list[JobRecord] = []
+
+    for camera_name in job_camera_names:
+        job_id = uuid.uuid4().hex[:12]
+        job_root = state.settings.jobs_root / job_id
+        input_dir = job_root / "input"
+        output_dir = job_root / "outputs"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        jobs.append(
+            JobRecord(
+                id=job_id,
+                source_filename=filename,
+                source_path=str(input_dir / filename),
+                output_directory=str(output_dir),
+                render_mode=render_mode,
+                output_format=output_format,
+                requested_device=device_preference,
+                camera_name=camera_name,
+                frame=frame,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                total_frames=total_frames,
+            )
+        )
+
+    first_job = jobs[0]
+    first_source_path = Path(first_job.source_path)
+    await save_upload(blend_file, first_source_path)
+
+    for job in jobs[1:]:
+        link_or_copy_file(first_source_path, Path(job.source_path))
+
+    snapshots: list[dict] = []
+    for job in jobs:
+        snapshot = await state.store.create(job)
+        state.queue.put_nowait(job.id)
+        snapshots.append(snapshot.model_dump(mode="json"))
+    return snapshots
 
 
 @app.get("/api/jobs/{job_id}/download")

@@ -4,6 +4,7 @@ import Image from "next/image";
 import type { FormEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Camera,
   ChevronDown,
   Cpu,
   Download,
@@ -11,8 +12,19 @@ import {
   SquareTerminal,
 } from "lucide-react";
 
-import { fetchJobs, fetchSystemStatus, submitJobWithProgress } from "@/lib/api";
-import type { RenderJob, RenderMode, SystemStatus } from "@/lib/types";
+import {
+  fetchJobs,
+  fetchSystemStatus,
+  inspectBlendFile,
+  submitJobWithProgress,
+  submitJobsWithProgress,
+} from "@/lib/api";
+import type {
+  BlendInspection,
+  RenderJob,
+  RenderMode,
+  SystemStatus,
+} from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -27,6 +39,8 @@ type JobFormState = {
   outputFormat: "PNG" | "JPEG" | "OPEN_EXR";
   devicePreference: "AUTO" | "CUDA" | "OPTIX" | "CPU";
 };
+
+type UploadSourceMode = "files" | "folder";
 
 const INITIAL_FORM: JobFormState = {
   renderMode: "still",
@@ -81,6 +95,14 @@ function formatBytes(bytes: number) {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+function fileLabel(file: File) {
+  return file.webkitRelativePath || file.name;
+}
+
+function totalFileBytes(files: File[]) {
+  return files.reduce((total, file) => total + file.size, 0);
+}
+
 function deviceSummary(system: SystemStatus | null) {
   if (!system) {
     return "Loading";
@@ -122,12 +144,24 @@ export function RenderDashboard() {
   const [jobs, setJobs] = useState<RenderJob[]>([]);
   const [system, setSystem] = useState<SystemStatus | null>(null);
   const [form, setForm] = useState<JobFormState>(INITIAL_FORM);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [uploadSourceMode, setUploadSourceMode] =
+    useState<UploadSourceMode>("files");
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [cameraInspection, setCameraInspection] =
+    useState<BlendInspection | null>(null);
+  const [selectedCameraNames, setSelectedCameraNames] = useState<string[]>([]);
+  const [inspectingCameras, setInspectingCameras] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [activeUploadName, setActiveUploadName] = useState<string | null>(null);
+  const [activeUploadIndex, setActiveUploadIndex] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const sourcesRef = useRef<Map<string, EventSource>>(new Map());
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const cameraScanAvailable = selectedFiles.length === 1;
+  const previewFrame = form.renderMode === "still" ? form.frame : form.startFrame;
 
   useEffect(() => {
     let cancelled = false;
@@ -204,6 +238,30 @@ export function RenderDashboard() {
     });
   }, [jobs]);
 
+  useEffect(() => {
+    const input = fileInputRef.current;
+    if (!input) {
+      return;
+    }
+
+    input.multiple = true;
+    if (uploadSourceMode === "folder") {
+      input.setAttribute("webkitdirectory", "");
+      input.setAttribute("directory", "");
+      input.removeAttribute("accept");
+    } else {
+      input.removeAttribute("webkitdirectory");
+      input.removeAttribute("directory");
+      input.setAttribute("accept", ".blend");
+    }
+
+    input.value = "";
+    setSelectedFiles([]);
+    setCameraInspection(null);
+    setSelectedCameraNames([]);
+    setError(null);
+  }, [uploadSourceMode]);
+
   const stats = useMemo(() => {
     const running = jobs.filter((job) => job.phase === "running").length;
     const queued = jobs.filter((job) => job.phase === "queued").length;
@@ -213,36 +271,66 @@ export function RenderDashboard() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selectedFile) {
-      setError("Choose a .blend file first.");
+    if (!selectedFiles.length) {
+      setError(
+        uploadSourceMode === "folder"
+          ? "Choose a folder with at least one .blend file."
+          : "Choose one or more .blend files first.",
+      );
       return;
-    }
-
-    const payload = new FormData();
-    payload.set("blend_file", selectedFile);
-    payload.set("render_mode", form.renderMode);
-    payload.set("output_format", form.outputFormat);
-    payload.set("device_preference", form.devicePreference);
-    if (form.renderMode === "still") {
-      payload.set("frame", String(form.frame));
-    } else {
-      payload.set("start_frame", String(form.startFrame));
-      payload.set("end_frame", String(form.endFrame));
     }
 
     setSubmitting(true);
     setUploadProgress(0);
+    setActiveUploadIndex(1);
+    setActiveUploadName(fileLabel(selectedFiles[0]));
     setError(null);
     try {
-      const job = await submitJobWithProgress(payload, setUploadProgress);
-      setJobs((current) => upsertJob(current, job));
-      setSelectedFile(null);
+      for (const [index, file] of selectedFiles.entries()) {
+        const payload = new FormData();
+        payload.set("blend_file", file, file.name);
+        payload.set("render_mode", form.renderMode);
+        payload.set("output_format", form.outputFormat);
+        payload.set("device_preference", form.devicePreference);
+        const requestedCameraNames =
+          selectedFiles.length === 1 ? selectedCameraNames : [];
+        requestedCameraNames.forEach((cameraName) => {
+          payload.append("camera_names", cameraName);
+        });
+        if (form.renderMode === "still") {
+          payload.set("frame", String(form.frame));
+        } else {
+          payload.set("start_frame", String(form.startFrame));
+          payload.set("end_frame", String(form.endFrame));
+        }
+
+        setActiveUploadIndex(index + 1);
+        setActiveUploadName(fileLabel(file));
+        const submittedJobs =
+          requestedCameraNames.length > 0
+            ? await submitJobsWithProgress(payload, (progress) => {
+                const overallProgress =
+                  ((index + progress / 100) / selectedFiles.length) * 100;
+                setUploadProgress(overallProgress);
+              })
+            : [
+                await submitJobWithProgress(payload, (progress) => {
+                  const overallProgress =
+                    ((index + progress / 100) / selectedFiles.length) * 100;
+                  setUploadProgress(overallProgress);
+                }),
+              ];
+        submittedJobs.forEach((job) => {
+          setJobs((current) => upsertJob(current, job));
+        });
+      }
+
+      setSelectedFiles([]);
+      setCameraInspection(null);
+      setSelectedCameraNames([]);
       setForm(INITIAL_FORM);
-      const fileInput = document.getElementById(
-        "blend-file",
-      ) as HTMLInputElement | null;
-      if (fileInput) {
-        fileInput.value = "";
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
       }
     } catch (submitError) {
       setError(
@@ -253,13 +341,55 @@ export function RenderDashboard() {
     } finally {
       setSubmitting(false);
       setUploadProgress(0);
+      setActiveUploadIndex(0);
+      setActiveUploadName(null);
     }
   }
 
+  async function handleInspectCameras() {
+    if (!cameraScanAvailable) {
+      return;
+    }
+
+    setInspectingCameras(true);
+    setError(null);
+    try {
+      const inspection = await inspectBlendFile(selectedFiles[0], previewFrame);
+      setCameraInspection(inspection);
+      setSelectedCameraNames(
+        inspection.default_camera
+          ? [inspection.default_camera]
+          : inspection.cameras[0]
+            ? [inspection.cameras[0].name]
+            : [],
+      );
+    } catch (inspectError) {
+      setCameraInspection(null);
+      setSelectedCameraNames([]);
+      setError(
+        inspectError instanceof Error
+          ? inspectError.message
+          : "Failed to inspect cameras.",
+      );
+    } finally {
+      setInspectingCameras(false);
+    }
+  }
+
+  function toggleCamera(name: string) {
+    setSelectedCameraNames((current) =>
+      current.includes(name)
+        ? current.filter((cameraName) => cameraName !== name)
+        : [...current, name],
+    );
+  }
+
   const uploadStageLabel =
-    uploadProgress >= 100
-      ? "Upload complete. Registering render job."
-      : "Uploading blend file to the render host.";
+    selectedFiles.length > 1
+      ? `Uploading ${activeUploadIndex} of ${selectedFiles.length}${activeUploadName ? `: ${activeUploadName}` : ""}`
+      : uploadProgress >= 100
+        ? "Upload complete. Registering render job."
+        : "Uploading blend file to the render host.";
 
   return (
     <main className="min-h-screen bg-paper text-ink">
@@ -358,6 +488,9 @@ export function RenderDashboard() {
                         <div className="mt-3 flex flex-wrap gap-x-5 gap-y-2 text-sm text-steel">
                           <span>{frameLabel(job)}</span>
                           <span>{job.output_format}</span>
+                          {job.camera_name ? (
+                            <span>Camera {job.camera_name}</span>
+                          ) : null}
                           <span>Requested {job.requested_device}</span>
                           <span>{liveDetail(job)}</span>
                         </div>
@@ -433,33 +566,88 @@ export function RenderDashboard() {
                 </div>
 
                 <form className="mt-8 space-y-5" onSubmit={handleSubmit}>
-                  <Label title="Blend file">
+                  <div>
+                    <span className="mb-2 block font-subheading text-[11px] uppercase tracking-[0.08em] text-ink/62">
+                      Upload source
+                    </span>
+                    <div className="grid grid-cols-2 gap-2 rounded-[1.15rem] bg-black/[0.04] p-1">
+                      <ModeButton
+                        active={uploadSourceMode === "files"}
+                        label="Files"
+                        onClick={() => setUploadSourceMode("files")}
+                      />
+                      <ModeButton
+                        active={uploadSourceMode === "folder"}
+                        label="Folder"
+                        onClick={() => setUploadSourceMode("folder")}
+                      />
+                    </div>
+                  </div>
+
+                  <Label
+                    title={
+                      uploadSourceMode === "folder"
+                        ? "Blend folder"
+                        : "Blend files"
+                    }
+                  >
                     <input
                       id="blend-file"
-                      accept=".blend"
                       className="block w-full rounded-[1rem] border border-dashed border-line bg-white px-4 py-4 text-sm text-ink outline-none transition file:mr-4 file:rounded-full file:border-0 file:bg-ember file:px-4 file:py-2 file:text-sm file:font-semibold file:tracking-[0] file:text-white hover:border-ember/30 focus:border-ember"
-                      onChange={(event) =>
-                        setSelectedFile(event.target.files?.[0] ?? null)
-                      }
+                      multiple
+                      onChange={(event) => {
+                        const files = Array.from(
+                          event.target.files ?? [],
+                        ).filter((file) =>
+                          file.name.toLowerCase().endsWith(".blend"),
+                        );
+                        setSelectedFiles(files);
+                        setCameraInspection(null);
+                        setSelectedCameraNames([]);
+                        if (!files.length && event.target.files?.length) {
+                          setError("Only .blend files are accepted.");
+                        } else {
+                          setError(null);
+                        }
+                      }}
+                      ref={fileInputRef}
                       type="file"
                     />
                   </Label>
 
-                  {selectedFile ? (
+                  {selectedFiles.length ? (
                     <div className="rounded-[1.2rem] border border-line bg-white px-4 py-4">
                       <div className="flex items-start justify-between gap-4">
                         <div className="min-w-0">
                           <p className="truncate font-subheading text-sm tracking-[0] text-ink">
-                            {selectedFile.name}
+                            {selectedFiles.length === 1
+                              ? fileLabel(selectedFiles[0])
+                              : `${selectedFiles.length} blend files selected`}
                           </p>
                           <p className="mt-1 text-sm text-steel">
-                            {formatBytes(selectedFile.size)}
+                            {formatBytes(totalFileBytes(selectedFiles))}
                           </p>
                         </div>
                         <span className="rounded-full bg-sand px-3 py-1 font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
                           {submitting ? "Uploading" : "Ready"}
                         </span>
                       </div>
+
+                      {selectedFiles.length > 1 ? (
+                        <div className="mt-4 space-y-1 text-sm text-steel">
+                          {selectedFiles.slice(0, 3).map((file) => (
+                            <p className="truncate" key={fileLabel(file)}>
+                              {fileLabel(file)}
+                            </p>
+                          ))}
+                          {selectedFiles.length > 3 ? (
+                            <p>
+                              +{selectedFiles.length - 3} more file
+                              {selectedFiles.length - 3 === 1 ? "" : "s"}
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
 
                       {submitting ? (
                         <div className="mt-4">
@@ -471,10 +659,101 @@ export function RenderDashboard() {
                         </div>
                       ) : (
                         <p className="mt-4 text-sm leading-6 text-steel">
-                          Large scenes take a moment to transfer before they are
-                          visible in the queue.
+                          {uploadSourceMode === "folder"
+                            ? "Every .blend file in the selected folder will be queued as its own render job."
+                            : "Large scenes take a moment to transfer before they are visible in the queue."}
                         </p>
                       )}
+                    </div>
+                  ) : null}
+
+                  {selectedFiles.length ? (
+                    <div className="rounded-[1.2rem] border border-line bg-mist px-4 py-4">
+                      <div className="flex items-start justify-between gap-4">
+                        <div>
+                          <p className="font-subheading text-sm text-ink">
+                            Camera views
+                          </p>
+                          <p className="mt-1 text-sm text-steel">
+                            {cameraScanAvailable
+                              ? "Scan the selected blend file to preview cameras and choose one or more render angles."
+                              : "Camera previews are available when one blend file is selected at a time."}
+                          </p>
+                        </div>
+                        {cameraScanAvailable ? (
+                          <Button
+                            disabled={inspectingCameras || submitting}
+                            onClick={handleInspectCameras}
+                            type="button"
+                            variant="secondary"
+                          >
+                            {inspectingCameras
+                              ? "Scanning"
+                              : cameraInspection
+                                ? "Rescan cameras"
+                                : "Scan cameras"}
+                          </Button>
+                        ) : null}
+                      </div>
+
+                      {cameraInspection?.cameras.length ? (
+                        <div className="mt-4 space-y-3">
+                          <p className="text-sm text-steel">
+                            Preview frame {cameraInspection.frame}. Selected{" "}
+                            {selectedCameraNames.length || 0} camera
+                            {selectedCameraNames.length === 1 ? "" : "s"}.
+                          </p>
+                          <div className="grid gap-3 sm:grid-cols-2">
+                            {cameraInspection.cameras.map((camera) => {
+                              const active = selectedCameraNames.includes(
+                                camera.name,
+                              );
+                              return (
+                                <button
+                                  className={`overflow-hidden rounded-[1.15rem] border text-left transition ${
+                                    active
+                                      ? "border-ember bg-white shadow-[0_14px_30px_rgba(207,32,46,0.12)]"
+                                      : "border-line bg-white hover:border-ink/25"
+                                  }`}
+                                  key={camera.name}
+                                  onClick={() => toggleCamera(camera.name)}
+                                  type="button"
+                                >
+                                  {camera.preview_data_url ? (
+                                    <img
+                                      alt={`${camera.name} preview`}
+                                      className="h-28 w-full object-cover"
+                                      src={camera.preview_data_url}
+                                    />
+                                  ) : (
+                                    <div className="flex h-28 items-center justify-center bg-sand text-steel">
+                                      <Camera className="h-5 w-5" />
+                                    </div>
+                                  )}
+                                  <div className="flex items-center justify-between gap-3 px-3 py-3">
+                                    <span className="min-w-0 truncate font-subheading text-sm text-ink">
+                                      {camera.name}
+                                    </span>
+                                    <span
+                                      className={`rounded-full px-2 py-1 font-subheading text-[10px] uppercase tracking-[0.08em] ${
+                                        active
+                                          ? "bg-ember text-white"
+                                          : "bg-sand text-steel"
+                                      }`}
+                                    >
+                                      {active ? "Selected" : "Select"}
+                                    </span>
+                                  </div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ) : cameraInspection ? (
+                        <p className="mt-4 text-sm text-steel">
+                          No cameras were found in this blend file.
+                        </p>
+                      ) : null}
                     </div>
                   ) : null}
 
@@ -608,10 +887,12 @@ export function RenderDashboard() {
                     type="submit"
                   >
                     {submitting
-                      ? uploadProgress >= 100
-                        ? "Creating render job"
-                        : `Uploading ${Math.round(uploadProgress)}%`
-                      : "Queue render"}
+                      ? `Uploading ${Math.round(uploadProgress)}%`
+                      : selectedCameraNames.length > 1 && selectedFiles.length === 1
+                        ? `Queue ${selectedCameraNames.length} camera renders`
+                      : selectedFiles.length > 1
+                        ? `Queue ${selectedFiles.length} renders`
+                        : "Queue render"}
                   </Button>
                 </form>
               </Card>

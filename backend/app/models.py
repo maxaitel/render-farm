@@ -52,6 +52,7 @@ class JobRecord(BaseModel):
     output_format: OutputFormat
     requested_device: RenderDevice = RenderDevice.auto
     resolved_device: str | None = None
+    camera_name: str | None = None
     frame: int | None = None
     start_frame: int | None = None
     end_frame: int | None = None
@@ -70,4 +71,3 @@ class JobRecord(BaseModel):
     @property
     def output_dir(self) -> Path:
         return Path(self.output_directory)
-

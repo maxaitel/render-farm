@@ -1,4 +1,4 @@
-import type { RenderJob, SystemStatus } from "@/lib/types";
+import type { BlendInspection, RenderJob, SystemStatus } from "@/lib/types";
 
 async function parseResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -54,9 +54,40 @@ export async function submitJobWithProgress(
   formData: FormData,
   onProgress: (progress: number) => void,
 ): Promise<RenderJob> {
-  return new Promise<RenderJob>((resolve, reject) => {
+  return submitWithProgress<RenderJob>("backend/api/jobs", formData, onProgress);
+}
+
+export async function submitJobsWithProgress(
+  formData: FormData,
+  onProgress: (progress: number) => void,
+): Promise<RenderJob[]> {
+  return submitWithProgress<RenderJob[]>("backend/api/jobs/batch", formData, onProgress);
+}
+
+export async function inspectBlendFile(
+  file: File,
+  frame?: number,
+): Promise<BlendInspection> {
+  const formData = new FormData();
+  formData.set("blend_file", file, file.name);
+  if (frame) {
+    formData.set("frame", String(frame));
+  }
+  const response = await fetch("backend/api/blend-inspect", {
+    method: "POST",
+    body: formData,
+  });
+  return parseResponse<BlendInspection>(response);
+}
+
+function submitWithProgress<T>(
+  url: string,
+  formData: FormData,
+  onProgress: (progress: number) => void,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
     const request = new XMLHttpRequest();
-    request.open("POST", "backend/api/jobs");
+    request.open("POST", url);
     request.responseType = "json";
 
     request.upload.onprogress = (event) => {
@@ -69,11 +100,11 @@ export async function submitJobWithProgress(
     request.onload = () => {
       const payload =
         request.response ??
-        (request.responseText ? (JSON.parse(request.responseText) as RenderJob | { detail?: string }) : null);
+        (request.responseText ? (JSON.parse(request.responseText) as T | { detail?: string }) : null);
 
       if (request.status >= 200 && request.status < 300 && payload) {
         onProgress(100);
-        resolve(payload as RenderJob);
+        resolve(payload as T);
         return;
       }
 

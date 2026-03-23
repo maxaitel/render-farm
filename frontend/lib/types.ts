@@ -17,6 +17,7 @@ export interface RenderJob {
   output_format: string;
   requested_device: string;
   resolved_device: string | null;
+  camera_name: string | null;
   frame: number | null;
   start_frame: number | null;
   end_frame: number | null;
@@ -45,4 +46,15 @@ export interface SystemStatus {
   };
   job_count: number;
   active_jobs: number;
+}
+
+export interface BlendCameraPreview {
+  name: string;
+  preview_data_url?: string | null;
+}
+
+export interface BlendInspection {
+  default_camera: string | null;
+  frame: number;
+  cameras: BlendCameraPreview[];
 }

@@ -2,34 +2,79 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable
 
-from .models import JobPhase, JobRecord
+from .models import JobPhase, JobRecord, utc_now
 
 
 Mutator = Callable[[JobRecord], None]
 
+SCHEMA_SQL = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    source_filename TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS jobs_created_at_idx ON jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS jobs_phase_idx ON jobs(phase);
+"""
+
 
 class JobStore:
-    def __init__(self, jobs_root: Path) -> None:
-        self.jobs_root = jobs_root
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = database_path
+        self.jobs_root = database_path.parent / "jobs"
         self._jobs: dict[str, JobRecord] = {}
         self._subscribers: dict[str, set[asyncio.Queue[dict]]] = defaultdict(set)
         self._lock = asyncio.Lock()
+        self._conn: sqlite3.Connection | None = None
 
     async def load(self) -> None:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.jobs_root.mkdir(parents=True, exist_ok=True)
-        for meta_path in sorted(self.jobs_root.glob("*/job.json")):
-            payload = await asyncio.to_thread(meta_path.read_text, "utf-8")
-            job = JobRecord.model_validate_json(payload)
+        self._conn = sqlite3.connect(self.database_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(SCHEMA_SQL)
+        self._conn.execute(
+            "INSERT OR IGNORE INTO users (id, username, created_at) VALUES (1, ?, ?)",
+            ("local", utc_now().isoformat()),
+        )
+        self._conn.commit()
+
+        self._jobs = {}
+        rows = self._conn.execute("SELECT payload FROM jobs ORDER BY created_at ASC").fetchall()
+        if not rows:
+            await self._import_legacy_jobs()
+            rows = self._conn.execute("SELECT payload FROM jobs ORDER BY created_at ASC").fetchall()
+
+        for row in rows:
+            job = JobRecord.model_validate_json(row["payload"])
             if job.phase == JobPhase.running:
                 job.phase = JobPhase.failed
                 job.error = "Server restarted while the render was in progress."
                 job.status_message = "Interrupted by server restart."
             self._jobs[job.id] = job
             await self._persist(job)
+
+    async def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     async def list_jobs(self) -> list[JobRecord]:
         async with self._lock:
@@ -112,9 +157,34 @@ class JobStore:
                 continue
 
     async def _persist(self, snapshot: JobRecord) -> None:
-        job_dir = self.jobs_root / snapshot.id
-        job_dir.mkdir(parents=True, exist_ok=True)
-        meta_path = job_dir / "job.json"
-        payload = json.dumps(snapshot.model_dump(mode="json"), indent=2)
-        await asyncio.to_thread(meta_path.write_text, payload, "utf-8")
+        if self._conn is None:
+            raise RuntimeError("JobStore database is not initialized.")
 
+        payload = snapshot.model_dump(mode="json")
+        self._conn.execute(
+            """
+            INSERT INTO jobs (id, user_id, created_at, phase, source_filename, payload)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                user_id = excluded.user_id,
+                created_at = excluded.created_at,
+                phase = excluded.phase,
+                source_filename = excluded.source_filename,
+                payload = excluded.payload
+            """,
+            (
+                snapshot.id,
+                1,
+                payload["created_at"],
+                payload["phase"],
+                payload["source_filename"],
+                json.dumps(payload, indent=2),
+            ),
+        )
+        self._conn.commit()
+
+    async def _import_legacy_jobs(self) -> None:
+        for meta_path in sorted(self.jobs_root.glob("*/job.json")):
+            payload = await asyncio.to_thread(meta_path.read_text, "utf-8")
+            job = JobRecord.model_validate_json(payload)
+            await self._persist(job)

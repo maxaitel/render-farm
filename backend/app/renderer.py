@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -128,10 +130,14 @@ class RenderRunner:
     async def _run_attempt(self, job: JobRecord, device: str) -> tuple[bool, str]:
         tracker = ProgressTracker(total_frames=self._total_frames(job))
         command = self._build_command(job, device)
+        env = os.environ.copy()
+        if job.camera_name:
+            env["RENDER_CAMERA_NAME"] = job.camera_name
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=env,
         )
 
         lines: list[str] = []
@@ -161,7 +167,7 @@ class RenderRunner:
             str(job.source_file),
             "-noaudio",
             "-P",
-            "/app/app/prepare_render.py",
+            str(self._script_path("prepare_render.py")),
             "-E",
             "CYCLES",
             "-o",
@@ -186,6 +192,47 @@ class RenderRunner:
             )
         command.extend(["--", "--cycles-print-stats", "--cycles-device", device])
         return command
+
+    async def inspect_blend(self, source_file: Path, preview_frame: int | None = None) -> dict:
+        with tempfile.TemporaryDirectory(dir=self.settings.temp_root) as temp_dir:
+            temp_root = Path(temp_dir)
+            output_json = temp_root / "inspection.json"
+            preview_dir = temp_root / "previews"
+            preview_dir.mkdir(parents=True, exist_ok=True)
+
+            command = [
+                self.settings.blender_binary,
+                "-b",
+                str(source_file),
+                "-noaudio",
+                "-P",
+                str(self._script_path("inspect_blend.py")),
+                "--",
+                "--output-json",
+                str(output_json),
+                "--preview-dir",
+                str(preview_dir),
+            ]
+            if preview_frame is not None:
+                command.extend(["--frame", str(preview_frame)])
+
+            output = await self._run_command(command)
+            if not output_json.exists():
+                message = output.splitlines()[-1] if output else "Failed to inspect blend file."
+                raise RuntimeError(message)
+
+            payload = json.loads(output_json.read_text("utf-8"))
+            cameras = payload.get("cameras", [])
+            for camera in cameras:
+                preview_path = camera.get("preview_path")
+                if not preview_path:
+                    continue
+                path = Path(preview_path)
+                if not path.exists():
+                    continue
+                camera["preview_data_url"] = self._preview_data_url(path)
+                camera.pop("preview_path", None)
+            return payload
 
     def _parse_progress(
         self, job: JobRecord, tracker: ProgressTracker, line: str
@@ -329,3 +376,12 @@ class RenderRunner:
         if process.returncode != 0:
             return ""
         return stdout.decode("utf-8", errors="replace").strip()
+
+    def _script_path(self, script_name: str) -> Path:
+        return Path(__file__).with_name(script_name)
+
+    def _preview_data_url(self, path: Path) -> str:
+        import base64
+
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
