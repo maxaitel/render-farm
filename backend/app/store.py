@@ -42,6 +42,7 @@ class JobStore:
         self._jobs: dict[str, JobRecord] = {}
         self._subscribers: dict[str, set[asyncio.Queue[dict]]] = defaultdict(set)
         self._lock = asyncio.Lock()
+        self._db_lock = asyncio.Lock()
         self._conn: sqlite3.Connection | None = None
 
     async def load(self) -> None:
@@ -155,6 +156,13 @@ class JobStore:
                 continue
 
     async def _persist(self, snapshot: JobRecord) -> None:
+        if self._conn is None:
+            raise RuntimeError("JobStore database is not initialized.")
+
+        async with self._db_lock:
+            await asyncio.to_thread(self._persist_sync, snapshot)
+
+    def _persist_sync(self, snapshot: JobRecord) -> None:
         if self._conn is None:
             raise RuntimeError("JobStore database is not initialized.")
 

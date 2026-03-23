@@ -114,6 +114,7 @@ function cameraScanKey(
     return "";
   }
   return [
+    file.webkitRelativePath || "",
     file.name,
     file.size,
     file.lastModified,
