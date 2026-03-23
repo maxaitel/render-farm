@@ -215,7 +215,11 @@ class RenderRunner:
             if preview_frame is not None:
                 command.extend(["--frame", str(preview_frame)])
 
-            output = await self._run_command(command, env=self._blender_env())
+            output = await self._run_command(
+                command,
+                env=self._blender_env(),
+                capture_failure_output=True,
+            )
             if not output_json.exists():
                 message = output.splitlines()[-1] if output else "Failed to inspect blend file."
                 raise RuntimeError(message)
@@ -368,7 +372,13 @@ class RenderRunner:
             env["RENDER_CAMERA_NAME"] = camera_name
         return env
 
-    async def _run_command(self, command: list[str], env: dict[str, str] | None = None) -> str:
+    async def _run_command(
+        self,
+        command: list[str],
+        env: dict[str, str] | None = None,
+        *,
+        capture_failure_output: bool = False,
+    ) -> str:
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -380,9 +390,10 @@ class RenderRunner:
             return ""
 
         stdout, _ = await process.communicate()
+        output = stdout.decode("utf-8", errors="replace").strip()
         if process.returncode != 0:
-            return ""
-        return stdout.decode("utf-8", errors="replace").strip()
+            return output if capture_failure_output else ""
+        return output
 
     def _script_path(self, script_name: str) -> Path:
         return Path(__file__).with_name(script_name)

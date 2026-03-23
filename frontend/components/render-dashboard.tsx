@@ -618,6 +618,8 @@ export function RenderDashboard() {
     setError(null);
     const requestId = cameraScanRequestRef.current;
     const expectedScanKey = activeCameraScanKey;
+    const previousInspection = cameraInspection;
+    const previousSelectedCameraNames = selectedCameraNames;
     try {
       const folderUploadOptions =
         uploadSourceMode === "folder"
@@ -668,8 +670,13 @@ export function RenderDashboard() {
       ) {
         return;
       }
-      setCameraInspection(null);
-      setSelectedCameraNames([]);
+      if (previousInspection) {
+        setCameraInspection(previousInspection);
+        setSelectedCameraNames(previousSelectedCameraNames);
+      } else {
+        setCameraInspection(null);
+        setSelectedCameraNames([]);
+      }
       setCameraScanProgress(0);
       setCameraScanPhase("uploading");
       setCameraScanStartedAt(null);

@@ -831,7 +831,12 @@ def test_blend_inspection_runs_prepare_render_before_camera_scan(tmp_path: Path)
         settings.temp_root.mkdir(parents=True, exist_ok=True)
         captured: dict[str, object] = {}
 
-        async def fake_run_command(command: list[str], env: dict[str, str] | None = None) -> str:
+        async def fake_run_command(
+            command: list[str],
+            env: dict[str, str] | None = None,
+            *,
+            capture_failure_output: bool = False,
+        ) -> str:
             captured["command"] = command
             captured["env"] = env
             output_json = Path(command[command.index("--output-json") + 1])
@@ -860,6 +865,40 @@ def test_blend_inspection_runs_prepare_render_before_camera_scan(tmp_path: Path)
             os.environ.pop("RENDER_CAMERA_NAME", None)
         else:
             os.environ["RENDER_CAMERA_NAME"] = previous_camera_name
+
+
+def test_run_command_can_return_output_for_failed_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        settings = Settings(
+            storage_root=tmp_path,
+            blender_binary="/bin/true",
+            default_device="AUTO",
+            gpu_order=["CPU"],
+            disable_worker=True,
+        )
+        runner = RenderRunner(settings, JobStore(tmp_path / "renderfarm.sqlite3"))
+
+        class FakeProcess:
+            returncode = 1
+
+            async def communicate(self) -> tuple[bytes, None]:
+                return (b"warning\nMissing linked asset", None)
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return FakeProcess()
+
+        monkeypatch.setattr("app.renderer.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+
+        output = await runner._run_command(
+            ["/bin/false"],
+            capture_failure_output=True,
+        )
+
+        assert output == "warning\nMissing linked asset"
+
+    asyncio.run(scenario())
 
 
 def test_preview_render_preserves_aspect_ratio_when_capped(
