@@ -11,7 +11,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.main import app, cleanup_expired_inspect_sessions, inspect_session_cleanup_loop
+from app.main import (
+    app,
+    cleanup_expired_inspect_sessions,
+    inspect_session_cleanup_loop,
+    keep_inspect_session_alive,
+)
 from app.models import JobRecord, RenderDevice, RenderMode, OutputFormat, utc_now
 from app.renderer import RenderRunner
 from app.store import JobStore
@@ -238,6 +243,26 @@ def test_blend_inspect_persists_processing_session_before_runner_finishes(tmp_pa
         _restore_env(previous)
 
 
+def test_blend_inspect_cleans_up_session_after_unexpected_error(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
+                raise ValueError("broken preview payload")
+
+            client.app.state.runtime.runner.inspect_blend = fake_inspect
+            response = client.post(
+                "/api/blend-inspect",
+                files={"blend_file": ("scene.blend", b"inspect-me", "application/octet-stream")},
+            )
+
+        assert response.status_code == 500
+        inspect_root = tmp_path / "tmp" / "inspect"
+        assert not inspect_root.exists() or not any(inspect_root.iterdir())
+    finally:
+        _restore_env(previous)
+
+
 def test_batch_job_can_reuse_saved_inspection_upload(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:
@@ -430,7 +455,7 @@ def test_touch_blend_inspection_refreshes_session_expiry(tmp_path: Path) -> None
         _restore_env(previous)
 
 
-def test_processing_inspection_session_is_not_reaped(tmp_path: Path) -> None:
+def test_stale_processing_inspection_session_is_reaped(tmp_path: Path) -> None:
     inspect_token = "inspect-processing"
     inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
     source_dir = inspect_root / "source"
@@ -454,7 +479,49 @@ def test_processing_inspection_session_is_not_reaped(tmp_path: Path) -> None:
 
     cleanup_expired_inspect_sessions(Settings(tmp_path, "/bin/true", "AUTO", ["CPU"], True))
 
-    assert inspect_root.exists()
+    assert not inspect_root.exists()
+
+
+def test_keepalive_inspection_session_refreshes_processing_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inspect_token = "inspect-keepalive"
+    inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
+    source_dir = inspect_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source_path = source_dir / "scene.blend"
+    source_path.write_bytes(b"keep-me")
+    session_path = inspect_root / "session.json"
+    session_path.write_text(
+        json.dumps(
+            {
+                "source_filename": "scene.blend",
+                "source_path": str(source_path),
+                "state": "processing",
+            }
+        ),
+        encoding="utf-8",
+    )
+    old_timestamp = time.time() - (2 * 60 * 60)
+    os.utime(inspect_root, (old_timestamp, old_timestamp))
+    os.utime(session_path, (old_timestamp, old_timestamp))
+
+    async def cancel_after_first_touch(_seconds: int) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.main.asyncio.sleep", cancel_after_first_touch)
+    settings = Settings(
+        storage_root=tmp_path,
+        blender_binary="/bin/true",
+        default_device="AUTO",
+        gpu_order=["CPU"],
+        disable_worker=True,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(keep_inspect_session_alive(settings, inspect_token, interval_seconds=1))
+
+    assert session_path.stat().st_mtime > old_timestamp
 
 
 def test_invalid_inspect_token_is_rejected(tmp_path: Path) -> None:

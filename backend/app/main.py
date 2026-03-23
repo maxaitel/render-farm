@@ -25,6 +25,7 @@ INSPECT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 INSPECT_SESSION_MAX_AGE_SECONDS = 60 * 60
 INSPECT_SESSION_CLEANUP_INTERVAL_SECONDS = 5 * 60
+INSPECT_SESSION_TOUCH_INTERVAL_SECONDS = 60
 
 
 class AppState:
@@ -128,13 +129,6 @@ def cleanup_expired_inspect_sessions(settings: Settings, max_age_seconds: int = 
             if not entry.is_dir():
                 continue
             meta_path = entry / "session.json"
-            if meta_path.exists():
-                try:
-                    payload = json.loads(meta_path.read_text("utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    payload = None
-                if payload and payload.get("state") == "processing":
-                    continue
             reference_path = meta_path if meta_path.exists() else entry
             if reference_path.stat().st_mtime >= cutoff:
                 continue
@@ -173,6 +167,16 @@ async def inspect_session_cleanup_loop(
 ) -> None:
     while True:
         cleanup_expired_inspect_sessions(settings)
+        await asyncio.sleep(interval_seconds)
+
+
+async def keep_inspect_session_alive(
+    settings: Settings,
+    token: str,
+    interval_seconds: int = INSPECT_SESSION_TOUCH_INTERVAL_SECONDS,
+) -> None:
+    while True:
+        touch_inspect_session(settings, token)
         await asyncio.sleep(interval_seconds)
 
 
@@ -330,6 +334,7 @@ async def inspect_blend_file(
     inspect_root.mkdir(parents=True, exist_ok=True)
     source_path = inspect_root / "source" / filename
     source_path.parent.mkdir(parents=True, exist_ok=True)
+    keepalive_task: asyncio.Task[None] | None = None
     try:
         await save_upload(blend_file, source_path)
         write_inspect_session(
@@ -338,6 +343,9 @@ async def inspect_blend_file(
             source_filename=filename,
             source_path=source_path,
             state="processing",
+        )
+        keepalive_task = asyncio.create_task(
+            keep_inspect_session_alive(state.settings, inspection_token)
         )
         payload = await state.runner.inspect_blend(source_path, preview_frame=frame)
         write_inspect_session(
@@ -352,6 +360,16 @@ async def inspect_blend_file(
     except RuntimeError as exc:
         delete_inspect_session(state.settings, inspection_token)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        delete_inspect_session(state.settings, inspection_token)
+        raise
+    finally:
+        if keepalive_task:
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
 
 
 @app.delete("/api/blend-inspect/{inspection_token}")
