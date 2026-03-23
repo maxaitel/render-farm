@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -8,8 +9,11 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app.config import Settings
 from app.main import app
 from app.models import JobRecord, RenderDevice, RenderMode, OutputFormat, utc_now
+from app.renderer import RenderRunner
+from app.store import JobStore
 
 
 def _set_test_env(storage_root: Path) -> dict[str, str | None]:
@@ -251,6 +255,54 @@ def test_batch_job_can_reuse_saved_inspection_upload(tmp_path: Path) -> None:
         _restore_env(previous)
 
 
+def test_saved_inspection_upload_is_kept_when_batch_job_creation_fails(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        inspect_token = "inspect-failure"
+        inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
+        source_dir = inspect_root / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        source_path = source_dir / "scene.blend"
+        source_path.write_bytes(b"reused-upload")
+        (inspect_root / "session.json").write_text(
+            json.dumps(
+                {
+                    "source_filename": "scene.blend",
+                    "source_path": str(source_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            original_create = client.app.state.runtime.store.create
+            create_calls = 0
+
+            async def flaky_create(job: JobRecord) -> JobRecord:
+                nonlocal create_calls
+                create_calls += 1
+                if create_calls == 2:
+                    raise RuntimeError("database write failed")
+                return await original_create(job)
+
+            client.app.state.runtime.store.create = flaky_create
+            response = client.post(
+                "/api/jobs/batch",
+                files=[
+                    ("inspect_token", (None, inspect_token)),
+                    ("render_mode", (None, "still")),
+                    ("frame", (None, "2")),
+                    ("camera_names", (None, "Cam_A")),
+                    ("camera_names", (None, "Cam_B")),
+                ],
+            )
+
+        assert response.status_code == 500
+        assert inspect_root.exists()
+    finally:
+        _restore_env(previous)
+
+
 def test_release_blend_inspection_deletes_saved_upload(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:
@@ -296,6 +348,79 @@ def test_invalid_inspect_token_is_rejected(tmp_path: Path) -> None:
         assert response.json()["detail"] == "Invalid camera scan token."
     finally:
         _restore_env(previous)
+
+
+def test_render_runner_clears_inherited_camera_env(tmp_path: Path) -> None:
+    previous_camera_name = os.environ.get("RENDER_CAMERA_NAME")
+    os.environ["RENDER_CAMERA_NAME"] = "InheritedCamera"
+    try:
+        settings = Settings(
+            storage_root=tmp_path,
+            blender_binary="/bin/true",
+            default_device="AUTO",
+            gpu_order=["CPU"],
+            disable_worker=True,
+        )
+        runner = RenderRunner(settings, JobStore(tmp_path / "renderfarm.sqlite3"))
+
+        inherited_free_env = runner._blender_env()
+        explicit_camera_env = runner._blender_env("ShotCam")
+
+        assert "RENDER_CAMERA_NAME" not in inherited_free_env
+        assert explicit_camera_env["RENDER_CAMERA_NAME"] == "ShotCam"
+    finally:
+        if previous_camera_name is None:
+            os.environ.pop("RENDER_CAMERA_NAME", None)
+        else:
+            os.environ["RENDER_CAMERA_NAME"] = previous_camera_name
+
+
+def test_blend_inspection_runs_prepare_render_before_camera_scan(tmp_path: Path) -> None:
+    previous_camera_name = os.environ.get("RENDER_CAMERA_NAME")
+    os.environ["RENDER_CAMERA_NAME"] = "InheritedCamera"
+    try:
+        settings = Settings(
+            storage_root=tmp_path,
+            blender_binary="/bin/true",
+            default_device="AUTO",
+            gpu_order=["CPU"],
+            disable_worker=True,
+        )
+        runner = RenderRunner(settings, JobStore(tmp_path / "renderfarm.sqlite3"))
+        source_path = tmp_path / "scene.blend"
+        source_path.write_bytes(b"blend")
+        settings.temp_root.mkdir(parents=True, exist_ok=True)
+        captured: dict[str, object] = {}
+
+        async def fake_run_command(command: list[str], env: dict[str, str] | None = None) -> str:
+            captured["command"] = command
+            captured["env"] = env
+            output_json = Path(command[command.index("--output-json") + 1])
+            output_json.write_text(
+                json.dumps({"default_camera": None, "frame": 4, "cameras": []}),
+                encoding="utf-8",
+            )
+            return "ok"
+
+        runner._run_command = fake_run_command  # type: ignore[method-assign]
+
+        payload = asyncio.run(runner.inspect_blend(source_path, preview_frame=4))
+
+        command = captured["command"]
+        assert isinstance(command, list)
+        prepare_script = str(runner._script_path("prepare_render.py"))
+        inspect_script = str(runner._script_path("inspect_blend.py"))
+        assert command.count("-P") == 2
+        assert prepare_script in command
+        assert inspect_script in command
+        assert command.index(prepare_script) < command.index(inspect_script)
+        assert payload["frame"] == 4
+        assert "RENDER_CAMERA_NAME" not in (captured["env"] or {})
+    finally:
+        if previous_camera_name is None:
+            os.environ.pop("RENDER_CAMERA_NAME", None)
+        else:
+            os.environ["RENDER_CAMERA_NAME"] = previous_camera_name
 
 
 def test_expired_inspection_upload_is_reaped_on_next_scan(tmp_path: Path) -> None:

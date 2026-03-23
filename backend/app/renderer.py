@@ -130,14 +130,11 @@ class RenderRunner:
     async def _run_attempt(self, job: JobRecord, device: str) -> tuple[bool, str]:
         tracker = ProgressTracker(total_frames=self._total_frames(job))
         command = self._build_command(job, device)
-        env = os.environ.copy()
-        if job.camera_name:
-            env["RENDER_CAMERA_NAME"] = job.camera_name
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env=env,
+            env=self._blender_env(job.camera_name),
         )
 
         lines: list[str] = []
@@ -206,6 +203,8 @@ class RenderRunner:
                 str(source_file),
                 "-noaudio",
                 "-P",
+                str(self._script_path("prepare_render.py")),
+                "-P",
                 str(self._script_path("inspect_blend.py")),
                 "--",
                 "--output-json",
@@ -216,7 +215,7 @@ class RenderRunner:
             if preview_frame is not None:
                 command.extend(["--frame", str(preview_frame)])
 
-            output = await self._run_command(command)
+            output = await self._run_command(command, env=self._blender_env())
             if not output_json.exists():
                 message = output.splitlines()[-1] if output else "Failed to inspect blend file."
                 raise RuntimeError(message)
@@ -362,12 +361,20 @@ class RenderRunner:
                 continue
         return {"available_types": [], "cuda": [], "optix": [], "hip": [], "cpu": []}
 
-    async def _run_command(self, command: list[str]) -> str:
+    def _blender_env(self, camera_name: str | None = None) -> dict[str, str]:
+        env = os.environ.copy()
+        env.pop("RENDER_CAMERA_NAME", None)
+        if camera_name:
+            env["RENDER_CAMERA_NAME"] = camera_name
+        return env
+
+    async def _run_command(self, command: list[str], env: dict[str, str] | None = None) -> str:
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=env,
             )
         except FileNotFoundError:
             return ""

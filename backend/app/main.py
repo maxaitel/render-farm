@@ -413,15 +413,15 @@ async def create_jobs_from_upload(
     for job in jobs[1:]:
         link_or_copy_file(first_source_path, Path(job.source_path))
 
-    if session_root is not None:
-        assert validated_inspect_token is not None
-        delete_inspect_session(state.settings, validated_inspect_token)
-
     snapshots: list[dict] = []
     for job in jobs:
         snapshot = await state.store.create(job)
         state.queue.put_nowait(job.id)
         snapshots.append(snapshot.model_dump(mode="json"))
+
+    if session_root is not None:
+        assert validated_inspect_token is not None
+        delete_inspect_session(state.settings, validated_inspect_token)
     return snapshots
 
 
