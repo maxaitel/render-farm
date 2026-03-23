@@ -380,16 +380,8 @@ async def inspect_blend_file(
     inspect_root.mkdir(parents=True, exist_ok=True)
     source_root = inspect_root / "source"
     source_path = source_root / relative_source_path
-    source_path.parent.mkdir(parents=True, exist_ok=True)
     keepalive_task: asyncio.Task[None] | None = None
     try:
-        await save_upload(blend_file, source_path)
-        for upload, path_value in zip(normalized_project_files, normalized_project_paths, strict=True):
-            relative_project_path = sanitize_relative_path(path_value)
-            if relative_project_path == relative_source_path:
-                await upload.close()
-                continue
-            await save_upload(upload, source_root / relative_project_path)
         write_inspect_session(
             state.settings,
             inspection_token,
@@ -400,6 +392,13 @@ async def inspect_blend_file(
         keepalive_task = asyncio.create_task(
             keep_inspect_session_alive(state.settings, inspection_token)
         )
+        await save_upload(blend_file, source_path)
+        for upload, path_value in zip(normalized_project_files, normalized_project_paths, strict=True):
+            relative_project_path = sanitize_relative_path(path_value)
+            if relative_project_path == relative_source_path:
+                await upload.close()
+                continue
+            await save_upload(upload, source_root / relative_project_path)
         payload = await state.runner.inspect_blend(source_path, preview_frame=frame)
         write_inspect_session(
             state.settings,

@@ -334,6 +334,65 @@ def test_blend_inspect_persists_processing_session_before_runner_finishes(tmp_pa
         _restore_env(previous)
 
 
+def test_blend_inspect_starts_session_before_uploading_project_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        from app import main as main_module
+
+        original_save_upload = main_module.save_upload
+        original_keepalive = main_module.keep_inspect_session_alive
+        keepalive_started = asyncio.Event()
+        observed_project_upload = False
+
+        async def tracked_keepalive(
+            settings: Settings,
+            token: str,
+            interval_seconds: int = 60,
+        ) -> None:
+            keepalive_started.set()
+            await original_keepalive(settings, token, interval_seconds)
+
+        async def tracked_save_upload(upload, destination: Path) -> None:
+            nonlocal observed_project_upload
+            source_root = next(parent for parent in destination.parents if parent.name == "source")
+            inspect_root = source_root.parent
+            session_path = inspect_root / "session.json"
+            payload = json.loads(session_path.read_text("utf-8"))
+            assert payload["state"] == "processing"
+            if destination.name == "Wood Floor.png":
+                await asyncio.sleep(0)
+                assert keepalive_started.is_set()
+                observed_project_upload = True
+            await original_save_upload(upload, destination)
+
+        monkeypatch.setattr(main_module, "keep_inspect_session_alive", tracked_keepalive)
+        monkeypatch.setattr(main_module, "save_upload", tracked_save_upload)
+
+        with _client_for(tmp_path) as client:
+            async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
+                return {"default_camera": None, "frame": 1, "cameras": []}
+
+            client.app.state.runtime.runner.inspect_blend = fake_inspect
+            response = client.post(
+                "/api/blend-inspect",
+                data={
+                    "blend_file_path": "Project Files/scenes/Scene 1.blend",
+                    "project_paths": ["Project Files/textures/Wood Floor.png"],
+                },
+                files=[
+                    ("blend_file", ("Scene 1.blend", b"inspect-me", "application/octet-stream")),
+                    ("project_files", ("Wood Floor.png", b"png-bytes", "application/octet-stream")),
+                ],
+            )
+
+        assert response.status_code == 200
+        assert observed_project_upload
+    finally:
+        _restore_env(previous)
+
+
 def test_blend_inspect_cleans_up_session_after_unexpected_error(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:

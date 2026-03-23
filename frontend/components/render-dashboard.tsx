@@ -196,8 +196,22 @@ function totalFileBytes(files: File[]) {
   return files.reduce((total, file) => total + file.size, 0);
 }
 
+function projectFilesFingerprint(files: File[]) {
+  return files
+    .map((file) =>
+      [
+        file.webkitRelativePath || file.name,
+        file.size,
+        file.lastModified,
+      ].join(":"),
+    )
+    .sort()
+    .join("|");
+}
+
 function cameraScanKey(
   file: File | null,
+  projectFiles: File[],
   renderMode: RenderMode,
   previewFrame: number,
 ) {
@@ -209,6 +223,7 @@ function cameraScanKey(
     file.name,
     file.size,
     file.lastModified,
+    projectFilesFingerprint(projectFiles),
     renderMode,
     previewFrame,
   ].join(":");
@@ -303,6 +318,7 @@ export function RenderDashboard() {
   const previewFrame = form.renderMode === "still" ? form.frame : form.startFrame;
   const activeCameraScanKey = cameraScanKey(
     primarySelectedFile,
+    selectedProjectFiles,
     form.renderMode,
     previewFrame,
   );
