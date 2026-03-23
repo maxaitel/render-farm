@@ -173,11 +173,21 @@ export async function releaseBlendInspection(
 
 export async function touchBlendInspection(
   inspectionToken: string,
-): Promise<void> {
-  await fetch(`backend/api/blend-inspect/${inspectionToken}/touch`, {
+): Promise<boolean> {
+  const response = await fetch(`backend/api/blend-inspect/${inspectionToken}/touch`, {
     method: "POST",
     keepalive: true,
-  }).catch(() => undefined);
+  });
+  if (response.ok) {
+    return true;
+  }
+  if (response.status === 404) {
+    return false;
+  }
+  const payload = await response
+    .json()
+    .catch(() => ({ detail: "Failed to refresh saved camera scan." }));
+  throw new Error(payload.detail ?? "Failed to refresh saved camera scan.");
 }
 
 function submitWithProgress<T>(

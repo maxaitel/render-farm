@@ -222,7 +222,20 @@ function projectFilesFingerprint(files: File[]) {
     .join("|");
 }
 
-function cameraScanKey(
+function inspectionUploadKey(file: File | null, projectFiles: File[]) {
+  if (!file) {
+    return "";
+  }
+  return [
+    file.webkitRelativePath || "",
+    file.name,
+    file.size,
+    file.lastModified,
+    projectFilesFingerprint(projectFiles),
+  ].join(":");
+}
+
+function cameraScanRequestKey(
   file: File | null,
   projectFiles: File[],
   renderMode: RenderMode,
@@ -323,13 +336,17 @@ export function RenderDashboard() {
   const sourcesRef = useRef<Map<string, EventSource>>(new Map());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cameraScanRequestRef = useRef(0);
-  const cameraScanKeyRef = useRef("");
+  const cameraScanRequestKeyRef = useRef("");
   const submittingInspectionTokenRef = useRef<string | null>(null);
 
   const primarySelectedFile = selectedFiles[0] ?? null;
   const cameraScanAvailable = selectedFiles.length === 1;
   const previewFrame = form.renderMode === "still" ? form.frame : form.startFrame;
-  const activeCameraScanKey = cameraScanKey(
+  const activeInspectionUploadKey = inspectionUploadKey(
+    primarySelectedFile,
+    selectedProjectFiles,
+  );
+  const activeCameraScanRequestKey = cameraScanRequestKey(
     primarySelectedFile,
     selectedProjectFiles,
     form.renderMode,
@@ -425,7 +442,32 @@ export function RenderDashboard() {
       if (submittingInspectionTokenRef.current === inspectionToken) {
         return;
       }
-      void touchBlendInspection(inspectionToken);
+      void touchBlendInspection(inspectionToken)
+        .then((stillAvailable) => {
+          if (stillAvailable) {
+            return;
+          }
+          let clearedInspection = false;
+          setCameraInspection((current) => {
+            if (current?.inspection_token !== inspectionToken) {
+              return current;
+            }
+            clearedInspection = true;
+            return null;
+          });
+          if (!clearedInspection) {
+            return;
+          }
+          setSelectedCameraNames([]);
+          setCameraScanProgress(0);
+          setCameraScanPhase("uploading");
+          setCameraScanStartedAt(null);
+          setCameraScanElapsedMs(null);
+          setError((current) =>
+            current ?? "Saved camera scan expired. Rescan cameras or queue the render to upload the scene again.",
+          );
+        })
+        .catch(() => undefined);
     }, INSPECTION_TOUCH_INTERVAL_MS);
 
     return () => {
@@ -491,7 +533,15 @@ export function RenderDashboard() {
 
   useEffect(() => {
     cameraScanRequestRef.current += 1;
-    cameraScanKeyRef.current = activeCameraScanKey;
+    cameraScanRequestKeyRef.current = activeCameraScanRequestKey;
+    setInspectingCameras(false);
+    setCameraScanProgress(0);
+    setCameraScanPhase("uploading");
+    setCameraScanStartedAt(null);
+    setCameraScanElapsedMs(null);
+  }, [activeCameraScanRequestKey]);
+
+  useEffect(() => {
     setInspectingCameras(false);
     setCameraInspection(null);
     setSelectedCameraNames([]);
@@ -499,7 +549,7 @@ export function RenderDashboard() {
     setCameraScanPhase("uploading");
     setCameraScanStartedAt(null);
     setCameraScanElapsedMs(null);
-  }, [activeCameraScanKey]);
+  }, [activeInspectionUploadKey]);
 
   const stats = useMemo(() => {
     const running = jobs.filter((job) => job.phase === "running").length;
@@ -635,7 +685,7 @@ export function RenderDashboard() {
     setCameraScanElapsedMs(0);
     setError(null);
     const requestId = cameraScanRequestRef.current;
-    const expectedScanKey = activeCameraScanKey;
+    const expectedScanKey = activeCameraScanRequestKey;
     const previousInspection = cameraInspection;
     const previousSelectedCameraNames = selectedCameraNames;
     try {
@@ -649,7 +699,7 @@ export function RenderDashboard() {
         (progress) => {
           if (
             requestId !== cameraScanRequestRef.current ||
-            expectedScanKey !== cameraScanKeyRef.current
+            expectedScanKey !== cameraScanRequestKeyRef.current
           ) {
             return;
           }
@@ -658,7 +708,7 @@ export function RenderDashboard() {
         (phase) => {
           if (
             requestId !== cameraScanRequestRef.current ||
-            expectedScanKey !== cameraScanKeyRef.current
+            expectedScanKey !== cameraScanRequestKeyRef.current
           ) {
             return;
           }
@@ -673,7 +723,7 @@ export function RenderDashboard() {
       );
       if (
         requestId !== cameraScanRequestRef.current ||
-        expectedScanKey !== cameraScanKeyRef.current
+        expectedScanKey !== cameraScanRequestKeyRef.current
       ) {
         void releaseBlendInspection(inspection.inspection_token);
         return;
@@ -684,7 +734,7 @@ export function RenderDashboard() {
     } catch (inspectError) {
       if (
         requestId !== cameraScanRequestRef.current ||
-        expectedScanKey !== cameraScanKeyRef.current
+        expectedScanKey !== cameraScanRequestKeyRef.current
       ) {
         return;
       }
@@ -707,7 +757,7 @@ export function RenderDashboard() {
     } finally {
       if (
         requestId === cameraScanRequestRef.current &&
-        expectedScanKey === cameraScanKeyRef.current
+        expectedScanKey === cameraScanRequestKeyRef.current
       ) {
         setInspectingCameras(false);
       }
