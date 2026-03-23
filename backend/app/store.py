@@ -57,10 +57,8 @@ class JobStore:
         self._conn.commit()
 
         self._jobs = {}
+        await self._import_legacy_jobs()
         rows = self._conn.execute("SELECT payload FROM jobs ORDER BY created_at ASC").fetchall()
-        if not rows:
-            await self._import_legacy_jobs()
-            rows = self._conn.execute("SELECT payload FROM jobs ORDER BY created_at ASC").fetchall()
 
         for row in rows:
             job = JobRecord.model_validate_json(row["payload"])
@@ -184,7 +182,21 @@ class JobStore:
         self._conn.commit()
 
     async def _import_legacy_jobs(self) -> None:
+        if self._conn is None:
+            raise RuntimeError("JobStore database is not initialized.")
+
         for meta_path in sorted(self.jobs_root.glob("*/job.json")):
-            payload = await asyncio.to_thread(meta_path.read_text, "utf-8")
-            job = JobRecord.model_validate_json(payload)
+            try:
+                payload = await asyncio.to_thread(meta_path.read_text, "utf-8")
+                job = JobRecord.model_validate_json(payload)
+            except Exception as exc:
+                print(f"Skipping unreadable legacy job file {meta_path}: {exc}")
+                continue
+
+            already_imported = self._conn.execute(
+                "SELECT 1 FROM jobs WHERE id = ?",
+                (job.id,),
+            ).fetchone()
+            if already_imported:
+                continue
             await self._persist(job)

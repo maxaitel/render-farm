@@ -291,3 +291,89 @@ def test_existing_job_json_is_imported_into_sqlite(tmp_path: Path) -> None:
         assert row == (legacy_job.id, "legacy.blend")
     finally:
         _restore_env(previous)
+
+
+def test_legacy_import_continues_when_database_already_has_jobs(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        existing_job = JobRecord(
+            id="existing001",
+            created_at=utc_now(),
+            source_filename="existing.blend",
+            source_path=str(tmp_path / "jobs" / "existing001" / "input" / "existing.blend"),
+            output_directory=str(tmp_path / "jobs" / "existing001" / "outputs"),
+            render_mode=RenderMode.still,
+            output_format=OutputFormat.png,
+            requested_device=RenderDevice.auto,
+            frame=1,
+            total_frames=1,
+        )
+        legacy_job = JobRecord(
+            id="legacy002",
+            created_at=utc_now(),
+            source_filename="legacy.blend",
+            source_path=str(tmp_path / "jobs" / "legacy002" / "input" / "legacy.blend"),
+            output_directory=str(tmp_path / "jobs" / "legacy002" / "outputs"),
+            render_mode=RenderMode.still,
+            output_format=OutputFormat.png,
+            requested_device=RenderDevice.auto,
+            frame=2,
+            total_frames=1,
+        )
+
+        conn = sqlite3.connect(tmp_path / "renderfarm.sqlite3")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                source_filename TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO users (id, username, created_at) VALUES (1, ?, ?)",
+            ("local", utc_now().isoformat()),
+        )
+        payload = existing_job.model_dump(mode="json")
+        conn.execute(
+            "INSERT INTO jobs (id, user_id, created_at, phase, source_filename, payload) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                existing_job.id,
+                1,
+                payload["created_at"],
+                payload["phase"],
+                payload["source_filename"],
+                json.dumps(payload, indent=2),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        corrupt_dir = tmp_path / "jobs" / "broken003"
+        corrupt_dir.mkdir(parents=True, exist_ok=True)
+        (corrupt_dir / "job.json").write_text("{not valid json", encoding="utf-8")
+
+        legacy_dir = tmp_path / "jobs" / legacy_job.id
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        (legacy_dir / "job.json").write_text(
+            json.dumps(legacy_job.model_dump(mode="json"), indent=2),
+            encoding="utf-8",
+        )
+
+        with _client_for(tmp_path) as client:
+            response = client.get("/api/jobs")
+
+        assert response.status_code == 200
+        jobs = response.json()
+        assert {job["id"] for job in jobs} == {existing_job.id, legacy_job.id}
+    finally:
+        _restore_env(previous)

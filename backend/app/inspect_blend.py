@@ -95,7 +95,7 @@ def main() -> None:
     preview_dir = Path(args.preview_dir)
     preview_dir.mkdir(parents=True, exist_ok=True)
 
-    cameras = [obj for obj in bpy.data.objects if obj.type == "CAMERA"]
+    cameras = [obj for obj in scene.objects if obj.type == "CAMERA"]
     payload = {
         "default_camera": scene.camera.name if scene.camera else None,
         "frame": scene.frame_current,
