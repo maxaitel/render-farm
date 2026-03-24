@@ -64,11 +64,20 @@ class RenderRunner:
             if success:
                 outputs = self._collect_outputs(job.output_dir)
                 archive_path = await self._create_archive(job.id, outputs)
-                await self.store.mutate(
+                completed = await self.store.mutate(
                     job_id,
                     lambda item, output_names=[path.name for path in outputs], archive=archive_path: self._mark_completed(
                         item, output_names, archive
                     ),
+                )
+                await self.store.create_activity(
+                    event_type="render.completed",
+                    description=f"Render {completed.id} completed.",
+                    actor_user_id=completed.user_id,
+                    subject_user_id=completed.user_id,
+                    file_id=completed.file_id,
+                    job_id=completed.id,
+                    metadata={"outputs": completed.outputs},
                 )
                 return
             collected_error = combined_output.strip() or "Blender exited with an error."
@@ -79,9 +88,18 @@ class RenderRunner:
                 f"Retrying with the next device backend after {device} failed.",
             )
 
-        await self.store.mutate(
+        failed = await self.store.mutate(
             job_id,
             lambda item, reason=collected_error: self._mark_failed(item, reason),
+        )
+        await self.store.create_activity(
+            event_type="render.failed",
+            description=f"Render {failed.id} failed.",
+            actor_user_id=failed.user_id,
+            subject_user_id=failed.user_id,
+            file_id=failed.file_id,
+            job_id=failed.id,
+            metadata={"error": failed.error},
         )
 
     def _mark_running(self, job: JobRecord) -> None:

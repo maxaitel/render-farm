@@ -1,28 +1,34 @@
+import { cva, type VariantProps } from "class-variance-authority";
+
 import { cn } from "@/lib/utils";
 
-const styles = {
-  queued: "bg-black/5 text-black/68",
-  running: "bg-[#f7dfe1] text-[#971b28]",
-  completed: "bg-[#e2ebe1] text-[#315837]",
-  failed: "bg-[#f7dfdf] text-[#8a3535]",
-} as const;
+const badgeVariants = cva(
+  "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors",
+  {
+    variants: {
+      variant: {
+        default:
+          "border-transparent bg-foreground text-background hover:bg-foreground/80",
+        secondary:
+          "border-transparent bg-secondary text-secondary-foreground hover:bg-secondary/80",
+        outline: "text-foreground",
+        success: "border-emerald-200 bg-emerald-50 text-emerald-700",
+        warning: "border-amber-200 bg-amber-50 text-amber-700",
+        destructive: "border-rose-200 bg-rose-50 text-rose-700",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+    },
+  },
+);
 
-export function Badge({
-  phase,
-  className,
-}: {
-  phase: keyof typeof styles;
-  className?: string;
-}) {
-  return (
-    <span
-      className={cn(
-        "inline-flex items-center rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.1em]",
-        styles[phase],
-        className,
-      )}
-    >
-      {phase}
-    </span>
-  );
+export interface BadgeProps
+  extends React.HTMLAttributes<HTMLDivElement>,
+    VariantProps<typeof badgeVariants> {}
+
+function Badge({ className, variant, ...props }: BadgeProps) {
+  return <div className={cn(badgeVariants({ variant }), className)} {...props} />;
 }
+
+export { Badge, badgeVariants };

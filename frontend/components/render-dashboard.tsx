@@ -1,38 +1,72 @@
 "use client";
 
 import Image from "next/image";
-import type { FormEvent, ReactNode } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import type { ChangeEvent, FormEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  ChevronDown,
+  ArrowLeft,
+  ChevronRight,
   Cpu,
   Download,
+  FolderOpen,
   LoaderCircle,
-  Server,
-  SquareTerminal,
+  LogOut,
+  Radar,
+  Shield,
+  Upload,
 } from "lucide-react";
 
 import {
-  fetchJobs,
-  releaseBlendInspection,
+  createRun,
+  fetchAdminActivity,
+  fetchAdminOverview,
+  fetchAdminRuns,
+  fetchAdminUsers,
+  fetchFiles,
+  fetchSession,
   fetchSystemStatus,
-  inspectBlendFile,
-  type ProjectUploadEntry,
-  submitJobWithProgress,
-  submitJobsWithProgress,
-  touchBlendInspection,
+  inspectStoredFile,
+  signIn,
+  signOut,
+  signUp,
+  updateAdminUserStatus,
+  uploadFileWithProgress,
 } from "@/lib/api";
 import type {
+  ActivityRecord,
+  AdminOverview,
+  AuthSession,
   BlendInspection,
   RenderJob,
   RenderMode,
   SystemStatus,
+  UserAccount,
+  UserFile,
+  UserStatus,
 } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
+import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import logoMark from "../public/logo.png";
+
+type RenderDashboardProps = {
+  view?: "library" | "detail" | "admin";
+  fileId?: string;
+};
+
+type UploadSourceMode = "file" | "folder";
+type AuthMode = "sign-in" | "sign-up";
 
 type JobFormState = {
   renderMode: RenderMode;
@@ -40,10 +74,15 @@ type JobFormState = {
   startFrame: number;
   endFrame: number;
   outputFormat: "PNG" | "JPEG" | "OPEN_EXR";
-  devicePreference: "AUTO" | "CUDA" | "OPTIX" | "CPU";
 };
 
-type UploadSourceMode = "files" | "folder";
+const INITIAL_FORM: JobFormState = {
+  renderMode: "still",
+  frame: 1,
+  startFrame: 1,
+  endFrame: 24,
+  outputFormat: "PNG",
+};
 
 const SCENE_DIRECTORY_NAMES = new Set([
   "scene",
@@ -69,60 +108,11 @@ const AUXILIARY_DIRECTORY_NAMES = new Set([
   "caches",
 ]);
 
-const INITIAL_FORM: JobFormState = {
-  renderMode: "still",
-  frame: 1,
-  startFrame: 1,
-  endFrame: 24,
-  outputFormat: "PNG",
-  devicePreference: "AUTO",
-};
-
-function upsertJob(list: RenderJob[], nextJob: RenderJob) {
-  const without = list.filter((job) => job.id !== nextJob.id);
-  return [nextJob, ...without].sort(
-    (left, right) =>
-      new Date(right.created_at).getTime() -
-      new Date(left.created_at).getTime(),
-  );
-}
-
 function formatTimestamp(value: string | null) {
   if (!value) {
     return "Pending";
   }
   return new Date(value).toLocaleString();
-}
-
-function frameLabel(job: RenderJob) {
-  if (job.render_mode === "still") {
-    return `Frame ${job.frame ?? 1}`;
-  }
-  return `Frames ${job.start_frame ?? 1}-${job.end_frame ?? job.start_frame ?? 1}`;
-}
-
-function outputLabel(job: RenderJob) {
-  if (!job.outputs.length) {
-    return "No outputs yet";
-  }
-  return `${job.outputs.length} file${job.outputs.length === 1 ? "" : "s"} ready`;
-}
-
-function cameraLabel(job: RenderJob) {
-  if (job.camera_names.length > 1) {
-    return `${job.camera_names.length} cameras`;
-  }
-  if (job.camera_names.length === 1) {
-    return `Camera ${job.camera_names[0]}`;
-  }
-  if (job.camera_name) {
-    return `Camera ${job.camera_name}`;
-  }
-  return null;
-}
-
-function activePhase(job: RenderJob) {
-  return job.phase === "queued" || job.phase === "running";
 }
 
 function formatBytes(bytes: number) {
@@ -144,7 +134,7 @@ function folderProjectUploadEntries(
   projectFiles: File[],
 ): {
   blendPath: string;
-  projectEntries: ProjectUploadEntry[];
+  projectEntries: { file: File; path: string }[];
 } {
   const blendPath = fileLabel(blendFile);
   return {
@@ -217,54 +207,43 @@ function folderRenderTargets(projectFiles: File[]) {
   return primaryCandidates.length ? [primaryCandidates[0].file] : [];
 }
 
-function totalFileBytes(files: File[]) {
-  return files.reduce((total, file) => total + file.size, 0);
+function activePhase(job: RenderJob) {
+  return job.phase === "queued" || job.phase === "running";
 }
 
-function projectFilesFingerprint(files: File[]) {
-  return files
-    .map((file) =>
-      [
-        file.webkitRelativePath || file.name,
-        file.size,
-        file.lastModified,
-      ].join(":"),
-    )
-    .sort()
-    .join("|");
-}
-
-function inspectionUploadKey(file: File | null, projectFiles: File[]) {
-  if (!file) {
-    return "";
+function frameLabel(job: RenderJob) {
+  if (job.render_mode === "still") {
+    return `Frame ${job.frame ?? 1}`;
   }
-  return [
-    file.webkitRelativePath || "",
-    file.name,
-    file.size,
-    file.lastModified,
-    projectFilesFingerprint(projectFiles),
-  ].join(":");
+  return `Frames ${job.start_frame ?? 1}-${job.end_frame ?? job.start_frame ?? 1}`;
 }
 
-function cameraScanRequestKey(
-  file: File | null,
-  projectFiles: File[],
-  renderMode: RenderMode,
-  scanFrame: number,
-) {
-  if (!file) {
-    return "";
+function cameraLabel(job: RenderJob) {
+  if (job.camera_names.length > 1) {
+    return `${job.camera_names.length} cameras`;
   }
-  return [
-    file.webkitRelativePath || "",
-    file.name,
-    file.size,
-    file.lastModified,
-    projectFilesFingerprint(projectFiles),
-    renderMode,
-    scanFrame,
-  ].join(":");
+  if (job.camera_names.length === 1) {
+    return job.camera_names[0];
+  }
+  if (job.camera_name) {
+    return job.camera_name;
+  }
+  return "Default camera";
+}
+
+function liveDetail(job: RenderJob) {
+  const cameraPrefix = job.current_camera_name
+    ? `${job.current_camera_name} • `
+    : "";
+  if (job.render_mode === "animation" && job.current_frame) {
+    return `${cameraPrefix}Frame ${job.current_frame} of ${job.total_frames}`;
+  }
+  if (job.current_sample !== null && job.total_samples) {
+    return `${cameraPrefix}Sample ${job.current_sample} of ${job.total_samples}`;
+  }
+  return job.resolved_device
+    ? `${cameraPrefix}${job.resolved_device}`
+    : "Queued";
 }
 
 function deviceSummary(system: SystemStatus | null) {
@@ -290,208 +269,1012 @@ function deviceSummary(system: SystemStatus | null) {
     .join(" • ");
 }
 
-function liveDetail(job: RenderJob) {
-  const cameraPrefix = job.current_camera_name
-    ? `${job.current_camera_name} • `
-    : "";
-  if (job.render_mode === "animation" && job.current_frame) {
-    return `${cameraPrefix}Frame ${job.current_frame} of ${job.total_frames}`;
+function runBadgeVariant(job: RenderJob): "secondary" | "success" | "destructive" {
+  if (job.phase === "completed") {
+    return "success";
   }
-
-  if (job.current_sample !== null && job.total_samples) {
-    return `${cameraPrefix}Sample ${job.current_sample} of ${job.total_samples}`;
+  if (job.phase === "failed") {
+    return "destructive";
   }
-
-  return job.resolved_device
-    ? `${cameraPrefix}Running on ${job.resolved_device}`
-    : "Waiting for worker";
+  return "secondary";
 }
 
-function formatElapsedDuration(milliseconds: number) {
-  const totalSeconds = milliseconds / 1000;
-  if (totalSeconds < 60) {
-    return `${totalSeconds.toFixed(1)}s`;
+function userStatusVariant(status: UserStatus): "secondary" | "success" | "destructive" {
+  if (status === "approved") {
+    return "success";
   }
-
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}m ${seconds.toFixed(1)}s`;
+  if (status === "suspended") {
+    return "destructive";
+  }
+  return "secondary";
 }
 
-const INSPECTION_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
+function upsertRun(files: UserFile[], nextRun: RenderJob) {
+  return files
+    .map((file) => {
+      if (file.id !== nextRun.file_id) {
+        return file;
+      }
+      const jobs = [nextRun, ...file.jobs.filter((job) => job.id !== nextRun.id)].sort(
+        (left, right) =>
+          new Date(right.created_at).getTime() -
+          new Date(left.created_at).getTime(),
+      );
+      return {
+        ...file,
+        jobs,
+        latest_job: jobs[0] ?? null,
+        updated_at: nextRun.created_at,
+      };
+    })
+    .sort(
+      (left, right) =>
+        new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
+    );
+}
 
-export function RenderDashboard() {
-  const [jobs, setJobs] = useState<RenderJob[]>([]);
+function TopBar({
+  adminPath,
+  session,
+  system,
+  view,
+  onSignOut,
+}: {
+  adminPath: string | null;
+  session: AuthSession;
+  system: SystemStatus | null;
+  view: "library" | "detail" | "admin";
+  onSignOut: () => void;
+}) {
+  const adminToggleHref = view === "admin" ? "/" : adminPath;
+  const AdminToggleIcon = view === "admin" ? FolderOpen : Shield;
+  const adminToggleLabel = view === "admin" ? "Workspace" : "Admin";
+
+  return (
+    <Card className="subtle-panel rounded-2xl shadow-none">
+      <CardContent className="flex flex-col gap-4 p-4 md:flex-row md:items-center md:justify-between">
+        <div className="flex items-center gap-4">
+          <Image
+            src={logoMark}
+            alt="Render Farm"
+            className="h-auto w-[112px]"
+            priority
+          />
+          <div>
+            <p className="text-sm font-medium">
+              {view === "admin"
+                ? "Admin"
+                : view === "detail"
+                  ? "Scene detail"
+                  : "Library"}
+            </p>
+            <p className="text-sm text-muted-foreground">
+              {view === "library"
+                ? "Upload a scene, then open it to run renders."
+                : view === "detail"
+                  ? "Run renders and review history for one scene."
+                  : "Approve users and watch activity."}
+            </p>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="outline">{session.user.username}</Badge>
+          <Badge variant="outline">{deviceSummary(system)}</Badge>
+          {adminToggleHref ? (
+            <Button asChild size="sm" variant="outline">
+              <Link href={adminToggleHref}>
+                <AdminToggleIcon />
+                {adminToggleLabel}
+              </Link>
+            </Button>
+          ) : null}
+          <Button onClick={onSignOut} size="sm" variant="ghost">
+            <LogOut />
+            Sign out
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function AuthScreen({
+  authBusy,
+  authMode,
+  authPassword,
+  authUsername,
+  error,
+  onSubmit,
+  setAuthMode,
+  setAuthPassword,
+  setAuthUsername,
+}: {
+  authBusy: boolean;
+  authMode: AuthMode;
+  authPassword: string;
+  authUsername: string;
+  error: string | null;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  setAuthMode: (value: AuthMode | ((current: AuthMode) => AuthMode)) => void;
+  setAuthPassword: (value: string) => void;
+  setAuthUsername: (value: string) => void;
+}) {
+  return (
+    <div className="app-shell">
+      <div className="page-frame flex min-h-screen items-center justify-center">
+        <Card className="subtle-panel w-full max-w-md rounded-2xl shadow-none">
+          <CardHeader className="space-y-4">
+            <Image
+              src={logoMark}
+              alt="Render Farm"
+              className="h-auto w-[120px]"
+              priority
+            />
+            <div>
+              <CardTitle className="text-2xl font-semibold">
+                {authMode === "sign-in" ? "Sign in" : "Create account"}
+              </CardTitle>
+              <CardDescription className="mt-1">
+                {authMode === "sign-in"
+                  ? "Use your approved account to enter the workspace."
+                  : "New accounts remain pending until an admin approves them."}
+              </CardDescription>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <form className="space-y-4" onSubmit={onSubmit}>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Username</label>
+                <Input
+                  value={authUsername}
+                  onChange={(event) => setAuthUsername(event.target.value)}
+                  autoComplete="username"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Password</label>
+                <Input
+                  type="password"
+                  value={authPassword}
+                  onChange={(event) => setAuthPassword(event.target.value)}
+                  autoComplete={
+                    authMode === "sign-in" ? "current-password" : "new-password"
+                  }
+                />
+              </div>
+              <Button className="w-full">
+                {authBusy ? (
+                  <>
+                    <LoaderCircle className="animate-spin" />
+                    Working
+                  </>
+                ) : authMode === "sign-in" ? (
+                  "Sign in"
+                ) : (
+                  "Create pending account"
+                )}
+              </Button>
+            </form>
+            <Button
+              className="mt-4 px-0"
+              onClick={() =>
+                setAuthMode((current) =>
+                  current === "sign-in" ? "sign-up" : "sign-in",
+                )
+              }
+              type="button"
+              variant="link"
+            >
+              {authMode === "sign-in"
+                ? "Need access? Create an account."
+                : "Already approved? Sign in."}
+            </Button>
+            {error ? (
+              <div className="mt-4 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                {error}
+              </div>
+            ) : null}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function PendingScreen({
+  error,
+  onSignOut,
+  status,
+}: {
+  error: string | null;
+  onSignOut: () => void;
+  status: UserStatus;
+}) {
+  return (
+    <div className="app-shell">
+      <div className="page-frame flex min-h-screen items-center justify-center">
+        <Card className="subtle-panel w-full max-w-lg rounded-2xl shadow-none">
+          <CardHeader>
+            <CardTitle className="text-2xl font-semibold">
+              {status === "pending" ? "Waiting for approval" : "Account suspended"}
+            </CardTitle>
+            <CardDescription>
+              {status === "pending"
+                ? "An admin must approve this account before you can render."
+                : "This account was suspended."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <Button onClick={onSignOut} variant="outline">
+              <LogOut />
+              Sign out
+            </Button>
+            {error ? (
+              <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                {error}
+              </div>
+            ) : null}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function UploadCard({
+  onFileChange,
+  onFolderChange,
+  onModeChange,
+  onSubmit,
+  selectedBlendFile,
+  selectionMessage,
+  uploadProgress,
+  uploadSourceMode,
+  uploading,
+}: {
+  onFileChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onFolderChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onModeChange: (mode: UploadSourceMode) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  selectedBlendFile: File | null;
+  selectionMessage: string | null;
+  uploadProgress: number;
+  uploadSourceMode: UploadSourceMode;
+  uploading: boolean;
+}) {
+  return (
+    <Card className="subtle-panel rounded-2xl shadow-none">
+      <CardHeader>
+        <CardTitle className="text-lg font-semibold">Add scene</CardTitle>
+        <CardDescription>
+          Upload a blend file or a project folder. The scene will appear in the grid and get its own detail page.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form className="space-y-4" onSubmit={onSubmit}>
+          <Tabs
+            onValueChange={(value) => onModeChange(value as UploadSourceMode)}
+            value={uploadSourceMode}
+          >
+            <TabsList className="grid w-full max-w-[26rem] grid-cols-2">
+              <TabsTrigger value="file">Single blend</TabsTrigger>
+              <TabsTrigger value="folder">Project folder</TabsTrigger>
+            </TabsList>
+            <TabsContent value="file" className="space-y-4">
+              <Input accept=".blend" onChange={onFileChange} type="file" />
+            </TabsContent>
+            <TabsContent value="folder" className="space-y-4">
+              <Input
+                onChange={onFolderChange}
+                type="file"
+                {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
+              />
+            </TabsContent>
+          </Tabs>
+          <div className="rounded-lg border border-dashed bg-muted/40 px-4 py-3 text-sm text-muted-foreground">
+            {selectedBlendFile
+              ? selectedBlendFile.name
+              : selectionMessage || "Choose a source to add it to the library."}
+          </div>
+          {selectionMessage && selectedBlendFile ? (
+            <p className="text-sm text-muted-foreground">{selectionMessage}</p>
+          ) : null}
+          {uploading ? <Progress value={uploadProgress} /> : null}
+          <Button className="w-full" disabled={uploading || !selectedBlendFile}>
+            {uploading ? (
+              <>
+                <LoaderCircle className="animate-spin" />
+                Uploading
+              </>
+            ) : (
+              <>
+                <Upload />
+                Add to library
+              </>
+            )}
+          </Button>
+        </form>
+      </CardContent>
+    </Card>
+  );
+}
+
+function FileGrid({ files }: { files: UserFile[] }) {
+  if (!files.length) {
+    return (
+      <Card className="subtle-panel rounded-2xl border-dashed shadow-none">
+        <CardContent className="flex min-h-[280px] flex-col items-center justify-center gap-3 py-16 text-center">
+          <FolderOpen className="size-8 text-muted-foreground" />
+          <div>
+            <p className="text-lg font-medium">No scenes uploaded yet</p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Upload a file to start building the library.
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      {files.map((file) => (
+        <Card className="subtle-panel rounded-2xl shadow-none" key={file.id}>
+          <CardHeader className="space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <CardTitle className="truncate text-base font-semibold">
+                  {file.source_filename}
+                </CardTitle>
+                <CardDescription className="mt-1">
+                  Updated {formatTimestamp(file.updated_at)}
+                </CardDescription>
+              </div>
+              {file.latest_job ? (
+                <Badge variant={runBadgeVariant(file.latest_job)}>
+                  {file.latest_job.phase}
+                </Badge>
+              ) : (
+                <Badge variant="outline">idle</Badge>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-center justify-between text-sm text-muted-foreground">
+              <span>{formatBytes(file.original_size_bytes)}</span>
+              <span>{file.jobs.length} run{file.jobs.length === 1 ? "" : "s"}</span>
+            </div>
+            <Button asChild className="w-full" variant="outline">
+              <Link href={`/files/${file.id}`}>
+                Open scene
+                <ChevronRight />
+              </Link>
+            </Button>
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+function LibraryView({
+  files,
+  loadingData,
+  onFileChange,
+  onFolderChange,
+  onModeChange,
+  onUpload,
+  selectedBlendFile,
+  selectionMessage,
+  uploadProgress,
+  uploadSourceMode,
+  uploading,
+}: {
+  files: UserFile[];
+  loadingData: boolean;
+  onFileChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onFolderChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onModeChange: (mode: UploadSourceMode) => void;
+  onUpload: (event: FormEvent<HTMLFormElement>) => void;
+  selectedBlendFile: File | null;
+  selectionMessage: string | null;
+  uploadProgress: number;
+  uploadSourceMode: UploadSourceMode;
+  uploading: boolean;
+}) {
+  return (
+    <div className="grid gap-6 lg:grid-cols-[320px_minmax(0,1fr)]">
+      <UploadCard
+        onFileChange={onFileChange}
+        onFolderChange={onFolderChange}
+        onModeChange={onModeChange}
+        onSubmit={onUpload}
+        selectedBlendFile={selectedBlendFile}
+        selectionMessage={selectionMessage}
+        uploadProgress={uploadProgress}
+        uploadSourceMode={uploadSourceMode}
+        uploading={uploading}
+      />
+      <Card className="subtle-panel rounded-2xl shadow-none">
+        <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <CardTitle className="text-lg font-semibold">Library</CardTitle>
+            <CardDescription>
+              Open a scene to run renders and review history.
+            </CardDescription>
+          </div>
+          <Badge variant="outline">{loadingData ? "Refreshing" : `${files.length} files`}</Badge>
+        </CardHeader>
+        <CardContent>
+          <FileGrid files={files} />
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function FileDetailView({
+  cameraInspection,
+  file,
+  form,
+  inspecting,
+  onInspect,
+  onRun,
+  running,
+  selectedCameraNames,
+  setForm,
+  setSelectedCameraNames,
+}: {
+  cameraInspection: BlendInspection | null;
+  file: UserFile;
+  form: JobFormState;
+  inspecting: boolean;
+  onInspect: () => void;
+  onRun: (event: FormEvent<HTMLFormElement>) => void;
+  running: boolean;
+  selectedCameraNames: string[];
+  setForm: (updater: (current: JobFormState) => JobFormState) => void;
+  setSelectedCameraNames: (
+    value: string[] | ((current: string[]) => string[]),
+  ) => void;
+}) {
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <Link href="/" className="inline-flex items-center gap-2 hover:text-foreground">
+          <ArrowLeft className="size-4" />
+          Library
+        </Link>
+        <ChevronRight className="size-4" />
+        <span className="truncate">{file.source_filename}</span>
+      </div>
+
+      <div className="grid gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
+        <Card className="subtle-panel rounded-2xl shadow-none">
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold">Scene</CardTitle>
+            <CardDescription>{file.source_filename}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Size</span>
+              <span>{formatBytes(file.original_size_bytes)}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Updated</span>
+              <span>{formatTimestamp(file.updated_at)}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Runs</span>
+              <span>{file.jobs.length}</span>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="subtle-panel rounded-2xl shadow-none">
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold">New render</CardTitle>
+            <CardDescription>
+              Run this scene again with different cameras or frame settings.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <form className="space-y-5" onSubmit={onRun}>
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                <label className="space-y-2 text-sm font-medium">
+                  <span>Mode</span>
+                  <select
+                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                    value={form.renderMode}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        renderMode: event.target.value as RenderMode,
+                      }))
+                    }
+                  >
+                    <option value="still">Still</option>
+                    <option value="animation">Animation</option>
+                  </select>
+                </label>
+                <label className="space-y-2 text-sm font-medium">
+                  <span>Format</span>
+                  <select
+                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                    value={form.outputFormat}
+                    onChange={(event) =>
+                      setForm((current) => ({
+                        ...current,
+                        outputFormat: event.target.value as JobFormState["outputFormat"],
+                      }))
+                    }
+                  >
+                    <option value="PNG">PNG</option>
+                    <option value="JPEG">JPEG</option>
+                    <option value="OPEN_EXR">OpenEXR</option>
+                  </select>
+                </label>
+                {form.renderMode === "still" ? (
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Frame</span>
+                    <Input
+                      min={1}
+                      type="number"
+                      value={form.frame}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          frame: Number(event.target.value || 1),
+                        }))
+                      }
+                    />
+                  </label>
+                ) : (
+                  <>
+                    <label className="space-y-2 text-sm font-medium">
+                      <span>Start</span>
+                      <Input
+                        min={1}
+                        type="number"
+                        value={form.startFrame}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            startFrame: Number(event.target.value || 1),
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="space-y-2 text-sm font-medium">
+                      <span>End</span>
+                      <Input
+                        min={form.startFrame}
+                        type="number"
+                        value={form.endFrame}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            endFrame: Number(event.target.value || current.startFrame),
+                          }))
+                        }
+                      />
+                    </label>
+                  </>
+                )}
+              </div>
+
+              <Separator />
+
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-medium">Cameras</p>
+                    <p className="text-sm text-muted-foreground">
+                      Scan this scene and select optional cameras for the run.
+                    </p>
+                  </div>
+                  <Button onClick={onInspect} type="button" variant="outline">
+                    {inspecting ? (
+                      <>
+                        <LoaderCircle className="animate-spin" />
+                        Scanning
+                      </>
+                    ) : (
+                      <>
+                        <Radar />
+                        Scan cameras
+                      </>
+                    )}
+                  </Button>
+                </div>
+                {cameraInspection?.cameras.length ? (
+                  <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                    {cameraInspection.cameras.map((camera) => {
+                      const checked = selectedCameraNames.includes(camera.name);
+                      return (
+                        <button
+                          className={`rounded-md border px-3 py-2 text-left text-sm transition-colors ${
+                            checked
+                              ? "border-foreground bg-secondary text-foreground"
+                              : "bg-background hover:bg-muted"
+                          }`}
+                          key={camera.name}
+                          onClick={() =>
+                            setSelectedCameraNames((current) =>
+                              checked
+                                ? current.filter((item) => item !== camera.name)
+                                : [...current, camera.name],
+                            )
+                          }
+                          type="button"
+                        >
+                          {camera.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="space-y-2">
+                <Button disabled={running}>
+                  {running ? (
+                    <>
+                      <LoaderCircle className="animate-spin" />
+                      Queueing render
+                    </>
+                  ) : (
+                    <>
+                      <Cpu />
+                      Start render
+                    </>
+                  )}
+                </Button>
+                <p className="text-sm text-muted-foreground">
+                  Device assignment is handled by the admin scheduler.
+                </p>
+              </div>
+            </form>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card className="subtle-panel rounded-2xl shadow-none">
+        <CardHeader>
+          <CardTitle className="text-lg font-semibold">Run history</CardTitle>
+          <CardDescription>
+            Previous renders for this scene.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {file.jobs.length ? (
+            file.jobs.map((job) => (
+              <Card className="rounded-xl shadow-none" key={job.id}>
+                <CardContent className="space-y-4 p-4">
+                  <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge variant={runBadgeVariant(job)}>{job.phase}</Badge>
+                        <span className="text-sm">{cameraLabel(job)}</span>
+                        <span className="text-sm text-muted-foreground">{frameLabel(job)}</span>
+                      </div>
+                      <p className="text-sm text-muted-foreground">
+                        {formatTimestamp(job.created_at)}
+                      </p>
+                      <p className="text-sm text-foreground/80">
+                        {activePhase(job)
+                          ? liveDetail(job)
+                          : job.error || job.status_message}
+                      </p>
+                    </div>
+                    {job.archive_path ? (
+                      <Button asChild size="sm" variant="outline">
+                        <a href={`/backend/api/jobs/${job.id}/download`}>
+                          <Download />
+                          Download
+                        </a>
+                      </Button>
+                    ) : null}
+                  </div>
+                  {activePhase(job) ? <Progress value={job.progress} /> : null}
+                  {job.logs_tail.length ? (
+                    <details className="rounded-md border bg-muted/30 p-3">
+                      <summary className="cursor-pointer text-sm font-medium">
+                        Log tail
+                      </summary>
+                      <pre className="mt-3 overflow-x-auto whitespace-pre-wrap text-xs text-muted-foreground">
+                        {job.logs_tail.join("\n")}
+                      </pre>
+                    </details>
+                  ) : null}
+                </CardContent>
+              </Card>
+            ))
+          ) : (
+            <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
+              No runs yet for this scene.
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function AdminView({
+  adminActivity,
+  adminOverview,
+  adminRuns,
+  adminUsers,
+  onStatusChange,
+}: {
+  adminActivity: ActivityRecord[];
+  adminOverview: AdminOverview | null;
+  adminRuns: RenderJob[];
+  adminUsers: UserAccount[];
+  onStatusChange: (userId: number, status: UserStatus) => void;
+}) {
+  return (
+    <div className="space-y-6">
+      <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-6">
+        {[
+          ["Pending", adminOverview?.pending_users ?? 0],
+          ["Approved", adminOverview?.approved_users ?? 0],
+          ["Suspended", adminOverview?.suspended_users ?? 0],
+          ["Files", adminOverview?.total_files ?? 0],
+          ["Runs", adminOverview?.total_runs ?? 0],
+          ["Active", adminOverview?.active_runs ?? 0],
+        ].map(([label, value]) => (
+          <Card className="subtle-panel rounded-2xl shadow-none" key={label}>
+            <CardContent className="p-4">
+              <p className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
+                {label}
+              </p>
+              <p className="mt-2 text-2xl font-semibold">{value}</p>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
+        <Card className="subtle-panel rounded-2xl shadow-none">
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold">Users</CardTitle>
+            <CardDescription>Approve or suspend access.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {adminUsers.map((user) => (
+              <div
+                className="flex flex-col gap-4 rounded-lg border p-4 md:flex-row md:items-center md:justify-between"
+                key={user.id}
+              >
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium">{user.username}</span>
+                    <Badge variant={userStatusVariant(user.status)}>{user.status}</Badge>
+                    <Badge variant="outline">{user.role}</Badge>
+                  </div>
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    {user.render_file_count} files • {user.run_count} runs
+                  </p>
+                </div>
+                <div className="flex gap-2">
+                  <Button onClick={() => onStatusChange(user.id, "approved")} size="sm" variant="outline">
+                    Approve
+                  </Button>
+                  <Button onClick={() => onStatusChange(user.id, "suspended")} size="sm" variant="outline">
+                    Suspend
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+
+        <div className="space-y-6">
+          <Card className="subtle-panel rounded-2xl shadow-none">
+            <CardHeader>
+              <CardTitle className="text-lg font-semibold">Activity</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {adminActivity.slice(0, 8).map((item) => (
+                <div className="rounded-lg border p-4" key={item.id}>
+                  <p className="text-sm">{item.description}</p>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    {item.event_type} • {formatTimestamp(item.created_at)}
+                  </p>
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+          <Card className="subtle-panel rounded-2xl shadow-none">
+            <CardHeader>
+              <CardTitle className="text-lg font-semibold">Recent runs</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {adminRuns.slice(0, 8).map((job) => (
+                <div className="rounded-lg border p-4" key={job.id}>
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="truncate text-sm font-medium">{job.source_filename}</p>
+                    <Badge variant={runBadgeVariant(job)}>{job.phase}</Badge>
+                  </div>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    {cameraLabel(job)} • {frameLabel(job)}
+                  </p>
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function RenderDashboard({
+  view = "library",
+  fileId,
+}: RenderDashboardProps) {
+  const [authMode, setAuthMode] = useState<AuthMode>("sign-in");
+  const [session, setSession] = useState<AuthSession | null>(null);
   const [system, setSystem] = useState<SystemStatus | null>(null);
+  const [files, setFiles] = useState<UserFile[]>([]);
   const [form, setForm] = useState<JobFormState>(INITIAL_FORM);
-  const [uploadSourceMode, setUploadSourceMode] =
-    useState<UploadSourceMode>("files");
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
-  const [selectedProjectFiles, setSelectedProjectFiles] = useState<File[]>([]);
   const [cameraInspection, setCameraInspection] =
     useState<BlendInspection | null>(null);
   const [selectedCameraNames, setSelectedCameraNames] = useState<string[]>([]);
-  const [inspectingCameras, setInspectingCameras] = useState(false);
-  const [cameraScanProgress, setCameraScanProgress] = useState(0);
-  const [cameraScanPhase, setCameraScanPhase] = useState<
-    "uploading" | "processing"
-  >("uploading");
-  const [cameraScanStartedAt, setCameraScanStartedAt] = useState<number | null>(
-    null,
-  );
-  const [cameraScanElapsedMs, setCameraScanElapsedMs] = useState<number | null>(
-    null,
-  );
-  const [submitting, setSubmitting] = useState(false);
+  const [uploadSourceMode, setUploadSourceMode] =
+    useState<UploadSourceMode>("file");
+  const [uploadBlendFile, setUploadBlendFile] = useState<File | null>(null);
+  const [uploadProjectFiles, setUploadProjectFiles] = useState<File[]>([]);
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
-  const [activeUploadName, setActiveUploadName] = useState<string | null>(null);
-  const [activeUploadIndex, setActiveUploadIndex] = useState(0);
-  const [loading, setLoading] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [inspecting, setInspecting] = useState(false);
+  const [booting, setBooting] = useState(true);
+  const [loadingData, setLoadingData] = useState(false);
+  const [selectionMessage, setSelectionMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [adminOverview, setAdminOverview] = useState<AdminOverview | null>(null);
+  const [adminUsers, setAdminUsers] = useState<UserAccount[]>([]);
+  const [adminActivity, setAdminActivity] = useState<ActivityRecord[]>([]);
+  const [adminRuns, setAdminRuns] = useState<RenderJob[]>([]);
   const sourcesRef = useRef<Map<string, EventSource>>(new Map());
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const cameraScanRequestRef = useRef(0);
-  const cameraScanRequestKeyRef = useRef("");
-  const submittingInspectionTokenRef = useRef<string | null>(null);
+  const activeJobIds = Array.from(
+    new Set(files.flatMap((file) => file.jobs).filter(activePhase).map((job) => job.id)),
+  ).sort();
+  const activeJobIdsKey = JSON.stringify(activeJobIds);
+  const activeJobSessionKey =
+    session && session.user.status === "approved" ? `${session.user.id}:approved` : "closed";
 
-  const primarySelectedFile = selectedFiles[0] ?? null;
-  const cameraScanAvailable = selectedFiles.length === 1;
-  const scanFrame = form.renderMode === "still" ? form.frame : form.startFrame;
-  const activeInspectionUploadKey = inspectionUploadKey(
-    primarySelectedFile,
-    selectedProjectFiles,
-  );
-  const activeCameraScanRequestKey = cameraScanRequestKey(
-    primarySelectedFile,
-    selectedProjectFiles,
-    form.renderMode,
-    scanFrame,
-  );
+  const selectedFile = fileId
+    ? files.find((item) => item.id === fileId) ?? null
+    : null;
+  const adminPath = session?.admin_panel_path ? `/${session.admin_panel_path}` : null;
 
   useEffect(() => {
     let cancelled = false;
 
-    async function load() {
-      try {
-        const [systemPayload, jobsPayload] = await Promise.all([
-          fetchSystemStatus(),
-          fetchJobs(),
-        ]);
-        if (cancelled) {
-          return;
-        }
-        setSystem(systemPayload);
-        setJobs(jobsPayload);
-        setError(null);
-      } catch (loadError) {
+    void fetchSession()
+      .then((payload) => {
         if (!cancelled) {
-          setError(
-            loadError instanceof Error
-              ? loadError.message
-              : "Failed to load dashboard.",
-          );
+          setSession(payload);
         }
-      } finally {
+      })
+      .catch(() => {
         if (!cancelled) {
-          setLoading(false);
+          setSession(null);
         }
-      }
-    }
-
-    void load();
-    const intervalId = window.setInterval(() => {
-      void fetchSystemStatus()
-        .then(setSystem)
-        .catch(() => undefined);
-      void fetchJobs()
-        .then(setJobs)
-        .catch(() => undefined);
-    }, 15000);
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setBooting(false);
+        }
+      });
 
     return () => {
       cancelled = true;
-      window.clearInterval(intervalId);
-      sourcesRef.current.forEach((source) => source.close());
-      sourcesRef.current.clear();
     };
   }, []);
 
-  useEffect(() => {
-    const inspectionToken = cameraInspection?.inspection_token;
-    return () => {
-      if (!inspectionToken) {
-        return;
-      }
-      if (submittingInspectionTokenRef.current === inspectionToken) {
-        return;
-      }
-      void releaseBlendInspection(inspectionToken);
-    };
-  }, [cameraInspection?.inspection_token]);
-
-  useEffect(() => {
-    if (!inspectingCameras || cameraScanStartedAt === null) {
+  async function refreshCoreData(currentSession = session) {
+    if (!currentSession || currentSession.user.status !== "approved") {
       return;
     }
+    setLoadingData(true);
+    try {
+      const [systemPayload, filesPayload] = await Promise.all([
+        fetchSystemStatus(),
+        fetchFiles(),
+      ]);
+      setSystem(systemPayload);
+      setFiles(
+        filesPayload.sort(
+          (left, right) =>
+            new Date(right.updated_at).getTime() -
+            new Date(left.updated_at).getTime(),
+        ),
+      );
+      setError(null);
+    } catch (loadError) {
+      setError(
+        loadError instanceof Error ? loadError.message : "Failed to load workspace.",
+      );
+    } finally {
+      setLoadingData(false);
+    }
+  }
 
-    setCameraScanElapsedMs(Date.now() - cameraScanStartedAt);
+  async function refreshAdminData(currentSession = session) {
+    if (
+      !currentSession ||
+      currentSession.user.role !== "admin" ||
+      !currentSession.lan_admin_access ||
+      view !== "admin"
+    ) {
+      return;
+    }
+    try {
+      const [overviewPayload, usersPayload, activityPayload, runsPayload] =
+        await Promise.all([
+          fetchAdminOverview(),
+          fetchAdminUsers(),
+          fetchAdminActivity(),
+          fetchAdminRuns(),
+        ]);
+      setAdminOverview(overviewPayload);
+      setAdminUsers(usersPayload);
+      setAdminActivity(activityPayload);
+      setAdminRuns(runsPayload);
+    } catch (loadError) {
+      setError(
+        loadError instanceof Error ? loadError.message : "Failed to load admin panel.",
+      );
+    }
+  }
+
+  useEffect(() => {
+    if (!session) {
+      setFiles([]);
+      setSystem(null);
+      return;
+    }
+    if (session.user.status === "approved") {
+      void refreshCoreData(session);
+      if (view === "admin") {
+        void refreshAdminData(session);
+      }
+      const intervalId = window.setInterval(() => {
+        void refreshCoreData(session);
+        if (view === "admin") {
+          void refreshAdminData(session);
+        }
+      }, 15000);
+      return () => {
+        window.clearInterval(intervalId);
+      };
+    }
     const intervalId = window.setInterval(() => {
-      setCameraScanElapsedMs(Date.now() - cameraScanStartedAt);
-    }, 200);
-
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [inspectingCameras, cameraScanStartedAt]);
-
-  useEffect(() => {
-    const inspectionToken = cameraInspection?.inspection_token;
-    if (!inspectionToken) {
-      return;
-    }
-    if (submittingInspectionTokenRef.current === inspectionToken) {
-      return;
-    }
-
-    const intervalId = window.setInterval(() => {
-      if (submittingInspectionTokenRef.current === inspectionToken) {
-        return;
-      }
-      void touchBlendInspection(inspectionToken)
-        .then((stillAvailable) => {
-          if (stillAvailable) {
-            return;
-          }
-          let clearedInspection = false;
-          setCameraInspection((current) => {
-            if (current?.inspection_token !== inspectionToken) {
-              return current;
-            }
-            clearedInspection = true;
-            return null;
-          });
-          if (!clearedInspection) {
-            return;
-          }
-          setSelectedCameraNames([]);
-          setCameraScanProgress(0);
-          setCameraScanPhase("uploading");
-          setCameraScanStartedAt(null);
-          setCameraScanElapsedMs(null);
-          setError((current) =>
-            current ?? "Saved camera scan expired. Rescan cameras or queue the render to upload the scene again.",
-          );
-        })
+      void fetchSession()
+        .then(setSession)
         .catch(() => undefined);
-    }, INSPECTION_TOUCH_INTERVAL_MS);
-
+    }, 15000);
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [cameraInspection?.inspection_token]);
+  }, [session, view]);
 
   useEffect(() => {
-    const activeIds = new Set(jobs.filter(activePhase).map((job) => job.id));
+    if (!session || session.user.status !== "approved") {
+      sourcesRef.current.forEach((source) => source.close());
+      sourcesRef.current.clear();
+      return;
+    }
+
+    const activeIds = new Set(JSON.parse(activeJobIdsKey) as string[]);
 
     sourcesRef.current.forEach((source, jobId) => {
       if (!activeIds.has(jobId)) {
@@ -504,10 +1287,10 @@ export function RenderDashboard() {
       if (sourcesRef.current.has(jobId)) {
         return;
       }
-      const source = new EventSource(`backend/api/jobs/${jobId}/events`);
+      const source = new EventSource(`/backend/api/jobs/${jobId}/events`);
       source.onmessage = (event) => {
         const payload = JSON.parse(event.data) as RenderJob;
-        setJobs((current) => upsertJob(current, payload));
+        setFiles((current) => upsertRun(current, payload));
       };
       source.onerror = () => {
         source.close();
@@ -515,1007 +1298,289 @@ export function RenderDashboard() {
       };
       sourcesRef.current.set(jobId, source);
     });
-  }, [jobs]);
+  }, [activeJobIdsKey, activeJobSessionKey]);
 
   useEffect(() => {
-    const input = fileInputRef.current;
-    if (!input) {
-      return;
-    }
+    return () => {
+      sourcesRef.current.forEach((source) => source.close());
+      sourcesRef.current.clear();
+    };
+  }, []);
 
-    input.multiple = true;
-    if (uploadSourceMode === "folder") {
-      input.setAttribute("webkitdirectory", "");
-      input.setAttribute("directory", "");
-      input.removeAttribute("accept");
-    } else {
-      input.removeAttribute("webkitdirectory");
-      input.removeAttribute("directory");
-      input.setAttribute("accept", ".blend");
-    }
-
-    input.value = "";
-    setSelectedFiles([]);
-    setSelectedProjectFiles([]);
-    setCameraInspection(null);
-    setSelectedCameraNames([]);
-    setCameraScanProgress(0);
-    setCameraScanPhase("uploading");
-    setCameraScanStartedAt(null);
-    setCameraScanElapsedMs(null);
-    setError(null);
-  }, [uploadSourceMode]);
-
-  useEffect(() => {
-    cameraScanRequestRef.current += 1;
-    cameraScanRequestKeyRef.current = activeCameraScanRequestKey;
-    setInspectingCameras(false);
-    setCameraScanProgress(0);
-    setCameraScanPhase("uploading");
-    setCameraScanStartedAt(null);
-    setCameraScanElapsedMs(null);
-  }, [activeCameraScanRequestKey]);
-
-  useEffect(() => {
-    setInspectingCameras(false);
-    setCameraInspection(null);
-    setSelectedCameraNames([]);
-    setCameraScanProgress(0);
-    setCameraScanPhase("uploading");
-    setCameraScanStartedAt(null);
-    setCameraScanElapsedMs(null);
-  }, [activeInspectionUploadKey]);
-
-  const stats = useMemo(() => {
-    const running = jobs.filter((job) => job.phase === "running").length;
-    const queued = jobs.filter((job) => job.phase === "queued").length;
-    const completed = jobs.filter((job) => job.phase === "completed").length;
-    return { running, queued, completed };
-  }, [jobs]);
-
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (inspectingCameras) {
-      setError("Wait for camera scanning to finish before queueing the render.");
-      return;
-    }
-    if (!selectedFiles.length) {
-      setError(
-        uploadSourceMode === "folder"
-          ? "Choose a folder with at least one .blend file."
-          : "Choose one or more .blend files first.",
-      );
-      return;
-    }
-
-    setSubmitting(true);
-    setUploadProgress(0);
-    setActiveUploadIndex(1);
-    setActiveUploadName(fileLabel(selectedFiles[0]));
-    setError(null);
-    let nextFileIndex = 0;
-    let submittedInspectionToken: string | null = null;
+    setAuthBusy(true);
     try {
-      for (const [index, file] of selectedFiles.entries()) {
-        const payload = new FormData();
-        const canReuseInspectionUpload =
-          selectedFiles.length === 1 &&
-          Boolean(cameraInspection?.inspection_token);
-        if (canReuseInspectionUpload && cameraInspection) {
-          submittingInspectionTokenRef.current = cameraInspection.inspection_token;
-          submittedInspectionToken = cameraInspection.inspection_token;
-          payload.set("inspect_token", cameraInspection.inspection_token);
-        } else {
-          payload.set("blend_file", file, file.name);
-          if (uploadSourceMode === "folder") {
-            const { blendPath, projectEntries } = folderProjectUploadEntries(
-              file,
-              selectedProjectFiles,
-            );
-            payload.set("blend_file_path", blendPath);
-            projectEntries.forEach(({ file: projectFile, path }) => {
-              payload.append("project_files", projectFile, projectFile.name);
-              payload.append("project_paths", path);
-            });
-          }
-        }
-        payload.set("render_mode", form.renderMode);
-        payload.set("output_format", form.outputFormat);
-        payload.set("device_preference", form.devicePreference);
-        const requestedCameraNames =
-          selectedFiles.length === 1 ? selectedCameraNames : [];
-        requestedCameraNames.forEach((cameraName) => {
-          payload.append("camera_names", cameraName);
-        });
-        if (form.renderMode === "still") {
-          payload.set("frame", String(form.frame));
-        } else {
-          payload.set("start_frame", String(form.startFrame));
-          payload.set("end_frame", String(form.endFrame));
-        }
-
-        setActiveUploadIndex(index + 1);
-        setActiveUploadName(fileLabel(file));
-        const submittedJobs =
-          requestedCameraNames.length > 0
-            ? await submitJobsWithProgress(payload, (progress) => {
-                const overallProgress =
-                  ((index + progress / 100) / selectedFiles.length) * 100;
-                setUploadProgress(overallProgress);
-              })
-            : [
-                await submitJobWithProgress(payload, (progress) => {
-                  const overallProgress =
-                    ((index + progress / 100) / selectedFiles.length) * 100;
-                  setUploadProgress(overallProgress);
-                }),
-              ];
-        submittedJobs.forEach((job) => {
-          setJobs((current) => upsertJob(current, job));
-        });
-        nextFileIndex = index + 1;
-      }
-
-      if (submittedInspectionToken) {
-        await releaseBlendInspection(submittedInspectionToken);
-      }
-      setSelectedFiles([]);
-      setSelectedProjectFiles([]);
-      setCameraInspection(null);
-      setSelectedCameraNames([]);
-      setCameraScanProgress(0);
-      setCameraScanPhase("uploading");
-      setForm(INITIAL_FORM);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
-    } catch (submitError) {
-      if (selectedFiles.length > 1 && nextFileIndex > 0) {
-        setSelectedFiles(selectedFiles.slice(nextFileIndex));
-      }
+      const payload =
+        authMode === "sign-in"
+          ? await signIn(authUsername, authPassword)
+          : await signUp(authUsername, authPassword);
+      setSession(payload);
+      setAuthPassword("");
       setError(
-        submitError instanceof Error
-          ? submitError.message
-          : "Failed to queue render.",
+        authMode === "sign-up"
+          ? "Account created. An admin must approve it before use."
+          : null,
+      );
+    } catch (authError) {
+      setError(
+        authError instanceof Error ? authError.message : "Authentication failed.",
       );
     } finally {
-      submittingInspectionTokenRef.current = null;
-      setSubmitting(false);
-      setUploadProgress(0);
-      setActiveUploadIndex(0);
-      setActiveUploadName(null);
+      setAuthBusy(false);
     }
   }
 
-  async function handleInspectCameras() {
-    if (!cameraScanAvailable) {
-      return;
-    }
-
-    setInspectingCameras(true);
-    setCameraScanProgress(0);
-    setCameraScanPhase("uploading");
-    const scanStartedAt = Date.now();
-    setCameraScanStartedAt(scanStartedAt);
-    setCameraScanElapsedMs(0);
-    setError(null);
-    const requestId = cameraScanRequestRef.current;
-    const expectedScanKey = activeCameraScanRequestKey;
-    const previousInspection = cameraInspection;
-    const previousSelectedCameraNames = selectedCameraNames;
-    try {
-      const folderUploadOptions =
-        uploadSourceMode === "folder"
-          ? folderProjectUploadEntries(selectedFiles[0], selectedProjectFiles)
-          : undefined;
-      const inspection = await inspectBlendFile(
-        selectedFiles[0],
-        scanFrame,
-        (progress) => {
-          if (
-            requestId !== cameraScanRequestRef.current ||
-            expectedScanKey !== cameraScanRequestKeyRef.current
-          ) {
-            return;
-          }
-          setCameraScanProgress(progress);
-        },
-        (phase) => {
-          if (
-            requestId !== cameraScanRequestRef.current ||
-            expectedScanKey !== cameraScanRequestKeyRef.current
-          ) {
-            return;
-          }
-          setCameraScanPhase(phase);
-        },
-        folderUploadOptions
-          ? {
-              blendFilePath: folderUploadOptions.blendPath,
-              projectFiles: folderUploadOptions.projectEntries,
-            }
-          : undefined,
-      );
-      if (
-        requestId !== cameraScanRequestRef.current ||
-        expectedScanKey !== cameraScanRequestKeyRef.current
-      ) {
-        void releaseBlendInspection(inspection.inspection_token);
-        return;
-      }
-      setCameraInspection(inspection);
-      setSelectedCameraNames([]);
-      setCameraScanElapsedMs(Date.now() - scanStartedAt);
-    } catch (inspectError) {
-      if (
-        requestId !== cameraScanRequestRef.current ||
-        expectedScanKey !== cameraScanRequestKeyRef.current
-      ) {
-        return;
-      }
-      if (previousInspection) {
-        setCameraInspection(previousInspection);
-        setSelectedCameraNames(previousSelectedCameraNames);
-      } else {
-        setCameraInspection(null);
-        setSelectedCameraNames([]);
-      }
-      setCameraScanProgress(0);
-      setCameraScanPhase("uploading");
-      setCameraScanStartedAt(null);
-      setCameraScanElapsedMs(null);
-      setError(
-        inspectError instanceof Error
-          ? inspectError.message
-          : "Failed to inspect cameras.",
-      );
-    } finally {
-      if (
-        requestId === cameraScanRequestRef.current &&
-        expectedScanKey === cameraScanRequestKeyRef.current
-      ) {
-        setInspectingCameras(false);
-      }
-    }
+  async function handleSignOut() {
+    await signOut().catch(() => undefined);
+    setSession(null);
+    setFiles([]);
+    setSystem(null);
+    setAdminOverview(null);
+    setAdminUsers([]);
+    setAdminActivity([]);
+    setAdminRuns([]);
   }
 
-  function toggleCamera(name: string) {
-    setSelectedCameraNames((current) =>
-      current.includes(name)
-        ? current.filter((cameraName) => cameraName !== name)
-        : [...current, name],
+  function handleSingleFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0] ?? null;
+    setUploadSourceMode("file");
+    setUploadBlendFile(file);
+    setUploadProjectFiles([]);
+    setSelectionMessage(file ? `${file.name} selected.` : null);
+  }
+
+  function handleFolderChange(event: ChangeEvent<HTMLInputElement>) {
+    const allFiles = Array.from(event.target.files ?? []);
+    setUploadSourceMode("folder");
+    setUploadProjectFiles(allFiles);
+    const targets = folderRenderTargets(allFiles);
+    const blendFile = targets[0] ?? null;
+    setUploadBlendFile(blendFile);
+    if (!blendFile) {
+      setSelectionMessage("No .blend file was found in that folder.");
+      return;
+    }
+    setSelectionMessage(
+      `${blendFile.webkitRelativePath || blendFile.name} will be used as the source scene.`,
     );
   }
 
-  const uploadStageLabel =
-    selectedFiles.length > 1
-      ? `Uploading ${activeUploadIndex} of ${selectedFiles.length}${activeUploadName ? `: ${activeUploadName}` : ""}`
-      : uploadProgress >= 100
-        ? "Upload complete. Registering render job."
-        : "Uploading blend file to the render host.";
+  async function handleUpload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!uploadBlendFile) {
+      setError("Choose a file or folder first.");
+      return;
+    }
 
-  const cameraScanLabel = inspectingCameras
-    ? cameraScanPhase === "uploading"
-      ? "Uploading the blend file for camera scanning."
-      : "Upload complete. Blender is reading camera names from the scene."
-    : cameraInspection?.cameras.length
-      ? `${cameraInspection.cameras.length} camera${cameraInspection.cameras.length === 1 ? "" : "s"} found.`
-      : "Scan the selected blend file to list cameras and choose one or more render angles.";
-  const cameraScanElapsedLabel =
-    cameraScanElapsedMs !== null
-      ? formatElapsedDuration(cameraScanElapsedMs)
-      : null;
+    const formData = new FormData();
+    formData.set("blend_file", uploadBlendFile, uploadBlendFile.name);
+    if (uploadSourceMode === "folder") {
+      const payload = folderProjectUploadEntries(uploadBlendFile, uploadProjectFiles);
+      formData.set("blend_file_path", payload.blendPath);
+      payload.projectEntries.forEach(({ file, path }) => {
+        formData.append("project_files", file, file.name);
+        formData.append("project_paths", path);
+      });
+    }
+
+    setUploading(true);
+    setUploadProgress(0);
+    try {
+      await uploadFileWithProgress(formData, setUploadProgress);
+      setUploadBlendFile(null);
+      setUploadProjectFiles([]);
+      setSelectionMessage("Scene added to the library.");
+      setError(null);
+      void refreshCoreData();
+    } catch (uploadError) {
+      setError(uploadError instanceof Error ? uploadError.message : "Upload failed.");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function handleInspect() {
+    if (!selectedFile) {
+      return;
+    }
+    setInspecting(true);
+    try {
+      const scanFrame = form.renderMode === "still" ? form.frame : form.startFrame;
+      const payload = await inspectStoredFile(selectedFile.id, scanFrame);
+      setCameraInspection(payload);
+      const defaultSelection =
+        payload.default_camera && payload.cameras.some((camera) => camera.name === payload.default_camera)
+          ? [payload.default_camera]
+          : payload.cameras[0]
+            ? [payload.cameras[0].name]
+            : [];
+      setSelectedCameraNames(defaultSelection);
+      setError(null);
+    } catch (inspectError) {
+      setError(
+        inspectError instanceof Error ? inspectError.message : "Camera scan failed.",
+      );
+    } finally {
+      setInspecting(false);
+    }
+  }
+
+  async function handleCreateRun(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedFile) {
+      return;
+    }
+
+    const formData = new FormData();
+    formData.set("render_mode", form.renderMode);
+    formData.set("output_format", form.outputFormat);
+    if (form.renderMode === "still") {
+      formData.set("frame", String(form.frame));
+    } else {
+      formData.set("start_frame", String(form.startFrame));
+      formData.set("end_frame", String(form.endFrame));
+    }
+    selectedCameraNames.forEach((cameraName) => {
+      formData.append("camera_names", cameraName);
+    });
+
+    setRunning(true);
+    try {
+      const run = await createRun(selectedFile.id, formData);
+      setFiles((current) => upsertRun(current, run));
+      setError(null);
+      void refreshCoreData();
+    } catch (runError) {
+      setError(runError instanceof Error ? runError.message : "Failed to queue render.");
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function handleAdminStatus(userId: number, status: UserStatus) {
+    try {
+      const updated = await updateAdminUserStatus(userId, status);
+      setAdminUsers((current) =>
+        current.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      void refreshAdminData();
+    } catch (adminError) {
+      setError(
+        adminError instanceof Error ? adminError.message : "Failed to update user.",
+      );
+    }
+  }
+
+  if (booting) {
+    return (
+      <div className="app-shell">
+        <div className="page-frame flex min-h-screen items-center justify-center">
+          <LoaderCircle className="size-5 animate-spin text-muted-foreground" />
+        </div>
+      </div>
+    );
+  }
+
+  if (!session) {
+    return (
+      <AuthScreen
+        authBusy={authBusy}
+        authMode={authMode}
+        authPassword={authPassword}
+        authUsername={authUsername}
+        error={error}
+        onSubmit={handleAuthSubmit}
+        setAuthMode={setAuthMode}
+        setAuthPassword={setAuthPassword}
+        setAuthUsername={setAuthUsername}
+      />
+    );
+  }
+
+  if (session.user.status !== "approved") {
+    return (
+      <PendingScreen
+        error={error}
+        onSignOut={() => void handleSignOut()}
+        status={session.user.status}
+      />
+    );
+  }
 
   return (
-    <main className="min-h-screen bg-paper text-ink">
-      <div className="mx-auto max-w-7xl px-4 py-4 sm:px-6 lg:px-8 lg:py-8">
-        <section className="dashboard-shell soft-surface overflow-hidden rounded-[2rem] border border-line p-4 shadow-panel md:p-6">
-          <div className="grid gap-6 xl:grid-cols-[minmax(0,1.25fr)_380px]">
-            <div className="space-y-6">
-              <section className="overflow-hidden rounded-[1.85rem] border border-line bg-white text-ink">
-                <div className="relative px-5 py-5 md:px-8 md:py-7">
-                  <div className="absolute inset-y-0 right-0 w-full bg-[radial-gradient(circle_at_top_right,rgba(207,32,46,0.08),transparent_34%)]" />
-                  <div className="relative z-10">
-                    <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                      <div>
-                        <Image
-                          alt="University of Canterbury logo"
-                          className="h-12 w-auto object-contain md:h-[3.4rem]"
-                          priority
-                          src={logoMark}
-                          unoptimized
-                          width={180}
-                          height={56}
-                        />
-                        <p className="eyebrow mt-3 text-steel">
-                          University of Canterbury
-                        </p>
-                      </div>
-                    </div>
-                    <div className="mt-3 grid gap-5 lg:grid-cols-[minmax(0,1fr)_17rem] lg:items-center">
-                      <div className="max-w-[34rem]">
-                        <h1 className="max-w-[8.5ch] font-display text-[2.15rem] leading-[0.95] tracking-[0] sm:text-[2.8rem] xl:text-[3.2rem]">
-                          Render Farm
-                        </h1>
-                      </div>
-                      <div className="rounded-[1.35rem] border border-line bg-mist p-5 lg:justify-self-end">
-                        <p className="font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
-                          Live Summary
-                        </p>
-                        <p className="mt-4 text-sm leading-6 text-ink">
-                          {loading
-                            ? "Syncing queue and system status."
-                            : `${jobs.length} job${jobs.length === 1 ? "" : "s"} tracked across the queue.`}
-                        </p>
-                        <p className="mt-4 font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
-                          {deviceSummary(system)}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="mt-7 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                      <Metric label="Running" value={String(stats.running)} />
-                      <Metric label="Queued" value={String(stats.queued)} />
-                      <Metric label="Finished" value={String(stats.completed)} />
-                      <Metric
-                        label="Workers"
-                        value={String(system?.active_jobs ?? 0)}
-                      />
-                    </div>
-                  </div>
-                </div>
-              </section>
+    <div className="app-shell">
+      <div className="page-frame space-y-6">
+        <TopBar
+          adminPath={adminPath}
+          onSignOut={() => void handleSignOut()}
+          session={session}
+          system={system}
+          view={view}
+        />
 
-              <section className="space-y-4">
-                <div className="flex items-end justify-between gap-4 px-1">
-                  <div>
-                    <p className="eyebrow">Queue</p>
-                    <h2 className="mt-3 font-subheading text-[2rem] leading-[1.02] tracking-[-0.02em] sm:text-[2.35rem]">
-                      Active Jobs
-                    </h2>
-                  </div>
-                  <span className="font-subheading text-xs uppercase tracking-[0.08em] text-steel">
-                    {loading ? "Syncing" : `${jobs.length} total`}
-                  </span>
-                </div>
-
-                {jobs.length === 0 && !loading ? (
-                  <Card className="bg-mist">
-                    <p className="font-subheading text-[2rem] leading-[1.02] tracking-[-0.02em]">
-                      Queue is empty.
-                    </p>
-                    <p className="mt-3 max-w-md text-sm leading-6 text-steel">
-                      Submit a scene from the right-hand panel and it will show
-                      up here with progress, logs, and download access.
-                    </p>
-                  </Card>
-                ) : null}
-
-                {jobs.map((job) => (
-                  <Card className="space-y-5 overflow-hidden" key={job.id}>
-                    <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-3">
-                          <Badge phase={job.phase} />
-                          <p className="min-w-0 truncate font-subheading text-lg tracking-[0.005em] text-ink md:text-xl">
-                            {job.source_filename}
-                          </p>
-                        </div>
-                        <div className="mt-3 flex flex-wrap gap-x-5 gap-y-2 text-sm text-steel">
-                          <span>{frameLabel(job)}</span>
-                          <span>{job.output_format}</span>
-                          {cameraLabel(job) ? <span>{cameraLabel(job)}</span> : null}
-                          <span>Requested {job.requested_device}</span>
-                          <span>{liveDetail(job)}</span>
-                        </div>
-                      </div>
-
-                      {job.archive_path ? (
-                        <a href={`backend/api/jobs/${job.id}/download`}>
-                          <Button variant="secondary">
-                            <Download className="mr-2 h-4 w-4" />
-                            Download
-                          </Button>
-                        </a>
-                      ) : null}
-                    </div>
-
-                    <div>
-                      <div className="mb-2 flex items-center justify-between gap-4 text-sm text-steel">
-                        <span className="truncate">{job.status_message}</span>
-                        <span className="font-subheading text-xs uppercase tracking-[0.08em] text-ink">
-                          {Math.round(job.progress)}%
-                        </span>
-                      </div>
-                      <Progress value={job.progress} />
-                    </div>
-
-                    <div className="grid gap-3 md:grid-cols-4">
-                      <MetaBlock
-                        label="Created"
-                        value={formatTimestamp(job.created_at)}
-                      />
-                      <MetaBlock
-                        label="Started"
-                        value={formatTimestamp(job.started_at)}
-                      />
-                      <MetaBlock label="Outputs" value={outputLabel(job)} />
-                      <MetaBlock
-                        label="Device"
-                        value={job.resolved_device ?? "Pending"}
-                      />
-                    </div>
-
-                    {job.logs_tail.length ? (
-                      <details className="group rounded-[1.25rem] border border-line bg-mist px-4 py-3">
-                        <summary className="flex cursor-pointer items-center justify-between gap-3 font-subheading text-xs uppercase tracking-[0.08em] text-ink">
-                          Recent log lines
-                          <ChevronDown className="h-4 w-4 text-steel transition-transform duration-200 group-open:rotate-180" />
-                        </summary>
-                        <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-[1rem] bg-[#16181b] p-4 text-xs leading-6 text-[#dae4ea]">
-                          {job.logs_tail.slice(-8).join("\n")}
-                        </pre>
-                      </details>
-                    ) : null}
-
-                    {job.error ? (
-                      <div className="rounded-[1rem] border border-[#e7c6c6] bg-[#fff5f5] px-4 py-3 text-sm text-[#8e3535]">
-                        {job.error}
-                      </div>
-                    ) : null}
-                  </Card>
-                ))}
-              </section>
-            </div>
-
-            <aside className="space-y-4">
-              <Card>
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <p className="eyebrow">New Job</p>
-                    <h2 className="mt-3 font-subheading text-[1.8rem] leading-[1.02] tracking-[-0.02em] sm:text-[2rem]">
-                      Submit Render
-                    </h2>
-                  </div>
-                </div>
-
-                <form className="mt-8 space-y-5" onSubmit={handleSubmit}>
-                  <div>
-                    <span className="mb-2 block font-subheading text-[11px] uppercase tracking-[0.08em] text-ink/62">
-                      Upload source
-                    </span>
-                    <div className="grid grid-cols-2 gap-2 rounded-[1.15rem] bg-black/[0.04] p-1">
-                      <ModeButton
-                        active={uploadSourceMode === "files"}
-                        label="Files"
-                        onClick={() => setUploadSourceMode("files")}
-                      />
-                      <ModeButton
-                        active={uploadSourceMode === "folder"}
-                        label="Folder"
-                        onClick={() => setUploadSourceMode("folder")}
-                      />
-                    </div>
-                  </div>
-
-                  <Label
-                    title={
-                      uploadSourceMode === "folder"
-                        ? "Blend folder"
-                        : "Blend files"
-                    }
-                  >
-                    <input
-                      id="blend-file"
-                      className="block w-full rounded-[1rem] border border-dashed border-line bg-white px-4 py-4 text-sm text-ink outline-none transition file:mr-4 file:rounded-full file:border-0 file:bg-ember file:px-4 file:py-2 file:text-sm file:font-semibold file:tracking-[0] file:text-white hover:border-ember/30 focus:border-ember"
-                      multiple
-                      onChange={(event) => {
-                        const allFiles = Array.from(event.target.files ?? []);
-                        const files =
-                          uploadSourceMode === "folder"
-                            ? folderRenderTargets(allFiles)
-                            : allFiles.filter((file) =>
-                                file.name.toLowerCase().endsWith(".blend"),
-                              );
-                        setSelectedFiles(files);
-                        setSelectedProjectFiles(
-                          uploadSourceMode === "folder" ? allFiles : files,
-                        );
-                        setCameraInspection(null);
-                        setSelectedCameraNames([]);
-                        setCameraScanProgress(0);
-                        setCameraScanPhase("uploading");
-                        if (!files.length && event.target.files?.length) {
-                          setError("Only .blend files are accepted.");
-                        } else {
-                          setError(null);
-                        }
-                      }}
-                      ref={fileInputRef}
-                      type="file"
-                    />
-                  </Label>
-
-                  {selectedFiles.length ? (
-                    <div className="rounded-[1.2rem] border border-line bg-white px-4 py-4">
-                      <div className="flex items-start justify-between gap-4">
-                        <div className="min-w-0">
-                          <p className="truncate font-subheading text-sm tracking-[0] text-ink">
-                            {selectedFiles.length === 1
-                              ? fileLabel(selectedFiles[0])
-                              : `${selectedFiles.length} blend files selected`}
-                          </p>
-                          <p className="mt-1 text-sm text-steel">
-                            {formatBytes(
-                              totalFileBytes(
-                                uploadSourceMode === "folder"
-                                  ? selectedProjectFiles
-                                  : selectedFiles,
-                              ),
-                            )}
-                          </p>
-                        </div>
-                        <span className="rounded-full bg-sand px-3 py-1 font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
-                          {submitting ? "Uploading" : "Ready"}
-                        </span>
-                      </div>
-
-                      {selectedFiles.length > 1 ? (
-                        <div className="mt-4 space-y-1 text-sm text-steel">
-                          {selectedFiles.slice(0, 3).map((file) => (
-                            <p className="truncate" key={fileLabel(file)}>
-                              {fileLabel(file)}
-                            </p>
-                          ))}
-                          {selectedFiles.length > 3 ? (
-                            <p>
-                              +{selectedFiles.length - 3} more file
-                              {selectedFiles.length - 3 === 1 ? "" : "s"}
-                            </p>
-                          ) : null}
-                        </div>
-                      ) : null}
-
-                      {submitting ? (
-                        <div className="mt-4">
-                          <div className="mb-2 flex items-center justify-between text-sm text-steel">
-                            <span>{uploadStageLabel}</span>
-                            <span>{Math.round(uploadProgress)}%</span>
-                          </div>
-                          <Progress value={uploadProgress} />
-                        </div>
-                      ) : (
-                        <p className="mt-4 text-sm leading-6 text-steel">
-                          {uploadSourceMode === "folder"
-                            ? "Using the primary scene .blend from the selected folder, while sibling assets stay attached to the job."
-                            : "Large scenes take a moment to transfer before they are visible in the queue."}
-                        </p>
-                      )}
-                    </div>
-                  ) : null}
-
-                  {selectedFiles.length ? (
-                    <div className="rounded-[1.2rem] border border-line bg-mist px-4 py-4">
-                      <div className="flex items-start justify-between gap-4">
-                        <div>
-                          <p className="font-subheading text-sm text-ink">
-                            Camera selection
-                          </p>
-                          <p className="mt-1 text-sm text-steel">
-                            {cameraScanAvailable
-                              ? cameraScanLabel
-                              : "Camera scanning is available when one blend file is selected at a time."}
-                          </p>
-                          {cameraInspection ? (
-                            <p className="mt-1 text-sm text-steel">
-                              This scan upload will be reused when you queue the render.
-                            </p>
-                          ) : null}
-                        </div>
-                        {cameraScanAvailable ? (
-                          <Button
-                            disabled={inspectingCameras || submitting}
-                            onClick={handleInspectCameras}
-                            type="button"
-                            variant="secondary"
-                          >
-                            {inspectingCameras
-                              ? "Scanning cameras"
-                              : cameraInspection
-                                ? "Rescan cameras"
-                                : "Scan cameras"}
-                          </Button>
-                        ) : null}
-                      </div>
-
-                      {inspectingCameras ? (
-                        <div className="mt-4 rounded-[1rem] border border-line bg-white px-4 py-3">
-                          <div className="flex items-center gap-3 text-sm text-ink">
-                            <LoaderCircle className="h-4 w-4 animate-spin text-ember" />
-                            <span>
-                              {cameraScanPhase === "uploading"
-                                ? "Uploading blend for camera scan."
-                                : "Reading camera names in Blender."}
-                            </span>
-                          </div>
-                          <div className="mt-3 flex items-center justify-between gap-3 text-sm text-steel">
-                            <span>{cameraScanLabel}</span>
-                            <div className="text-right">
-                              {cameraScanElapsedLabel ? (
-                                <p>{cameraScanElapsedLabel}</p>
-                              ) : null}
-                              <p>{Math.round(cameraScanProgress)}%</p>
-                            </div>
-                          </div>
-                          <div className="mt-3">
-                            <Progress value={cameraScanProgress} />
-                          </div>
-                        </div>
-                      ) : null}
-
-                      {cameraInspection?.cameras.length ? (
-                        <div className="mt-4 space-y-3">
-                          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                            <p className="text-sm text-steel">
-                              Scan frame {cameraInspection.frame}. Selected{" "}
-                              {selectedCameraNames.length || 0} camera
-                              {selectedCameraNames.length === 1 ? "" : "s"}.
-                              {cameraScanElapsedLabel
-                                ? ` Scan took ${cameraScanElapsedLabel}.`
-                                : ""}
-                            </p>
-                            <div className="flex gap-2">
-                              <Button
-                                disabled={!cameraInspection.cameras.length}
-                                onClick={() =>
-                                  setSelectedCameraNames(
-                                    cameraInspection.cameras.map((camera) => camera.name),
-                                  )
-                                }
-                                type="button"
-                                variant="secondary"
-                              >
-                                Select all
-                              </Button>
-                              <Button
-                                disabled={!selectedCameraNames.length}
-                                onClick={() => setSelectedCameraNames([])}
-                                type="button"
-                                variant="secondary"
-                              >
-                                Clear
-                              </Button>
-                            </div>
-                          </div>
-                          <div className="grid gap-2 sm:grid-cols-2">
-                            {cameraInspection.cameras.map((camera) => {
-                              const active = selectedCameraNames.includes(
-                                camera.name,
-                              );
-                              const isDefaultCamera =
-                                cameraInspection.default_camera === camera.name;
-
-                              return (
-                                <label
-                                  className={`flex cursor-pointer items-center justify-between gap-3 rounded-[1rem] border px-3 py-3 transition ${
-                                    active
-                                      ? "border-ember bg-white shadow-[0_10px_24px_rgba(207,32,46,0.08)]"
-                                      : "border-line bg-white hover:border-ink/25"
-                                  }`}
-                                  key={camera.name}
-                                >
-                                  <div className="min-w-0">
-                                    <p className="truncate font-subheading text-sm text-ink">
-                                      {camera.name}
-                                    </p>
-                                    <p className="mt-1 text-xs text-steel">
-                                      {isDefaultCamera
-                                        ? "Default scene camera"
-                                        : "Additional camera"}
-                                    </p>
-                                  </div>
-                                  <input
-                                    checked={active}
-                                    className="h-4 w-4 accent-[#cf202e]"
-                                    onChange={() => toggleCamera(camera.name)}
-                                    type="checkbox"
-                                  />
-                                </label>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      ) : cameraInspection ? (
-                        <p className="mt-4 text-sm text-steel">
-                          No cameras were found in this blend file.
-                          {cameraScanElapsedLabel
-                            ? ` Scan took ${cameraScanElapsedLabel}.`
-                            : ""}
-                        </p>
-                      ) : null}
-                    </div>
-                  ) : null}
-
-                  <div>
-                    <span className="mb-2 block font-subheading text-[11px] uppercase tracking-[0.08em] text-ink/62">
-                      Render mode
-                    </span>
-                    <div className="grid grid-cols-2 gap-2 rounded-[1.15rem] bg-black/[0.04] p-1">
-                      <ModeButton
-                        active={form.renderMode === "still"}
-                        label="Still frame"
-                        onClick={() =>
-                          setForm((current) => ({
-                            ...current,
-                            renderMode: "still",
-                          }))
-                        }
-                      />
-                      <ModeButton
-                        active={form.renderMode === "animation"}
-                        label="Animation"
-                        onClick={() =>
-                          setForm((current) => ({
-                            ...current,
-                            renderMode: "animation",
-                          }))
-                        }
-                      />
-                    </div>
-                  </div>
-
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <Label title="Output format">
-                      <select
-                        className="field"
-                        value={form.outputFormat}
-                        onChange={(event) =>
-                          setForm((current) => ({
-                            ...current,
-                            outputFormat: event.target
-                              .value as JobFormState["outputFormat"],
-                          }))
-                        }
-                      >
-                        <option value="PNG">PNG</option>
-                        <option value="JPEG">JPEG</option>
-                        <option value="OPEN_EXR">OpenEXR</option>
-                      </select>
-                    </Label>
-
-                    <Label title="Device preference">
-                      <select
-                        className="field"
-                        value={form.devicePreference}
-                        onChange={(event) =>
-                          setForm((current) => ({
-                            ...current,
-                            devicePreference: event.target
-                              .value as JobFormState["devicePreference"],
-                          }))
-                        }
-                      >
-                        <option value="AUTO">Auto</option>
-                        <option value="CUDA">CUDA</option>
-                        <option value="OPTIX">OptiX</option>
-                        <option value="CPU">CPU</option>
-                      </select>
-                    </Label>
-                  </div>
-
-                  {form.renderMode === "still" ? (
-                    <Label title="Frame">
-                      <input
-                        className="field"
-                        min={1}
-                        type="number"
-                        value={form.frame}
-                        onChange={(event) =>
-                          setForm((current) => ({
-                            ...current,
-                            frame: Number(event.target.value || 1),
-                          }))
-                        }
-                      />
-                    </Label>
-                  ) : (
-                    <div className="grid gap-4 md:grid-cols-2">
-                      <Label title="Start frame">
-                        <input
-                          className="field"
-                          min={1}
-                          type="number"
-                          value={form.startFrame}
-                          onChange={(event) =>
-                            setForm((current) => ({
-                              ...current,
-                              startFrame: Number(event.target.value || 1),
-                            }))
-                          }
-                        />
-                      </Label>
-
-                      <Label title="End frame">
-                        <input
-                          className="field"
-                          min={form.startFrame}
-                          type="number"
-                          value={form.endFrame}
-                          onChange={(event) =>
-                            setForm((current) => ({
-                              ...current,
-                              endFrame: Number(
-                                event.target.value || current.startFrame,
-                              ),
-                            }))
-                          }
-                        />
-                      </Label>
-                    </div>
-                  )}
-
-                  {error ? (
-                    <div className="rounded-[1rem] border border-[#e5c6c6] bg-[#fff7f7] px-4 py-3 text-sm text-[#8a2e2e]">
-                      {error}
-                    </div>
-                  ) : null}
-
-                  <Button
-                    className="w-full"
-                    disabled={submitting || loading || inspectingCameras}
-                    type="submit"
-                  >
-                    {submitting
-                      ? `Uploading ${Math.round(uploadProgress)}%`
-                      : inspectingCameras
-                        ? `Scanning ${Math.round(cameraScanProgress)}%`
-                      : selectedCameraNames.length > 1 && selectedFiles.length === 1
-                        ? `Queue render for ${selectedCameraNames.length} cameras`
-                      : selectedFiles.length > 1
-                        ? `Queue ${selectedFiles.length} renders`
-                        : "Queue render"}
-                  </Button>
-                </form>
-              </Card>
-
-              <Card>
-                <p className="eyebrow">System</p>
-                <div className="mt-5 space-y-3">
-                  <StatusRow
-                    icon={<Server className="h-4 w-4" />}
-                    label="GPU runtime"
-                    value={system?.gpu ?? "Loading"}
-                  />
-                  <StatusRow
-                    icon={<SquareTerminal className="h-4 w-4" />}
-                    label="Blender"
-                    value={system?.blender ?? "Loading"}
-                  />
-                  <StatusRow
-                    icon={<Cpu className="h-4 w-4" />}
-                    label="Device policy"
-                    value={
-                      system
-                        ? `${system.device_policy.default} first, then ${system.device_policy.order.join(" / ")}`
-                        : "Loading"
-                    }
-                  />
-                  <StatusRow
-                    icon={<Cpu className="h-4 w-4" />}
-                    label="Detected devices"
-                    value={deviceSummary(system)}
-                  />
-                </div>
-              </Card>
-
-              <Card className="bg-mist">
-                <p className="font-subheading text-xs uppercase tracking-[0.08em] text-ink">
-                  Notes
-                </p>
-                <p className="mt-3 text-sm leading-6 text-steel">
-                  Jobs update automatically. Use the queue to watch progress,
-                  inspect recent logs, and download archives when they finish.
-                </p>
-              </Card>
-            </aside>
+        {error ? (
+          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+            {error}
           </div>
-        </section>
+        ) : null}
+
+        {view === "admin" ? (
+          <AdminView
+            adminActivity={adminActivity}
+            adminOverview={adminOverview}
+            adminRuns={adminRuns}
+            adminUsers={adminUsers}
+            onStatusChange={(userId, status) => void handleAdminStatus(userId, status)}
+          />
+        ) : view === "detail" ? (
+          selectedFile ? (
+            <FileDetailView
+              cameraInspection={cameraInspection}
+              file={selectedFile}
+              form={form}
+              inspecting={inspecting}
+              onInspect={() => void handleInspect()}
+              onRun={handleCreateRun}
+              running={running}
+              selectedCameraNames={selectedCameraNames}
+              setForm={(updater) => setForm((current) => updater(current))}
+              setSelectedCameraNames={setSelectedCameraNames}
+            />
+          ) : (
+            <Card className="subtle-panel rounded-2xl shadow-none">
+              <CardHeader>
+                <CardTitle className="text-lg font-semibold">Scene not found</CardTitle>
+                <CardDescription>
+                  That file id is not in your library.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <Button asChild variant="outline">
+                  <Link href="/">
+                    <ArrowLeft />
+                    Back to library
+                  </Link>
+                </Button>
+              </CardContent>
+            </Card>
+          )
+        ) : (
+          <LibraryView
+            files={files}
+            loadingData={loadingData}
+            onFileChange={handleSingleFileChange}
+            onFolderChange={handleFolderChange}
+            onModeChange={setUploadSourceMode}
+            onUpload={handleUpload}
+            selectedBlendFile={uploadBlendFile}
+            selectionMessage={selectionMessage}
+            uploadProgress={uploadProgress}
+            uploadSourceMode={uploadSourceMode}
+            uploading={uploading}
+          />
+        )}
       </div>
-    </main>
-  );
-}
-
-function Label({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <label className="block">
-      <span className="mb-2 block font-subheading text-[11px] uppercase tracking-[0.08em] text-ink/62">
-        {title}
-      </span>
-      {children}
-    </label>
-  );
-}
-
-function ModeButton({
-  active,
-  label,
-  onClick,
-}: {
-  active: boolean;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      className={
-        active
-          ? "rounded-[0.95rem] bg-ember px-3 py-3 font-subheading text-[11px] uppercase tracking-[0.08em] text-white transition"
-          : "rounded-[0.95rem] px-3 py-3 font-subheading text-[11px] uppercase tracking-[0.08em] text-steel transition hover:bg-white"
-      }
-      onClick={onClick}
-      type="button"
-    >
-      {label}
-    </button>
-  );
-}
-
-function Metric({
-  icon,
-  label,
-  value,
-}: {
-  icon?: ReactNode;
-  label: string;
-  value: string;
-}) {
-  return (
-    <div className="rounded-[1.35rem] border border-line bg-mist p-5">
-      {icon ? <div className="flex items-center gap-2 text-ember">{icon}</div> : null}
-      <p
-        className={`font-subheading text-[11px] uppercase tracking-[0.08em] text-steel ${icon ? "mt-5" : "mt-0"}`}
-      >
-        {label}
-      </p>
-      <p className="mt-3 font-subheading text-[1.9rem] leading-none tracking-[-0.03em] text-ink">
-        {value}
-      </p>
-    </div>
-  );
-}
-
-function StatusRow({
-  icon,
-  label,
-  value,
-}: {
-  icon: ReactNode;
-  label: string;
-  value: string;
-}) {
-  return (
-    <div className="rounded-[1.2rem] border border-line bg-white px-4 py-3">
-      <div className="flex items-center gap-3">
-        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[rgba(207,32,46,0.08)] text-ember">
-          {icon}
-        </div>
-        <div className="min-w-0">
-          <p className="font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
-            {label}
-          </p>
-          <p className="truncate text-sm text-ink">{value}</p>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function MetaBlock({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-[1.1rem] border border-line bg-mist px-4 py-3">
-      <p className="font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
-        {label}
-      </p>
-      <p className="mt-2 text-sm text-ink">{value}</p>
     </div>
   );
 }

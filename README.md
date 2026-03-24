@@ -7,11 +7,13 @@ Containerized Blender render queue. The stack exposes:
 
 ## What It Does
 
-- Accepts `.blend` uploads from the browser
-- Queues stills or frame ranges
+- Creates account-based access with pending approval
+- Stores uploaded `.blend` projects in a per-user file library
+- Lets users rerun the same source scene with different cameras or frame ranges
 - Runs Blender headless with Cycles inside the API container
 - Streams live job updates over SSE
 - Bundles finished output frames for download
+- Exposes a LAN-only admin panel behind a non-obvious URL slug
 
 ## Run It
 
@@ -19,7 +21,23 @@ Containerized Blender render queue. The stack exposes:
 docker compose up --build
 ```
 
+Before doing that for a real deployment, copy [.env.example](/home/maxaitel/render-farm/.env.example) to `.env` and set:
+
+- `ADMIN_BOOTSTRAP_USERNAME`
+- `ADMIN_BOOTSTRAP_PASSWORD`
+- `ADMIN_PANEL_PATH`
+
 Then open `http://localhost:3100`.
+
+The first admin login uses the bootstrap credentials above. New sign-ups stay in
+the `pending` state until that admin approves them from the hidden admin route:
+
+- `http://<host>:3100/<ADMIN_PANEL_PATH>`
+
+That route is also restricted to private/LAN client IPs.
+The API trusts forwarded client IP headers only from `TRUSTED_PROXIES`, which
+defaults to the local host and Docker bridge addresses used by the bundled
+`web -> api` proxy path.
 
 ## Requirements
 
@@ -81,8 +99,17 @@ You can change that in [compose.yaml](/home/maxaitel/render-farm/compose.yaml) w
 - `API_PORT`
 - `LOCAL_UID`
 - `LOCAL_GID`
+- `ADMIN_BOOTSTRAP_USERNAME`
+- `ADMIN_BOOTSTRAP_PASSWORD`
+- `ADMIN_PANEL_PATH`
+- `AUTH_COOKIE_SECURE`
+- `TRUSTED_PROXIES`
 
 The example port settings live in [.env.example](/home/maxaitel/render-farm/.env.example).
+
+This stack does not support upgrading legacy pre-account databases or importing
+old `jobs/*/job.json` payloads. Start from the current schema in
+`./data/renderfarm.sqlite3`.
 
 ## Frontend Notes
 
@@ -90,7 +117,13 @@ The example port settings live in [.env.example](/home/maxaitel/render-farm/.env
   forwarded ports and path-prefixed proxies.
 - The web image copies `.next/static` into the standalone output so the Next.js
   server can serve its built CSS and JS correctly.
+- The admin UI is served from a single-segment hidden route and only renders
+  when that route matches `ADMIN_PANEL_PATH`.
 
 ## Storage Layout
 
-Uploaded projects and renders are stored under `./data/jobs/<job-id>/`.
+Uploaded projects and renders are stored under:
+
+- `./data/files/<file-id>/source/` for reusable user-owned source trees
+- `./data/jobs/<job-id>/outputs/` for render outputs and archives
+- `./data/renderfarm.sqlite3` for users, sessions, activity, files, and runs

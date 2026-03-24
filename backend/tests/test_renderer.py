@@ -5,7 +5,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from app.config import Settings
-from app.models import JobPhase, JobRecord, OutputFormat, RenderDevice, RenderMode
+from app.models import JobPhase, JobRecord, OutputFormat, RenderDevice, RenderMode, UserFileRecord, UserStatus
 from app.renderer import RenderRunner
 from app.store import JobStore
 
@@ -21,21 +21,50 @@ def test_multi_camera_render_creates_single_archive_with_camera_named_outputs(
             default_device="AUTO",
             gpu_order=["CPU"],
             disable_worker=True,
+            session_cookie_name="renderfarm_session",
+            session_ttl_hours=24,
+            auth_cookie_secure="false",
+            admin_panel_path="control-tower",
+            admin_bootstrap_username=None,
+            admin_bootstrap_password=None,
+            allow_signups=True,
+            trusted_proxies=[],
         )
         store = JobStore(settings.database_path)
         await store.load()
         try:
+            user = await store.create_user(
+                username="artist_renderer",
+                password="artist-renderer-pass",
+                status=UserStatus.approved,
+            )
+            file_id = "file001"
+            file_root = settings.files_root / file_id / "source"
+            file_root.mkdir(parents=True, exist_ok=True)
+            source_path = file_root / "scene.blend"
+            source_path.write_bytes(b"blend-data")
+            await store.create_user_file(
+                UserFileRecord(
+                    id=file_id,
+                    user_id=user.id,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    updated_at="2026-01-01T00:00:00+00:00",
+                    source_filename="scene.blend",
+                    source_path=str(source_path),
+                    source_root=str(file_root),
+                    original_size_bytes=len(b"blend-data"),
+                )
+            )
+
             job_id = "multicam001"
             job_root = settings.jobs_root / job_id
-            input_dir = job_root / "input"
             output_dir = job_root / "outputs"
-            input_dir.mkdir(parents=True, exist_ok=True)
             output_dir.mkdir(parents=True, exist_ok=True)
-            source_path = input_dir / "scene.blend"
-            source_path.write_bytes(b"blend-data")
 
             job = JobRecord(
                 id=job_id,
+                user_id=user.id,
+                file_id=file_id,
                 source_filename="scene.blend",
                 source_path=str(source_path),
                 output_directory=str(output_dir),
