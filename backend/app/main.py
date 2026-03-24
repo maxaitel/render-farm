@@ -133,6 +133,10 @@ def client_ip(request: Request, settings: Settings) -> str | None:
 
 
 def lan_admin_access(request: Request, settings: Settings) -> bool:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    remote_host = request.client.host if request.client else None
+    if forwarded_for and not is_trusted_proxy(remote_host, settings.trusted_proxies):
+        return False
     return is_private_ip(client_ip(request, settings))
 
 
