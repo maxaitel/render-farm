@@ -4,7 +4,6 @@ import Image from "next/image";
 import type { FormEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Camera,
   ChevronDown,
   Cpu,
   Download,
@@ -252,7 +251,7 @@ function cameraScanRequestKey(
   file: File | null,
   projectFiles: File[],
   renderMode: RenderMode,
-  previewFrame: number,
+  scanFrame: number,
 ) {
   if (!file) {
     return "";
@@ -264,7 +263,7 @@ function cameraScanRequestKey(
     file.lastModified,
     projectFilesFingerprint(projectFiles),
     renderMode,
-    previewFrame,
+    scanFrame,
   ].join(":");
 }
 
@@ -357,7 +356,7 @@ export function RenderDashboard() {
 
   const primarySelectedFile = selectedFiles[0] ?? null;
   const cameraScanAvailable = selectedFiles.length === 1;
-  const previewFrame = form.renderMode === "still" ? form.frame : form.startFrame;
+  const scanFrame = form.renderMode === "still" ? form.frame : form.startFrame;
   const activeInspectionUploadKey = inspectionUploadKey(
     primarySelectedFile,
     selectedProjectFiles,
@@ -366,7 +365,7 @@ export function RenderDashboard() {
     primarySelectedFile,
     selectedProjectFiles,
     form.renderMode,
-    previewFrame,
+    scanFrame,
   );
 
   useEffect(() => {
@@ -711,7 +710,7 @@ export function RenderDashboard() {
           : undefined;
       const inspection = await inspectBlendFile(
         selectedFiles[0],
-        previewFrame,
+        scanFrame,
         (progress) => {
           if (
             requestId !== cameraScanRequestRef.current ||
@@ -798,10 +797,10 @@ export function RenderDashboard() {
   const cameraScanLabel = inspectingCameras
     ? cameraScanPhase === "uploading"
       ? "Uploading the blend file for camera scanning."
-      : "Upload complete. Blender is generating low-res camera previews."
+      : "Upload complete. Blender is reading camera names from the scene."
     : cameraInspection?.cameras.length
       ? `${cameraInspection.cameras.length} camera${cameraInspection.cameras.length === 1 ? "" : "s"} found.`
-      : "Scan the selected blend file to preview cameras and choose one or more render angles.";
+      : "Scan the selected blend file to list cameras and choose one or more render angles.";
   const cameraScanElapsedLabel =
     cameraScanElapsedMs !== null
       ? formatElapsedDuration(cameraScanElapsedMs)
@@ -1099,12 +1098,12 @@ export function RenderDashboard() {
                       <div className="flex items-start justify-between gap-4">
                         <div>
                           <p className="font-subheading text-sm text-ink">
-                            Camera views
+                            Camera selection
                           </p>
                           <p className="mt-1 text-sm text-steel">
                             {cameraScanAvailable
                               ? cameraScanLabel
-                              : "Camera previews are available when one blend file is selected at a time."}
+                              : "Camera scanning is available when one blend file is selected at a time."}
                           </p>
                           {cameraInspection ? (
                             <p className="mt-1 text-sm text-steel">
@@ -1135,7 +1134,7 @@ export function RenderDashboard() {
                             <span>
                               {cameraScanPhase === "uploading"
                                 ? "Uploading blend for camera scan."
-                                : "Generating preview thumbnails in Blender."}
+                                : "Reading camera names in Blender."}
                             </span>
                           </div>
                           <div className="mt-3 flex items-center justify-between gap-3 text-sm text-steel">
@@ -1155,56 +1154,72 @@ export function RenderDashboard() {
 
                       {cameraInspection?.cameras.length ? (
                         <div className="mt-4 space-y-3">
-                          <p className="text-sm text-steel">
-                            Preview frame {cameraInspection.frame}. Selected{" "}
-                            {selectedCameraNames.length || 0} camera
-                            {selectedCameraNames.length === 1 ? "" : "s"}.
-                            {cameraScanElapsedLabel
-                              ? ` Scan took ${cameraScanElapsedLabel}.`
-                              : ""}
-                          </p>
-                          <div className="grid gap-3 sm:grid-cols-2">
+                          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                            <p className="text-sm text-steel">
+                              Scan frame {cameraInspection.frame}. Selected{" "}
+                              {selectedCameraNames.length || 0} camera
+                              {selectedCameraNames.length === 1 ? "" : "s"}.
+                              {cameraScanElapsedLabel
+                                ? ` Scan took ${cameraScanElapsedLabel}.`
+                                : ""}
+                            </p>
+                            <div className="flex gap-2">
+                              <Button
+                                disabled={!cameraInspection.cameras.length}
+                                onClick={() =>
+                                  setSelectedCameraNames(
+                                    cameraInspection.cameras.map((camera) => camera.name),
+                                  )
+                                }
+                                type="button"
+                                variant="secondary"
+                              >
+                                Select all
+                              </Button>
+                              <Button
+                                disabled={!selectedCameraNames.length}
+                                onClick={() => setSelectedCameraNames([])}
+                                type="button"
+                                variant="secondary"
+                              >
+                                Clear
+                              </Button>
+                            </div>
+                          </div>
+                          <div className="grid gap-2 sm:grid-cols-2">
                             {cameraInspection.cameras.map((camera) => {
                               const active = selectedCameraNames.includes(
                                 camera.name,
                               );
+                              const isDefaultCamera =
+                                cameraInspection.default_camera === camera.name;
+
                               return (
-                                <button
-                                  className={`overflow-hidden rounded-[1.15rem] border text-left transition ${
+                                <label
+                                  className={`flex cursor-pointer items-center justify-between gap-3 rounded-[1rem] border px-3 py-3 transition ${
                                     active
-                                      ? "border-ember bg-white shadow-[0_14px_30px_rgba(207,32,46,0.12)]"
+                                      ? "border-ember bg-white shadow-[0_10px_24px_rgba(207,32,46,0.08)]"
                                       : "border-line bg-white hover:border-ink/25"
                                   }`}
                                   key={camera.name}
-                                  onClick={() => toggleCamera(camera.name)}
-                                  type="button"
                                 >
-                                  {camera.preview_data_url ? (
-                                    <img
-                                      alt={`${camera.name} preview`}
-                                      className="h-28 w-full object-cover"
-                                      src={camera.preview_data_url}
-                                    />
-                                  ) : (
-                                    <div className="flex h-28 items-center justify-center bg-sand text-steel">
-                                      <Camera className="h-5 w-5" />
-                                    </div>
-                                  )}
-                                  <div className="flex items-center justify-between gap-3 px-3 py-3">
-                                    <span className="min-w-0 truncate font-subheading text-sm text-ink">
+                                  <div className="min-w-0">
+                                    <p className="truncate font-subheading text-sm text-ink">
                                       {camera.name}
-                                    </span>
-                                    <span
-                                      className={`rounded-full px-2 py-1 font-subheading text-[10px] uppercase tracking-[0.08em] ${
-                                        active
-                                          ? "bg-ember text-white"
-                                          : "bg-sand text-steel"
-                                      }`}
-                                    >
-                                      {active ? "Selected" : "Select"}
-                                    </span>
+                                    </p>
+                                    <p className="mt-1 text-xs text-steel">
+                                      {isDefaultCamera
+                                        ? "Default scene camera"
+                                        : "Additional camera"}
+                                    </p>
                                   </div>
-                                </button>
+                                  <input
+                                    checked={active}
+                                    className="h-4 w-4 accent-[#cf202e]"
+                                    onChange={() => toggleCamera(camera.name)}
+                                    type="checkbox"
+                                  />
+                                </label>
                               );
                             })}
                           </div>

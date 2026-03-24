@@ -252,12 +252,10 @@ class RenderRunner:
         command.extend(["--", "--cycles-print-stats", "--cycles-device", device])
         return command
 
-    async def inspect_blend(self, source_file: Path, preview_frame: int | None = None) -> dict:
+    async def inspect_blend(self, source_file: Path, scan_frame: int | None = None) -> dict:
         with tempfile.TemporaryDirectory(dir=self.settings.temp_root) as temp_dir:
             temp_root = Path(temp_dir)
             output_json = temp_root / "inspection.json"
-            preview_dir = temp_root / "previews"
-            preview_dir.mkdir(parents=True, exist_ok=True)
 
             command = [
                 self.settings.blender_binary,
@@ -271,11 +269,9 @@ class RenderRunner:
                 "--",
                 "--output-json",
                 str(output_json),
-                "--preview-dir",
-                str(preview_dir),
             ]
-            if preview_frame is not None:
-                command.extend(["--frame", str(preview_frame)])
+            if scan_frame is not None:
+                command.extend(["--frame", str(scan_frame)])
 
             output = await self._run_command(
                 command,
@@ -287,16 +283,6 @@ class RenderRunner:
                 raise RuntimeError(message)
 
             payload = json.loads(output_json.read_text("utf-8"))
-            cameras = payload.get("cameras", [])
-            for camera in cameras:
-                preview_path = camera.get("preview_path")
-                if not preview_path:
-                    continue
-                path = Path(preview_path)
-                if not path.exists():
-                    continue
-                camera["preview_data_url"] = self._preview_data_url(path)
-                camera.pop("preview_path", None)
             return payload
 
     def _parse_progress(
@@ -533,9 +519,3 @@ class RenderRunner:
 
     def _script_path(self, script_name: str) -> Path:
         return Path(__file__).with_name(script_name)
-
-    def _preview_data_url(self, path: Path) -> str:
-        import base64
-
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        return f"data:image/png;base64,{encoded}"

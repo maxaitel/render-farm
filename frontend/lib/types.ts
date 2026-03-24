@@ -50,14 +50,13 @@ export interface SystemStatus {
   active_jobs: number;
 }
 
-export interface BlendCameraPreview {
+export interface BlendCameraOption {
   name: string;
-  preview_data_url?: string | null;
 }
 
 export interface BlendInspection {
   default_camera: string | null;
   frame: number;
   inspection_token: string;
-  cameras: BlendCameraPreview[];
+  cameras: BlendCameraOption[];
 }

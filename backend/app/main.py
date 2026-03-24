@@ -464,7 +464,7 @@ async def inspect_blend_file(
                 await upload.close()
                 continue
             await save_upload(upload, source_root / relative_project_path)
-        payload = await state.runner.inspect_blend(source_path, preview_frame=frame)
+        payload = await state.runner.inspect_blend(source_path, scan_frame=frame)
         write_inspect_session(
             state.settings,
             inspection_token,

@@ -256,16 +256,15 @@ def test_blend_inspect_returns_camera_payload(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:
         with _client_for(tmp_path) as client:
-            async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
+            async def fake_inspect(source_path: Path, scan_frame: int | None = None) -> dict:
                 assert source_path.exists()
-                assert preview_frame == 7
+                assert scan_frame == 7
                 return {
                     "default_camera": "Camera_Main",
                     "frame": 7,
                     "cameras": [
                         {
                             "name": "Camera_Main",
-                            "preview_data_url": "data:image/png;base64,preview",
                         }
                     ],
                 }
@@ -282,7 +281,7 @@ def test_blend_inspect_returns_camera_payload(tmp_path: Path) -> None:
         assert payload["inspection_token"]
         assert payload["default_camera"] == "Camera_Main"
         assert payload["frame"] == 7
-        assert payload["cameras"][0]["preview_data_url"].startswith("data:image/png;base64,")
+        assert payload["cameras"] == [{"name": "Camera_Main"}]
     finally:
         _restore_env(previous)
 
@@ -312,7 +311,7 @@ def test_blend_inspect_uploads_full_folder_tree_for_camera_scan(tmp_path: Path) 
     previous = _set_test_env(tmp_path)
     try:
         with _client_for(tmp_path) as client:
-            async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
+            async def fake_inspect(source_path: Path, scan_frame: int | None = None) -> dict:
                 source_root = source_path.parents[2]
                 assert source_path == (
                     source_root / "Project Files" / "scenes" / "Scene 1.blend"
@@ -364,7 +363,7 @@ def test_blend_inspect_persists_processing_session_before_runner_finishes(tmp_pa
     previous = _set_test_env(tmp_path)
     try:
         with _client_for(tmp_path) as client:
-            async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
+            async def fake_inspect(source_path: Path, scan_frame: int | None = None) -> dict:
                 inspect_root = source_path.parents[1]
                 payload = json.loads((inspect_root / "session.json").read_text("utf-8"))
                 assert payload["state"] == "processing"
@@ -419,7 +418,7 @@ def test_blend_inspect_starts_session_before_uploading_project_files(
         monkeypatch.setattr(main_module, "save_upload", tracked_save_upload)
 
         with _client_for(tmp_path) as client:
-            async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
+            async def fake_inspect(source_path: Path, scan_frame: int | None = None) -> dict:
                 return {"default_camera": None, "frame": 1, "cameras": []}
 
             client.app.state.runtime.runner.inspect_blend = fake_inspect
@@ -445,8 +444,8 @@ def test_blend_inspect_cleans_up_session_after_unexpected_error(tmp_path: Path) 
     previous = _set_test_env(tmp_path)
     try:
         with TestClient(app, raise_server_exceptions=False) as client:
-            async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
-                raise ValueError("broken preview payload")
+            async def fake_inspect(source_path: Path, scan_frame: int | None = None) -> dict:
+                raise ValueError("broken camera payload")
 
             client.app.state.runtime.runner.inspect_blend = fake_inspect
             response = client.post(
@@ -898,7 +897,7 @@ def test_blend_inspection_runs_prepare_render_before_camera_scan(tmp_path: Path)
 
         runner._run_command = fake_run_command  # type: ignore[method-assign]
 
-        payload = asyncio.run(runner.inspect_blend(source_path, preview_frame=4))
+        payload = asyncio.run(runner.inspect_blend(source_path, scan_frame=4))
 
         command = captured["command"]
         assert isinstance(command, list)
@@ -908,6 +907,7 @@ def test_blend_inspection_runs_prepare_render_before_camera_scan(tmp_path: Path)
         assert prepare_script in command
         assert inspect_script in command
         assert command.index(prepare_script) < command.index(inspect_script)
+        assert "--preview-dir" not in command
         assert payload["frame"] == 4
         assert "RENDER_CAMERA_NAME" not in (captured["env"] or {})
     finally:
@@ -951,55 +951,70 @@ def test_run_command_can_return_output_for_failed_process(
     asyncio.run(scenario())
 
 
-def test_preview_render_preserves_aspect_ratio_when_capped(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_camera_payload_contains_name_only(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_bpy = types.SimpleNamespace(
         context=types.SimpleNamespace(scene=None, preferences=types.SimpleNamespace(addons={})),
         ops=types.SimpleNamespace(render=types.SimpleNamespace(render=None)),
+        data=types.SimpleNamespace(images={}),
         types=types.SimpleNamespace(Scene=object, Object=object),
     )
     monkeypatch.setitem(sys.modules, "bpy", fake_bpy)
     sys.modules.pop("app.inspect_blend", None)
     inspect_blend = importlib.import_module("app.inspect_blend")
 
-    captured: dict[str, tuple[int, int]] = {}
+    payload = inspect_blend.camera_payload(types.SimpleNamespace(name="Camera_Main"))
+
+    assert payload == {"name": "Camera_Main"}
+
+
+def test_inspect_blend_main_lists_cameras_without_rendering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frame_calls: list[int] = []
     scene = types.SimpleNamespace(
-        camera=None,
-        render=types.SimpleNamespace(
-            engine="BLENDER_EEVEE",
-            filepath="",
-            image_settings=types.SimpleNamespace(file_format="OPEN_EXR", color_mode="RGBA"),
-            resolution_x=1080,
-            resolution_y=1920,
-            resolution_percentage=50,
-            use_file_extension=False,
-        ),
+        camera=types.SimpleNamespace(name="Camera_Main"),
+        frame_current=12,
+        frame_set=lambda frame: frame_calls.append(frame),
+        objects=[
+            types.SimpleNamespace(name="Camera_Main", type="CAMERA"),
+            types.SimpleNamespace(name="Camera_Side", type="CAMERA"),
+            types.SimpleNamespace(name="Cube", type="MESH"),
+        ],
     )
-    fake_bpy.context.scene = scene
-
-    def fake_render(*, write_still: bool) -> None:
-        captured["resolution"] = (scene.render.resolution_x, scene.render.resolution_y)
-        Path(scene.render.filepath).write_bytes(b"preview")
-
-    fake_bpy.ops.render.render = fake_render
-    monkeypatch.setattr(inspect_blend, "choose_preview_engine", lambda: "CYCLES")
-    monkeypatch.setattr(inspect_blend, "configure_cycles_cpu_preview", lambda _scene: None)
-
-    preview_path = inspect_blend.render_preview(
-        scene,
-        types.SimpleNamespace(name="PortraitCam"),
-        tmp_path,
-        "portrait-preview",
+    fake_bpy = types.SimpleNamespace(
+        context=types.SimpleNamespace(scene=scene, preferences=types.SimpleNamespace(addons={})),
+        ops=types.SimpleNamespace(render=types.SimpleNamespace(render=None)),
+        data=types.SimpleNamespace(images={}),
+        types=types.SimpleNamespace(Scene=object, Object=object),
+    )
+    monkeypatch.setitem(sys.modules, "bpy", fake_bpy)
+    sys.modules.pop("app.inspect_blend", None)
+    inspect_blend = importlib.import_module("app.inspect_blend")
+    output_path = tmp_path / "inspection.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "blender",
+            "--",
+            "--output-json",
+            str(output_path),
+            "--frame",
+            "12",
+        ],
     )
 
-    assert preview_path == tmp_path / "portrait-preview.png"
-    width, height = captured["resolution"]
-    assert height == 360
-    assert abs((width / height) - (1080 / 1920)) < 0.01
-    assert scene.render.resolution_x == 1080
-    assert scene.render.resolution_y == 1920
-    assert scene.render.resolution_percentage == 50
+    inspect_blend.main()
+
+    assert frame_calls == [12]
+    assert json.loads(output_path.read_text("utf-8")) == {
+        "default_camera": "Camera_Main",
+        "frame": 12,
+        "cameras": [
+            {"name": "Camera_Main"},
+            {"name": "Camera_Side"},
+        ],
+    }
 
 
 def test_expired_inspection_upload_is_reaped_on_next_scan(tmp_path: Path) -> None:
@@ -1026,7 +1041,7 @@ def test_expired_inspection_upload_is_reaped_on_next_scan(tmp_path: Path) -> Non
         cleanup_expired_inspect_sessions(Settings(tmp_path, "/bin/true", "AUTO", ["CPU"], True))
 
         with _client_for(tmp_path) as client:
-            async def fake_inspect(source_path: Path, preview_frame: int | None = None) -> dict:
+            async def fake_inspect(source_path: Path, scan_frame: int | None = None) -> dict:
                 return {"default_camera": None, "frame": 1, "cameras": []}
 
             client.app.state.runtime.runner.inspect_blend = fake_inspect

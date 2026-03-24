@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libjack0 \
     libjemalloc2 \
     libdbus-1-3 \
+    libegl1 \
     libfontconfig1 \
     libglib2.0-0 \
     libgl1 \
