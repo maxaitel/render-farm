@@ -63,12 +63,7 @@ def test_sign_up_creates_pending_account_and_session_reflects_status(tmp_path: P
             )
             assert create_response.status_code == 200
             assert create_response.json()["user"]["status"] == "pending"
-
-            sign_in_response = client.post(
-                "/api/auth/sign-in",
-                json={"username": "artist_one", "password": "artist-password-123"},
-            )
-            assert sign_in_response.status_code == 200
+            assert "renderfarm_session" in create_response.cookies
 
             session_response = client.get("/api/auth/session")
             assert session_response.status_code == 200
@@ -200,5 +195,27 @@ def test_spoofed_forwarded_for_header_does_not_grant_admin_access(tmp_path: Path
                 headers={"x-forwarded-for": "127.0.0.1"},
             )
             assert response.status_code == 404
+    finally:
+        _restore_env(previous)
+
+
+def test_untrusted_forwarded_for_preserves_remote_host_in_session_records(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with TestClient(app, client=("198.51.100.24", 50000)) as client:
+            response = client.post(
+                "/api/auth/sign-in",
+                json={"username": "admin", "password": "admin-password-123"},
+                headers={"x-forwarded-for": "127.0.0.1"},
+            )
+            assert response.status_code == 200
+            assert response.json()["lan_admin_access"] is False
+
+            conn = sqlite3.connect(tmp_path / "renderfarm.sqlite3")
+            row = conn.execute(
+                "SELECT ip_address FROM user_sessions ORDER BY rowid DESC LIMIT 1",
+            ).fetchone()
+            conn.close()
+            assert row == ("198.51.100.24",)
     finally:
         _restore_env(previous)

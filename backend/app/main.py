@@ -120,7 +120,7 @@ def client_ip(request: Request, settings: Settings) -> str | None:
     forwarded_for = request.headers.get("x-forwarded-for", "")
     if forwarded_for:
         if not is_trusted_proxy(remote_host, settings.trusted_proxies):
-            return None
+            return remote_host
         candidate = forwarded_for.split(",")[0].strip()
         if candidate:
             return candidate
@@ -129,6 +129,27 @@ def client_ip(request: Request, settings: Settings) -> str | None:
 
 def lan_admin_access(request: Request, settings: Settings) -> bool:
     return is_private_ip(client_ip(request, settings))
+
+
+async def start_user_session(state: AppState, user: UserRecord, request: Request, response: Response) -> None:
+    session_token = new_session_token()
+    request_ip = client_ip(request, state.settings)
+    await state.store.create_session(
+        user_id=user.id,
+        token_hash=hash_session_token(session_token),
+        expires_in_hours=state.settings.session_ttl_hours,
+        ip_address=request_ip,
+        user_agent=request.headers.get("user-agent"),
+    )
+    response.set_cookie(
+        key=state.settings.session_cookie_name,
+        value=session_token,
+        httponly=True,
+        secure=cookie_secure_setting(state.settings, request),
+        samesite="strict",
+        path="/",
+        max_age=state.settings.session_ttl_hours * 60 * 60,
+    )
 
 
 async def save_upload(upload: UploadFile, destination: Path) -> int:
@@ -376,7 +397,6 @@ async def healthcheck() -> dict:
 @app.post("/api/auth/sign-up")
 async def sign_up(payload: SignUpRequest, request: Request, response: Response) -> dict:
     state = runtime_state()
-    del response
     if not state.settings.allow_signups:
         raise HTTPException(status_code=403, detail="Sign-ups are disabled.")
 
@@ -387,6 +407,8 @@ async def sign_up(payload: SignUpRequest, request: Request, response: Response) 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except sqlite3.IntegrityError as exc:
         raise HTTPException(status_code=409, detail="That username is already registered.") from exc
+
+    await start_user_session(state, user, request, response)
 
     await state.store.create_activity(
         event_type="auth.sign_up",
@@ -406,23 +428,7 @@ async def sign_in(payload: SignInRequest, request: Request, response: Response) 
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid username or password.")
 
-    session_token = new_session_token()
-    await state.store.create_session(
-        user_id=user.id,
-        token_hash=hash_session_token(session_token),
-        expires_in_hours=state.settings.session_ttl_hours,
-        ip_address=client_ip(request, state.settings),
-        user_agent=request.headers.get("user-agent"),
-    )
-    response.set_cookie(
-        key=state.settings.session_cookie_name,
-        value=session_token,
-        httponly=True,
-        secure=cookie_secure_setting(state.settings, request),
-        samesite="strict",
-        path="/",
-        max_age=state.settings.session_ttl_hours * 60 * 60,
-    )
+    await start_user_session(state, user, request, response)
     await state.store.create_activity(
         event_type="auth.sign_in",
         description=f"{user.username} signed in.",
