@@ -115,17 +115,15 @@ class JobStore:
         self._conn = sqlite3.connect(self.database_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA_SQL)
-        self._migrate_legacy_schema()
         self._conn.executescript(INDEX_SQL)
 
         self._jobs = {}
-        await self._import_legacy_jobs()
         rows = self._conn.execute(
             "SELECT id, user_id, file_id, created_at, phase, source_filename, payload FROM jobs ORDER BY created_at ASC"
         ).fetchall()
 
         for row in rows:
-            job = self._job_from_row(row)
+            job = JobRecord.model_validate_json(row["payload"])
             if job.phase == JobPhase.running:
                 job.phase = JobPhase.failed
                 job.error = "Server restarted while the render was in progress."
@@ -873,115 +871,6 @@ class JobStore:
             "UPDATE user_files SET updated_at = ? WHERE id = ?",
             (utc_now().isoformat(), snapshot.file_id),
         )
-
-    def _migrate_legacy_schema(self) -> None:
-        if self._conn is None:
-            raise RuntimeError("JobStore database is not initialized.")
-
-        self._ensure_column("users", "password_hash", "TEXT NOT NULL DEFAULT ''")
-        self._ensure_column("users", "role", "TEXT NOT NULL DEFAULT 'user'")
-        self._ensure_column("users", "status", "TEXT NOT NULL DEFAULT 'pending'")
-        self._ensure_column("users", "approved_at", "TEXT")
-        self._ensure_column("users", "approved_by_user_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL")
-        self._ensure_column("users", "last_login_at", "TEXT")
-        self._ensure_column("jobs", "file_id", "TEXT")
-        self._ensure_column("jobs", "user_id", "INTEGER")
-        self._conn.commit()
-
-    def _ensure_column(self, table_name: str, column_name: str, definition: str) -> None:
-        if self._conn is None:
-            raise RuntimeError("JobStore database is not initialized.")
-        existing = {
-            row["name"]
-            for row in self._conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-        }
-        if column_name not in existing:
-            self._conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
-
-    async def _import_legacy_jobs(self) -> None:
-        if self._conn is None:
-            raise RuntimeError("JobStore database is not initialized.")
-
-        for meta_path in sorted(self.jobs_root.glob("*/job.json")):
-            try:
-                payload = await asyncio.to_thread(meta_path.read_text, "utf-8")
-                payload_data = json.loads(payload)
-                if not isinstance(payload_data, dict):
-                    continue
-            except Exception as exc:
-                print(f"Skipping unreadable legacy job file {meta_path}: {exc}")
-                continue
-
-            job_id = str(payload_data.get("id") or meta_path.parent.name)
-            already_imported = self._conn.execute(
-                "SELECT 1 FROM jobs WHERE id = ?",
-                (job_id,),
-            ).fetchone()
-            if already_imported:
-                continue
-
-            source_filename = str(payload_data.get("source_filename") or "scene.blend")
-            source_path = str(payload_data.get("source_path") or meta_path.parent / "input" / source_filename)
-            legacy_file_id = str(payload_data.get("file_id") or f"legacy-{job_id}")
-            legacy_user_id = int(payload_data.get("user_id") or 1)
-
-            with self._conn:
-                self._conn.execute(
-                    """
-                    INSERT OR IGNORE INTO users (id, username, password_hash, role, status, created_at)
-                    VALUES (?, ?, '', ?, ?, ?)
-                    """,
-                    (
-                        legacy_user_id,
-                        f"legacy-{legacy_user_id}",
-                        UserRole.user.value,
-                        UserStatus.approved.value,
-                        utc_now().isoformat(),
-                    ),
-                )
-                self._conn.execute(
-                    """
-                    INSERT OR IGNORE INTO user_files (
-                        id,
-                        user_id,
-                        created_at,
-                        updated_at,
-                        source_filename,
-                        source_path,
-                        source_root,
-                        original_size_bytes
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        legacy_file_id,
-                        legacy_user_id,
-                        payload_data.get("created_at") or utc_now().isoformat(),
-                        utc_now().isoformat(),
-                        source_filename,
-                        source_path,
-                        str(Path(source_path).parent.parent if Path(source_path).exists() else Path(source_path).parent),
-                        Path(source_path).stat().st_size if Path(source_path).exists() else 0,
-                    ),
-                )
-
-            payload_data["id"] = job_id
-            payload_data["user_id"] = legacy_user_id
-            payload_data["file_id"] = legacy_file_id
-            payload_data["source_filename"] = source_filename
-            payload_data["source_path"] = source_path
-            if "output_directory" not in payload_data:
-                payload_data["output_directory"] = str(meta_path.parent / "outputs")
-            job = JobRecord.model_validate(payload_data)
-            await self._persist(job)
-
-    def _job_from_row(self, row: sqlite3.Row) -> JobRecord:
-        payload = json.loads(row["payload"])
-        if "user_id" not in payload:
-            payload["user_id"] = row["user_id"] or 1
-        if "file_id" not in payload:
-            payload["file_id"] = row["file_id"] or f"legacy-{row['id']}"
-        return JobRecord.model_validate(payload)
 
     def _user_from_row(self, row: sqlite3.Row) -> UserRecord:
         return UserRecord.model_validate(

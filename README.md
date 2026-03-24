@@ -35,6 +35,9 @@ the `pending` state until that admin approves them from the hidden admin route:
 - `http://<host>:3100/<ADMIN_PANEL_PATH>`
 
 That route is also restricted to private/LAN client IPs.
+The API trusts forwarded client IP headers only from `TRUSTED_PROXIES`, which
+defaults to the local host and Docker bridge addresses used by the bundled
+`web -> api` proxy path.
 
 ## Requirements
 
@@ -100,8 +103,13 @@ You can change that in [compose.yaml](/home/maxaitel/render-farm/compose.yaml) w
 - `ADMIN_BOOTSTRAP_PASSWORD`
 - `ADMIN_PANEL_PATH`
 - `AUTH_COOKIE_SECURE`
+- `TRUSTED_PROXIES`
 
 The example port settings live in [.env.example](/home/maxaitel/render-farm/.env.example).
+
+This stack does not support upgrading legacy pre-account databases or importing
+old `jobs/*/job.json` payloads. Start from the current schema in
+`./data/renderfarm.sqlite3`.
 
 ## Frontend Notes
 
