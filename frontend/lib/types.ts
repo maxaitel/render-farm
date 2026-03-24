@@ -1,8 +1,12 @@
 export type JobPhase = "queued" | "running" | "completed" | "failed";
 export type RenderMode = "still" | "animation";
+export type UserRole = "user" | "admin";
+export type UserStatus = "pending" | "approved" | "suspended";
 
 export interface RenderJob {
   id: string;
+  user_id: number;
+  file_id: string;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -32,6 +36,38 @@ export interface RenderJob {
   error: string | null;
 }
 
+export interface UserFile {
+  id: string;
+  user_id: number;
+  created_at: string;
+  updated_at: string;
+  source_filename: string;
+  source_path: string;
+  source_root: string;
+  original_size_bytes: number;
+  latest_job: RenderJob | null;
+  jobs: RenderJob[];
+}
+
+export interface UserAccount {
+  id: number;
+  username: string;
+  role: UserRole;
+  status: UserStatus;
+  created_at: string;
+  approved_at: string | null;
+  approved_by_user_id: number | null;
+  last_login_at: string | null;
+  render_file_count: number;
+  run_count: number;
+}
+
+export interface AuthSession {
+  user: UserAccount;
+  admin_panel_path: string | null;
+  lan_admin_access: boolean;
+}
+
 export interface SystemStatus {
   blender: string;
   gpu: string;
@@ -57,6 +93,28 @@ export interface BlendCameraOption {
 export interface BlendInspection {
   default_camera: string | null;
   frame: number;
-  inspection_token: string;
   cameras: BlendCameraOption[];
+}
+
+export interface AdminOverview {
+  pending_users: number;
+  approved_users: number;
+  suspended_users: number;
+  total_files: number;
+  total_runs: number;
+  active_runs: number;
+}
+
+export interface ActivityRecord {
+  id: number;
+  created_at: string;
+  event_type: string;
+  description: string;
+  actor_user_id: number | null;
+  actor_username: string | null;
+  subject_user_id: number | null;
+  subject_username: string | null;
+  file_id: string | null;
+  job_id: string | null;
+  metadata: Record<string, unknown>;
 }

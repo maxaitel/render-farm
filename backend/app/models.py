@@ -36,8 +36,21 @@ class RenderDevice(str, Enum):
     cpu = "CPU"
 
 
+class UserRole(str, Enum):
+    user = "user"
+    admin = "admin"
+
+
+class UserStatus(str, Enum):
+    pending = "pending"
+    approved = "approved"
+    suspended = "suspended"
+
+
 class JobRecord(BaseModel):
     id: str
+    user_id: int
+    file_id: str
     created_at: datetime = Field(default_factory=utc_now)
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -73,3 +86,77 @@ class JobRecord(BaseModel):
     @property
     def output_dir(self) -> Path:
         return Path(self.output_directory)
+
+
+class UserRecord(BaseModel):
+    id: int
+    username: str
+    role: UserRole
+    status: UserStatus
+    created_at: datetime
+    approved_at: datetime | None = None
+    approved_by_user_id: int | None = None
+    last_login_at: datetime | None = None
+    render_file_count: int = 0
+    run_count: int = 0
+
+
+class UserSessionRecord(BaseModel):
+    id: str
+    user_id: int
+    created_at: datetime
+    expires_at: datetime
+    last_seen_at: datetime
+    ip_address: str | None = None
+    user_agent: str | None = None
+
+
+class UserFileRecord(BaseModel):
+    id: str
+    user_id: int
+    created_at: datetime
+    updated_at: datetime
+    source_filename: str
+    source_path: str
+    source_root: str
+    original_size_bytes: int
+    latest_job: JobRecord | None = None
+    jobs: list[JobRecord] = Field(default_factory=list)
+
+    @property
+    def source_file(self) -> Path:
+        return Path(self.source_path)
+
+    @property
+    def source_tree(self) -> Path:
+        return Path(self.source_root)
+
+
+class ActivityRecord(BaseModel):
+    id: int
+    created_at: datetime
+    event_type: str
+    description: str
+    actor_user_id: int | None = None
+    actor_username: str | None = None
+    subject_user_id: int | None = None
+    subject_username: str | None = None
+    file_id: str | None = None
+    job_id: str | None = None
+    metadata: dict = Field(default_factory=dict)
+
+
+class AuthSessionPayload(BaseModel):
+    user: UserRecord
+    session: UserSessionRecord | None = None
+    admin_panel_path: str | None = None
+    lan_admin_access: bool = False
+
+
+class AdminOverview(BaseModel):
+    pending_users: int
+    approved_users: int
+    suspended_users: int
+    total_files: int
+    total_runs: int
+    active_runs: int

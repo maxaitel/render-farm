@@ -1,4 +1,14 @@
-import type { BlendInspection, RenderJob, SystemStatus } from "@/lib/types";
+import type {
+  ActivityRecord,
+  AdminOverview,
+  AuthSession,
+  BlendInspection,
+  RenderJob,
+  SystemStatus,
+  UserAccount,
+  UserFile,
+  UserStatus,
+} from "@/lib/types";
 
 export type ProjectUploadEntry = {
   file: File;
@@ -28,175 +38,109 @@ async function parseResponse<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export async function fetchSession(): Promise<AuthSession> {
+  const response = await fetch("/backend/api/auth/session", { cache: "no-store" });
+  return parseResponse<AuthSession>(response);
+}
+
+export async function signUp(username: string, password: string): Promise<AuthSession> {
+  const response = await fetch("/backend/api/auth/sign-up", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  return parseResponse<AuthSession>(response);
+}
+
+export async function signIn(username: string, password: string): Promise<AuthSession> {
+  const response = await fetch("/backend/api/auth/sign-in", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  return parseResponse<AuthSession>(response);
+}
+
+export async function signOut(): Promise<void> {
+  const response = await fetch("/backend/api/auth/sign-out", {
+    method: "POST",
+  });
+  await parseResponse<{ ok: boolean }>(response);
+}
+
 export async function fetchSystemStatus(): Promise<SystemStatus> {
-  const response = await fetch("backend/api/system", { cache: "no-store" });
+  const response = await fetch("/backend/api/system", { cache: "no-store" });
   return parseResponse<SystemStatus>(response);
 }
 
-export async function fetchJobs(): Promise<RenderJob[]> {
-  const response = await fetch("backend/api/jobs", { cache: "no-store" });
-  return parseResponse<RenderJob[]>(response);
+export async function fetchFiles(): Promise<UserFile[]> {
+  const response = await fetch("/backend/api/files", { cache: "no-store" });
+  return parseResponse<UserFile[]>(response);
 }
 
-export async function submitJob(formData: FormData): Promise<RenderJob> {
-  return new Promise<RenderJob>((resolve, reject) => {
-    const request = new XMLHttpRequest();
-    request.open("POST", "backend/api/jobs");
-    request.responseType = "json";
-
-    request.onload = () => {
-      const payload =
-        request.response ??
-        (request.responseText ? (JSON.parse(request.responseText) as RenderJob | { detail?: string }) : null);
-
-      if (request.status >= 200 && request.status < 300 && payload) {
-        resolve(payload as RenderJob);
-        return;
-      }
-
-      reject(new Error(responseDetail(payload) ?? "Request failed."));
-    };
-
-    request.onerror = () => {
-      reject(new Error("Upload failed."));
-    };
-
-    request.onabort = () => {
-      reject(new Error("Upload cancelled."));
-    };
-
-    request.send(formData);
-  });
-}
-
-export async function submitJobWithProgress(
+export async function uploadFileWithProgress(
   formData: FormData,
   onProgress: (progress: number) => void,
-): Promise<RenderJob> {
-  return submitWithProgress<RenderJob>("backend/api/jobs", formData, onProgress);
+): Promise<UserFile> {
+  return submitWithProgress<UserFile>("/backend/api/files", formData, onProgress);
 }
 
-export async function submitJobsWithProgress(
-  formData: FormData,
-  onProgress: (progress: number) => void,
-): Promise<RenderJob[]> {
-  return submitWithProgress<RenderJob[]>("backend/api/jobs/batch", formData, onProgress);
-}
-
-export async function inspectBlendFile(
-  file: File,
+export async function inspectStoredFile(
+  fileId: string,
   frame: number | undefined,
-  onProgress: (progress: number) => void,
-  onPhaseChange: (phase: "uploading" | "processing") => void,
-  options?: {
-    blendFilePath?: string;
-    projectFiles?: ProjectUploadEntry[];
-  },
 ): Promise<BlendInspection> {
-  return new Promise<BlendInspection>((resolve, reject) => {
-    const formData = new FormData();
-    formData.set("blend_file", file, file.name);
-    if (options?.blendFilePath) {
-      formData.set("blend_file_path", options.blendFilePath);
-    }
-    options?.projectFiles?.forEach(({ file: projectFile, path }) => {
-      formData.append("project_files", projectFile, projectFile.name);
-      formData.append("project_paths", path);
-    });
-    if (frame) {
-      formData.set("frame", String(frame));
-    }
-
-    const request = new XMLHttpRequest();
-    let processingTimer: number | null = null;
-    let currentProgress = 0;
-
-    const startProcessingProgress = () => {
-      onPhaseChange("processing");
-      currentProgress = Math.max(currentProgress, 90);
-      onProgress(currentProgress);
-      processingTimer = window.setInterval(() => {
-        currentProgress = Math.min(98, currentProgress + 1);
-        onProgress(currentProgress);
-      }, 350);
-    };
-
-    const clearProcessingProgress = () => {
-      if (processingTimer !== null) {
-        window.clearInterval(processingTimer);
-        processingTimer = null;
-      }
-    };
-
-    request.open("POST", "backend/api/blend-inspect");
-    request.responseType = "json";
-
-    request.upload.onprogress = (event) => {
-      if (!event.lengthComputable || event.total === 0) {
-        return;
-      }
-      onPhaseChange("uploading");
-      currentProgress = Math.min(89, (event.loaded / event.total) * 89);
-      onProgress(currentProgress);
-    };
-
-    request.upload.onload = () => {
-      startProcessingProgress();
-    };
-
-    request.onload = () => {
-      clearProcessingProgress();
-      const payload = xhrJsonPayload<BlendInspection>(request);
-
-      if (request.status >= 200 && request.status < 300 && payload) {
-        onProgress(100);
-        resolve(payload as BlendInspection);
-        return;
-      }
-
-      reject(new Error(responseDetail(payload) ?? "Request failed."));
-    };
-
-    request.onerror = () => {
-      clearProcessingProgress();
-      reject(new Error("Camera scan failed."));
-    };
-
-    request.onabort = () => {
-      clearProcessingProgress();
-      reject(new Error("Camera scan cancelled."));
-    };
-
-    request.send(formData);
-  });
-}
-
-export async function releaseBlendInspection(
-  inspectionToken: string,
-): Promise<void> {
-  await fetch(`backend/api/blend-inspect/${inspectionToken}`, {
-    method: "DELETE",
-    keepalive: true,
-  }).catch(() => undefined);
-}
-
-export async function touchBlendInspection(
-  inspectionToken: string,
-): Promise<boolean> {
-  const response = await fetch(`backend/api/blend-inspect/${inspectionToken}/touch`, {
+  const formData = new FormData();
+  if (typeof frame === "number") {
+    formData.set("frame", String(frame));
+  }
+  const response = await fetch(`/backend/api/files/${fileId}/inspect`, {
     method: "POST",
-    keepalive: true,
+    body: formData,
   });
-  if (response.ok) {
-    return true;
-  }
-  if (response.status === 404) {
-    return false;
-  }
-  const payload = await response
-    .json()
-    .catch(() => ({ detail: "Failed to refresh saved camera scan." }));
-  throw new Error(payload.detail ?? "Failed to refresh saved camera scan.");
+  return parseResponse<BlendInspection>(response);
+}
+
+export async function createRun(
+  fileId: string,
+  formData: FormData,
+): Promise<RenderJob> {
+  const response = await fetch(`/backend/api/files/${fileId}/runs`, {
+    method: "POST",
+    body: formData,
+  });
+  return parseResponse<RenderJob>(response);
+}
+
+export async function fetchAdminOverview(): Promise<AdminOverview> {
+  const response = await fetch("/backend/api/admin/overview", { cache: "no-store" });
+  return parseResponse<AdminOverview>(response);
+}
+
+export async function fetchAdminUsers(): Promise<UserAccount[]> {
+  const response = await fetch("/backend/api/admin/users", { cache: "no-store" });
+  return parseResponse<UserAccount[]>(response);
+}
+
+export async function updateAdminUserStatus(
+  userId: number,
+  status: UserStatus,
+): Promise<UserAccount> {
+  const response = await fetch(`/backend/api/admin/users/${userId}/status`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  return parseResponse<UserAccount>(response);
+}
+
+export async function fetchAdminActivity(): Promise<ActivityRecord[]> {
+  const response = await fetch("/backend/api/admin/activity", { cache: "no-store" });
+  return parseResponse<ActivityRecord[]>(response);
+}
+
+export async function fetchAdminRuns(): Promise<RenderJob[]> {
+  const response = await fetch("/backend/api/admin/runs", { cache: "no-store" });
+  return parseResponse<RenderJob[]>(response);
 }
 
 function submitWithProgress<T>(
@@ -220,7 +164,6 @@ function submitWithProgress<T>(
       const payload = xhrJsonPayload<T>(request);
 
       if (request.status >= 200 && request.status < 300 && payload) {
-        onProgress(100);
         resolve(payload as T);
         return;
       }

@@ -1,22 +1,26 @@
+"use client";
+
+import * as React from "react";
+
 import { cn } from "@/lib/utils";
 
-interface ProgressProps {
-  value: number;
-  className?: string;
-}
-
-export function Progress({ value, className }: ProgressProps) {
-  return (
+const Progress = React.forwardRef<
+  HTMLDivElement,
+  React.HTMLAttributes<HTMLDivElement> & {
+    value?: number;
+  }
+>(({ className, value = 0, ...props }, ref) => (
+  <div
+    ref={ref}
+    className={cn("relative h-2 w-full overflow-hidden rounded-full bg-secondary", className)}
+    {...props}
+  >
     <div
-      className={cn(
-        "h-2 w-full overflow-hidden rounded-full bg-black/6",
-        className,
-      )}
-    >
-      <div
-        className="h-full rounded-full bg-[linear-gradient(90deg,#8e1824_0%,var(--ember)_100%)] transition-[width] duration-500"
-        style={{ width: `${Math.max(0, Math.min(100, value))}%` }}
-      />
-    </div>
-  );
-}
+      className="h-full w-full flex-1 bg-foreground transition-all"
+      style={{ transform: `translateX(-${100 - Math.max(0, Math.min(100, value))}%)` }}
+    />
+  </div>
+));
+Progress.displayName = "Progress";
+
+export { Progress };
