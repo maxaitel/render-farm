@@ -110,6 +110,11 @@ def _clear_inspect_session_pending_delete(settings: Settings, token: str) -> Non
     inspect_session_pending_delete_path(settings, token).unlink(missing_ok=True)
 
 
+def _invalid_inspect_session(settings: Settings, token: str) -> HTTPException:
+    delete_inspect_session(settings, token)
+    return HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+
+
 def write_inspect_session(
     settings: Settings,
     token: str,
@@ -144,17 +149,17 @@ def load_inspect_session(settings: Settings, token: str) -> dict:
     try:
         payload = json.loads(meta_path.read_text("utf-8"))
     except (OSError, json.JSONDecodeError):
-        delete_inspect_session(settings, validated_token)
-        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+        raise _invalid_inspect_session(settings, validated_token)
 
     if not isinstance(payload, dict):
-        delete_inspect_session(settings, validated_token)
-        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+        raise _invalid_inspect_session(settings, validated_token)
 
     required_keys = {"source_filename", "source_path"}
     if not required_keys.issubset(payload):
-        delete_inspect_session(settings, validated_token)
-        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+        raise _invalid_inspect_session(settings, validated_token)
+
+    if not isinstance(payload["source_filename"], str) or not isinstance(payload["source_path"], str):
+        raise _invalid_inspect_session(settings, validated_token)
 
     try:
         touch_inspect_session(settings, validated_token)
@@ -189,8 +194,12 @@ def cleanup_expired_inspect_sessions(settings: Settings, max_age_seconds: int = 
             if not INSPECT_TOKEN_RE.fullmatch(entry.name):
                 continue
             meta_path = entry / "session.json"
-            reference_path = meta_path if meta_path.exists() else entry
             pending_delete_path = entry / INSPECT_SESSION_PENDING_DELETE_NAME
+            if not meta_path.exists():
+                if entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry, ignore_errors=True)
+                continue
+            reference_path = meta_path
             reference_mtime = reference_path.stat().st_mtime
             if reference_mtime >= cutoff:
                 pending_delete_path.unlink(missing_ok=True)

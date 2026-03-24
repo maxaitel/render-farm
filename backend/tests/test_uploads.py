@@ -1154,6 +1154,53 @@ def test_inspect_session_touch_race_returns_404(tmp_path: Path, monkeypatch: pyt
         _restore_env(previous)
 
 
+def test_inspect_session_with_non_string_fields_is_deleted(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        inspect_token = "inspect-bad-types"
+        inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
+        source_dir = inspect_root / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "scene.blend").write_bytes(b"stale")
+        (inspect_root / "session.json").write_text(
+            json.dumps(
+                {
+                    "source_filename": ["scene.blend"],
+                    "source_path": {"path": "scene.blend"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with _client_for(tmp_path) as client:
+            response = client.post(
+                "/api/jobs",
+                data={
+                    "inspect_token": inspect_token,
+                    "render_mode": "still",
+                    "frame": "1",
+                },
+            )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Saved camera scan was not found. Scan the blend file again."
+        assert not inspect_root.exists()
+    finally:
+        _restore_env(previous)
+
+
+def test_stale_inspect_directory_without_metadata_is_reaped(tmp_path: Path) -> None:
+    inspect_root = tmp_path / "tmp" / "inspect" / "inspect-orphaned"
+    (inspect_root / "source").mkdir(parents=True, exist_ok=True)
+    (inspect_root / "source" / "scene.blend").write_bytes(b"orphaned")
+    old_timestamp = time.time() - (2 * 60 * 60)
+    os.utime(inspect_root, (old_timestamp, old_timestamp))
+
+    cleanup_expired_inspect_sessions(Settings(tmp_path, "/bin/true", "AUTO", ["CPU"], True))
+
+    assert not inspect_root.exists()
+
+
 def test_existing_job_json_is_imported_into_sqlite(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:
