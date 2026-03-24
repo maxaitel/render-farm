@@ -204,6 +204,20 @@ def test_spoofed_forwarded_for_header_does_not_grant_admin_access(tmp_path: Path
         _restore_env(previous)
 
 
+def test_untrusted_private_proxy_with_forwarded_for_does_not_grant_admin_access(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path, trusted_proxies="")
+    try:
+        with TestClient(app, client=("192.168.10.5", 50000)) as client:
+            _sign_in(client, "admin", "admin-password-123")
+            response = client.get(
+                "/api/admin/users",
+                headers={"x-forwarded-for": "203.0.113.99"},
+            )
+            assert response.status_code == 404
+    finally:
+        _restore_env(previous)
+
+
 def test_untrusted_forwarded_for_preserves_remote_host_in_session_records(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:
