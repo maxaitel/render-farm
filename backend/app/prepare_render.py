@@ -1,3 +1,5 @@
+import os
+
 import bpy
 
 
@@ -23,4 +25,17 @@ def disable_unavailable_denoisers() -> None:
                 node.mute = True
 
 
+def apply_requested_camera() -> None:
+    camera_name = os.getenv("RENDER_CAMERA_NAME", "").strip()
+    if not camera_name:
+        return
+
+    camera = bpy.data.objects.get(camera_name)
+    if camera is None or camera.type != "CAMERA":
+        raise SystemExit(f"Requested camera '{camera_name}' was not found in the blend file.")
+
+    bpy.context.scene.camera = camera
+
+
 disable_unavailable_denoisers()
+apply_requested_camera()

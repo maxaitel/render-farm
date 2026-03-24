@@ -4,15 +4,31 @@ import Image from "next/image";
 import type { FormEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Camera,
   ChevronDown,
   Cpu,
   Download,
+  LoaderCircle,
   Server,
   SquareTerminal,
 } from "lucide-react";
 
-import { fetchJobs, fetchSystemStatus, submitJobWithProgress } from "@/lib/api";
-import type { RenderJob, RenderMode, SystemStatus } from "@/lib/types";
+import {
+  fetchJobs,
+  releaseBlendInspection,
+  fetchSystemStatus,
+  inspectBlendFile,
+  type ProjectUploadEntry,
+  submitJobWithProgress,
+  submitJobsWithProgress,
+  touchBlendInspection,
+} from "@/lib/api";
+import type {
+  BlendInspection,
+  RenderJob,
+  RenderMode,
+  SystemStatus,
+} from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -27,6 +43,32 @@ type JobFormState = {
   outputFormat: "PNG" | "JPEG" | "OPEN_EXR";
   devicePreference: "AUTO" | "CUDA" | "OPTIX" | "CPU";
 };
+
+type UploadSourceMode = "files" | "folder";
+
+const SCENE_DIRECTORY_NAMES = new Set([
+  "scene",
+  "scenes",
+  "shot",
+  "shots",
+  "render",
+  "renders",
+]);
+
+const AUXILIARY_DIRECTORY_NAMES = new Set([
+  "asset",
+  "assets",
+  "lib",
+  "libs",
+  "library",
+  "libraries",
+  "link",
+  "linked",
+  "texture",
+  "textures",
+  "cache",
+  "caches",
+]);
 
 const INITIAL_FORM: JobFormState = {
   renderMode: "still",
@@ -81,6 +123,138 @@ function formatBytes(bytes: number) {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+function fileLabel(file: File) {
+  return file.webkitRelativePath || file.name;
+}
+
+function folderProjectUploadEntries(
+  blendFile: File,
+  projectFiles: File[],
+): {
+  blendPath: string;
+  projectEntries: ProjectUploadEntry[];
+} {
+  const blendPath = fileLabel(blendFile);
+  return {
+    blendPath,
+    projectEntries: projectFiles.flatMap((projectFile) => {
+      const path = fileLabel(projectFile);
+      if (path === blendPath) {
+        return [];
+      }
+      return [{ file: projectFile, path }];
+    }),
+  };
+}
+
+function folderRenderTargets(projectFiles: File[]) {
+  const blendFiles = projectFiles.filter((file) =>
+    file.name.toLowerCase().endsWith(".blend"),
+  );
+  if (!blendFiles.length) {
+    return [];
+  }
+
+  const rankedFiles = blendFiles.map((file) => {
+    const directories = fileLabel(file).split("/").slice(0, -1);
+    const normalizedDirectories = directories.map((part) => part.toLowerCase());
+    const auxiliaryScore = directories.filter((part) =>
+      AUXILIARY_DIRECTORY_NAMES.has(part.toLowerCase()),
+    ).length;
+    const sceneScore = normalizedDirectories.some((part) =>
+      SCENE_DIRECTORY_NAMES.has(part),
+    )
+      ? 0
+      : 1;
+
+    return {
+      file,
+      auxiliaryScore,
+      sceneScore,
+      depth: directories.length,
+    };
+  });
+
+  const bestAuxiliaryScore = Math.min(
+    ...rankedFiles.map(({ auxiliaryScore }) => auxiliaryScore),
+  );
+  const bestSceneScore = Math.min(
+    ...rankedFiles
+      .filter(({ auxiliaryScore }) => auxiliaryScore === bestAuxiliaryScore)
+      .map(({ sceneScore }) => sceneScore),
+  );
+  const bestDepth = Math.min(
+    ...rankedFiles
+      .filter(
+        ({ auxiliaryScore, sceneScore }) =>
+          auxiliaryScore === bestAuxiliaryScore &&
+          sceneScore === bestSceneScore,
+      )
+      .map(({ depth }) => depth),
+  );
+
+  const primaryCandidates = rankedFiles
+    .filter(
+      ({ auxiliaryScore, sceneScore, depth }) =>
+        auxiliaryScore === bestAuxiliaryScore &&
+        sceneScore === bestSceneScore &&
+        depth === bestDepth,
+    )
+    .sort((left, right) => fileLabel(left.file).localeCompare(fileLabel(right.file)));
+
+  return primaryCandidates.length ? [primaryCandidates[0].file] : [];
+}
+
+function totalFileBytes(files: File[]) {
+  return files.reduce((total, file) => total + file.size, 0);
+}
+
+function projectFilesFingerprint(files: File[]) {
+  return files
+    .map((file) =>
+      [
+        file.webkitRelativePath || file.name,
+        file.size,
+        file.lastModified,
+      ].join(":"),
+    )
+    .sort()
+    .join("|");
+}
+
+function inspectionUploadKey(file: File | null, projectFiles: File[]) {
+  if (!file) {
+    return "";
+  }
+  return [
+    file.webkitRelativePath || "",
+    file.name,
+    file.size,
+    file.lastModified,
+    projectFilesFingerprint(projectFiles),
+  ].join(":");
+}
+
+function cameraScanRequestKey(
+  file: File | null,
+  projectFiles: File[],
+  renderMode: RenderMode,
+  previewFrame: number,
+) {
+  if (!file) {
+    return "";
+  }
+  return [
+    file.webkitRelativePath || "",
+    file.name,
+    file.size,
+    file.lastModified,
+    projectFilesFingerprint(projectFiles),
+    renderMode,
+    previewFrame,
+  ].join(":");
+}
+
 function deviceSummary(system: SystemStatus | null) {
   if (!system) {
     return "Loading";
@@ -118,16 +292,66 @@ function liveDetail(job: RenderJob) {
     : "Waiting for worker";
 }
 
+function formatElapsedDuration(milliseconds: number) {
+  const totalSeconds = milliseconds / 1000;
+  if (totalSeconds < 60) {
+    return `${totalSeconds.toFixed(1)}s`;
+  }
+
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds.toFixed(1)}s`;
+}
+
+const INSPECTION_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
+
 export function RenderDashboard() {
   const [jobs, setJobs] = useState<RenderJob[]>([]);
   const [system, setSystem] = useState<SystemStatus | null>(null);
   const [form, setForm] = useState<JobFormState>(INITIAL_FORM);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [uploadSourceMode, setUploadSourceMode] =
+    useState<UploadSourceMode>("files");
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [selectedProjectFiles, setSelectedProjectFiles] = useState<File[]>([]);
+  const [cameraInspection, setCameraInspection] =
+    useState<BlendInspection | null>(null);
+  const [selectedCameraNames, setSelectedCameraNames] = useState<string[]>([]);
+  const [inspectingCameras, setInspectingCameras] = useState(false);
+  const [cameraScanProgress, setCameraScanProgress] = useState(0);
+  const [cameraScanPhase, setCameraScanPhase] = useState<
+    "uploading" | "processing"
+  >("uploading");
+  const [cameraScanStartedAt, setCameraScanStartedAt] = useState<number | null>(
+    null,
+  );
+  const [cameraScanElapsedMs, setCameraScanElapsedMs] = useState<number | null>(
+    null,
+  );
   const [submitting, setSubmitting] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [activeUploadName, setActiveUploadName] = useState<string | null>(null);
+  const [activeUploadIndex, setActiveUploadIndex] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const sourcesRef = useRef<Map<string, EventSource>>(new Map());
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const cameraScanRequestRef = useRef(0);
+  const cameraScanRequestKeyRef = useRef("");
+  const submittingInspectionTokenRef = useRef<string | null>(null);
+
+  const primarySelectedFile = selectedFiles[0] ?? null;
+  const cameraScanAvailable = selectedFiles.length === 1;
+  const previewFrame = form.renderMode === "still" ? form.frame : form.startFrame;
+  const activeInspectionUploadKey = inspectionUploadKey(
+    primarySelectedFile,
+    selectedProjectFiles,
+  );
+  const activeCameraScanRequestKey = cameraScanRequestKey(
+    primarySelectedFile,
+    selectedProjectFiles,
+    form.renderMode,
+    previewFrame,
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -178,6 +402,80 @@ export function RenderDashboard() {
   }, []);
 
   useEffect(() => {
+    const inspectionToken = cameraInspection?.inspection_token;
+    return () => {
+      if (!inspectionToken) {
+        return;
+      }
+      if (submittingInspectionTokenRef.current === inspectionToken) {
+        return;
+      }
+      void releaseBlendInspection(inspectionToken);
+    };
+  }, [cameraInspection?.inspection_token]);
+
+  useEffect(() => {
+    if (!inspectingCameras || cameraScanStartedAt === null) {
+      return;
+    }
+
+    setCameraScanElapsedMs(Date.now() - cameraScanStartedAt);
+    const intervalId = window.setInterval(() => {
+      setCameraScanElapsedMs(Date.now() - cameraScanStartedAt);
+    }, 200);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [inspectingCameras, cameraScanStartedAt]);
+
+  useEffect(() => {
+    const inspectionToken = cameraInspection?.inspection_token;
+    if (!inspectionToken) {
+      return;
+    }
+    if (submittingInspectionTokenRef.current === inspectionToken) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      if (submittingInspectionTokenRef.current === inspectionToken) {
+        return;
+      }
+      void touchBlendInspection(inspectionToken)
+        .then((stillAvailable) => {
+          if (stillAvailable) {
+            return;
+          }
+          let clearedInspection = false;
+          setCameraInspection((current) => {
+            if (current?.inspection_token !== inspectionToken) {
+              return current;
+            }
+            clearedInspection = true;
+            return null;
+          });
+          if (!clearedInspection) {
+            return;
+          }
+          setSelectedCameraNames([]);
+          setCameraScanProgress(0);
+          setCameraScanPhase("uploading");
+          setCameraScanStartedAt(null);
+          setCameraScanElapsedMs(null);
+          setError((current) =>
+            current ?? "Saved camera scan expired. Rescan cameras or queue the render to upload the scene again.",
+          );
+        })
+        .catch(() => undefined);
+    }, INSPECTION_TOUCH_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [cameraInspection?.inspection_token]);
+
+  useEffect(() => {
     const activeIds = new Set(jobs.filter(activePhase).map((job) => job.id));
 
     sourcesRef.current.forEach((source, jobId) => {
@@ -204,6 +502,55 @@ export function RenderDashboard() {
     });
   }, [jobs]);
 
+  useEffect(() => {
+    const input = fileInputRef.current;
+    if (!input) {
+      return;
+    }
+
+    input.multiple = true;
+    if (uploadSourceMode === "folder") {
+      input.setAttribute("webkitdirectory", "");
+      input.setAttribute("directory", "");
+      input.removeAttribute("accept");
+    } else {
+      input.removeAttribute("webkitdirectory");
+      input.removeAttribute("directory");
+      input.setAttribute("accept", ".blend");
+    }
+
+    input.value = "";
+    setSelectedFiles([]);
+    setSelectedProjectFiles([]);
+    setCameraInspection(null);
+    setSelectedCameraNames([]);
+    setCameraScanProgress(0);
+    setCameraScanPhase("uploading");
+    setCameraScanStartedAt(null);
+    setCameraScanElapsedMs(null);
+    setError(null);
+  }, [uploadSourceMode]);
+
+  useEffect(() => {
+    cameraScanRequestRef.current += 1;
+    cameraScanRequestKeyRef.current = activeCameraScanRequestKey;
+    setInspectingCameras(false);
+    setCameraScanProgress(0);
+    setCameraScanPhase("uploading");
+    setCameraScanStartedAt(null);
+    setCameraScanElapsedMs(null);
+  }, [activeCameraScanRequestKey]);
+
+  useEffect(() => {
+    setInspectingCameras(false);
+    setCameraInspection(null);
+    setSelectedCameraNames([]);
+    setCameraScanProgress(0);
+    setCameraScanPhase("uploading");
+    setCameraScanStartedAt(null);
+    setCameraScanElapsedMs(null);
+  }, [activeInspectionUploadKey]);
+
   const stats = useMemo(() => {
     const running = jobs.filter((job) => job.phase === "running").length;
     const queued = jobs.filter((job) => job.phase === "queued").length;
@@ -213,53 +560,236 @@ export function RenderDashboard() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selectedFile) {
-      setError("Choose a .blend file first.");
+    if (inspectingCameras) {
+      setError("Wait for camera scanning to finish before queueing the render.");
       return;
     }
-
-    const payload = new FormData();
-    payload.set("blend_file", selectedFile);
-    payload.set("render_mode", form.renderMode);
-    payload.set("output_format", form.outputFormat);
-    payload.set("device_preference", form.devicePreference);
-    if (form.renderMode === "still") {
-      payload.set("frame", String(form.frame));
-    } else {
-      payload.set("start_frame", String(form.startFrame));
-      payload.set("end_frame", String(form.endFrame));
+    if (!selectedFiles.length) {
+      setError(
+        uploadSourceMode === "folder"
+          ? "Choose a folder with at least one .blend file."
+          : "Choose one or more .blend files first.",
+      );
+      return;
     }
 
     setSubmitting(true);
     setUploadProgress(0);
+    setActiveUploadIndex(1);
+    setActiveUploadName(fileLabel(selectedFiles[0]));
     setError(null);
+    let nextFileIndex = 0;
+    let submittedInspectionToken: string | null = null;
     try {
-      const job = await submitJobWithProgress(payload, setUploadProgress);
-      setJobs((current) => upsertJob(current, job));
-      setSelectedFile(null);
+      for (const [index, file] of selectedFiles.entries()) {
+        const payload = new FormData();
+        const canReuseInspectionUpload =
+          selectedFiles.length === 1 &&
+          Boolean(cameraInspection?.inspection_token);
+        if (canReuseInspectionUpload && cameraInspection) {
+          submittingInspectionTokenRef.current = cameraInspection.inspection_token;
+          submittedInspectionToken = cameraInspection.inspection_token;
+          payload.set("inspect_token", cameraInspection.inspection_token);
+        } else {
+          payload.set("blend_file", file, file.name);
+          if (uploadSourceMode === "folder") {
+            const { blendPath, projectEntries } = folderProjectUploadEntries(
+              file,
+              selectedProjectFiles,
+            );
+            payload.set("blend_file_path", blendPath);
+            projectEntries.forEach(({ file: projectFile, path }) => {
+              payload.append("project_files", projectFile, projectFile.name);
+              payload.append("project_paths", path);
+            });
+          }
+        }
+        payload.set("render_mode", form.renderMode);
+        payload.set("output_format", form.outputFormat);
+        payload.set("device_preference", form.devicePreference);
+        const requestedCameraNames =
+          selectedFiles.length === 1 ? selectedCameraNames : [];
+        requestedCameraNames.forEach((cameraName) => {
+          payload.append("camera_names", cameraName);
+        });
+        if (form.renderMode === "still") {
+          payload.set("frame", String(form.frame));
+        } else {
+          payload.set("start_frame", String(form.startFrame));
+          payload.set("end_frame", String(form.endFrame));
+        }
+
+        setActiveUploadIndex(index + 1);
+        setActiveUploadName(fileLabel(file));
+        const submittedJobs =
+          requestedCameraNames.length > 0
+            ? await submitJobsWithProgress(payload, (progress) => {
+                const overallProgress =
+                  ((index + progress / 100) / selectedFiles.length) * 100;
+                setUploadProgress(overallProgress);
+              })
+            : [
+                await submitJobWithProgress(payload, (progress) => {
+                  const overallProgress =
+                    ((index + progress / 100) / selectedFiles.length) * 100;
+                  setUploadProgress(overallProgress);
+                }),
+              ];
+        submittedJobs.forEach((job) => {
+          setJobs((current) => upsertJob(current, job));
+        });
+        nextFileIndex = index + 1;
+      }
+
+      if (submittedInspectionToken) {
+        await releaseBlendInspection(submittedInspectionToken);
+      }
+      setSelectedFiles([]);
+      setSelectedProjectFiles([]);
+      setCameraInspection(null);
+      setSelectedCameraNames([]);
+      setCameraScanProgress(0);
+      setCameraScanPhase("uploading");
       setForm(INITIAL_FORM);
-      const fileInput = document.getElementById(
-        "blend-file",
-      ) as HTMLInputElement | null;
-      if (fileInput) {
-        fileInput.value = "";
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
       }
     } catch (submitError) {
+      if (selectedFiles.length > 1 && nextFileIndex > 0) {
+        setSelectedFiles(selectedFiles.slice(nextFileIndex));
+      }
       setError(
         submitError instanceof Error
           ? submitError.message
           : "Failed to queue render.",
       );
     } finally {
+      submittingInspectionTokenRef.current = null;
       setSubmitting(false);
       setUploadProgress(0);
+      setActiveUploadIndex(0);
+      setActiveUploadName(null);
     }
   }
 
+  async function handleInspectCameras() {
+    if (!cameraScanAvailable) {
+      return;
+    }
+
+    setInspectingCameras(true);
+    setCameraScanProgress(0);
+    setCameraScanPhase("uploading");
+    const scanStartedAt = Date.now();
+    setCameraScanStartedAt(scanStartedAt);
+    setCameraScanElapsedMs(0);
+    setError(null);
+    const requestId = cameraScanRequestRef.current;
+    const expectedScanKey = activeCameraScanRequestKey;
+    const previousInspection = cameraInspection;
+    const previousSelectedCameraNames = selectedCameraNames;
+    try {
+      const folderUploadOptions =
+        uploadSourceMode === "folder"
+          ? folderProjectUploadEntries(selectedFiles[0], selectedProjectFiles)
+          : undefined;
+      const inspection = await inspectBlendFile(
+        selectedFiles[0],
+        previewFrame,
+        (progress) => {
+          if (
+            requestId !== cameraScanRequestRef.current ||
+            expectedScanKey !== cameraScanRequestKeyRef.current
+          ) {
+            return;
+          }
+          setCameraScanProgress(progress);
+        },
+        (phase) => {
+          if (
+            requestId !== cameraScanRequestRef.current ||
+            expectedScanKey !== cameraScanRequestKeyRef.current
+          ) {
+            return;
+          }
+          setCameraScanPhase(phase);
+        },
+        folderUploadOptions
+          ? {
+              blendFilePath: folderUploadOptions.blendPath,
+              projectFiles: folderUploadOptions.projectEntries,
+            }
+          : undefined,
+      );
+      if (
+        requestId !== cameraScanRequestRef.current ||
+        expectedScanKey !== cameraScanRequestKeyRef.current
+      ) {
+        void releaseBlendInspection(inspection.inspection_token);
+        return;
+      }
+      setCameraInspection(inspection);
+      setSelectedCameraNames([]);
+      setCameraScanElapsedMs(Date.now() - scanStartedAt);
+    } catch (inspectError) {
+      if (
+        requestId !== cameraScanRequestRef.current ||
+        expectedScanKey !== cameraScanRequestKeyRef.current
+      ) {
+        return;
+      }
+      if (previousInspection) {
+        setCameraInspection(previousInspection);
+        setSelectedCameraNames(previousSelectedCameraNames);
+      } else {
+        setCameraInspection(null);
+        setSelectedCameraNames([]);
+      }
+      setCameraScanProgress(0);
+      setCameraScanPhase("uploading");
+      setCameraScanStartedAt(null);
+      setCameraScanElapsedMs(null);
+      setError(
+        inspectError instanceof Error
+          ? inspectError.message
+          : "Failed to inspect cameras.",
+      );
+    } finally {
+      if (
+        requestId === cameraScanRequestRef.current &&
+        expectedScanKey === cameraScanRequestKeyRef.current
+      ) {
+        setInspectingCameras(false);
+      }
+    }
+  }
+
+  function toggleCamera(name: string) {
+    setSelectedCameraNames((current) =>
+      current.includes(name)
+        ? current.filter((cameraName) => cameraName !== name)
+        : [...current, name],
+    );
+  }
+
   const uploadStageLabel =
-    uploadProgress >= 100
-      ? "Upload complete. Registering render job."
-      : "Uploading blend file to the render host.";
+    selectedFiles.length > 1
+      ? `Uploading ${activeUploadIndex} of ${selectedFiles.length}${activeUploadName ? `: ${activeUploadName}` : ""}`
+      : uploadProgress >= 100
+        ? "Upload complete. Registering render job."
+        : "Uploading blend file to the render host.";
+
+  const cameraScanLabel = inspectingCameras
+    ? cameraScanPhase === "uploading"
+      ? "Uploading the blend file for camera scanning."
+      : "Upload complete. Blender is generating low-res camera previews."
+    : cameraInspection?.cameras.length
+      ? `${cameraInspection.cameras.length} camera${cameraInspection.cameras.length === 1 ? "" : "s"} found.`
+      : "Scan the selected blend file to preview cameras and choose one or more render angles.";
+  const cameraScanElapsedLabel =
+    cameraScanElapsedMs !== null
+      ? formatElapsedDuration(cameraScanElapsedMs)
+      : null;
 
   return (
     <main className="min-h-screen bg-paper text-ink">
@@ -358,6 +888,9 @@ export function RenderDashboard() {
                         <div className="mt-3 flex flex-wrap gap-x-5 gap-y-2 text-sm text-steel">
                           <span>{frameLabel(job)}</span>
                           <span>{job.output_format}</span>
+                          {job.camera_name ? (
+                            <span>Camera {job.camera_name}</span>
+                          ) : null}
                           <span>Requested {job.requested_device}</span>
                           <span>{liveDetail(job)}</span>
                         </div>
@@ -433,33 +966,101 @@ export function RenderDashboard() {
                 </div>
 
                 <form className="mt-8 space-y-5" onSubmit={handleSubmit}>
-                  <Label title="Blend file">
+                  <div>
+                    <span className="mb-2 block font-subheading text-[11px] uppercase tracking-[0.08em] text-ink/62">
+                      Upload source
+                    </span>
+                    <div className="grid grid-cols-2 gap-2 rounded-[1.15rem] bg-black/[0.04] p-1">
+                      <ModeButton
+                        active={uploadSourceMode === "files"}
+                        label="Files"
+                        onClick={() => setUploadSourceMode("files")}
+                      />
+                      <ModeButton
+                        active={uploadSourceMode === "folder"}
+                        label="Folder"
+                        onClick={() => setUploadSourceMode("folder")}
+                      />
+                    </div>
+                  </div>
+
+                  <Label
+                    title={
+                      uploadSourceMode === "folder"
+                        ? "Blend folder"
+                        : "Blend files"
+                    }
+                  >
                     <input
                       id="blend-file"
-                      accept=".blend"
                       className="block w-full rounded-[1rem] border border-dashed border-line bg-white px-4 py-4 text-sm text-ink outline-none transition file:mr-4 file:rounded-full file:border-0 file:bg-ember file:px-4 file:py-2 file:text-sm file:font-semibold file:tracking-[0] file:text-white hover:border-ember/30 focus:border-ember"
-                      onChange={(event) =>
-                        setSelectedFile(event.target.files?.[0] ?? null)
-                      }
+                      multiple
+                      onChange={(event) => {
+                        const allFiles = Array.from(event.target.files ?? []);
+                        const files =
+                          uploadSourceMode === "folder"
+                            ? folderRenderTargets(allFiles)
+                            : allFiles.filter((file) =>
+                                file.name.toLowerCase().endsWith(".blend"),
+                              );
+                        setSelectedFiles(files);
+                        setSelectedProjectFiles(
+                          uploadSourceMode === "folder" ? allFiles : files,
+                        );
+                        setCameraInspection(null);
+                        setSelectedCameraNames([]);
+                        setCameraScanProgress(0);
+                        setCameraScanPhase("uploading");
+                        if (!files.length && event.target.files?.length) {
+                          setError("Only .blend files are accepted.");
+                        } else {
+                          setError(null);
+                        }
+                      }}
+                      ref={fileInputRef}
                       type="file"
                     />
                   </Label>
 
-                  {selectedFile ? (
+                  {selectedFiles.length ? (
                     <div className="rounded-[1.2rem] border border-line bg-white px-4 py-4">
                       <div className="flex items-start justify-between gap-4">
                         <div className="min-w-0">
                           <p className="truncate font-subheading text-sm tracking-[0] text-ink">
-                            {selectedFile.name}
+                            {selectedFiles.length === 1
+                              ? fileLabel(selectedFiles[0])
+                              : `${selectedFiles.length} blend files selected`}
                           </p>
                           <p className="mt-1 text-sm text-steel">
-                            {formatBytes(selectedFile.size)}
+                            {formatBytes(
+                              totalFileBytes(
+                                uploadSourceMode === "folder"
+                                  ? selectedProjectFiles
+                                  : selectedFiles,
+                              ),
+                            )}
                           </p>
                         </div>
                         <span className="rounded-full bg-sand px-3 py-1 font-subheading text-[11px] uppercase tracking-[0.08em] text-steel">
                           {submitting ? "Uploading" : "Ready"}
                         </span>
                       </div>
+
+                      {selectedFiles.length > 1 ? (
+                        <div className="mt-4 space-y-1 text-sm text-steel">
+                          {selectedFiles.slice(0, 3).map((file) => (
+                            <p className="truncate" key={fileLabel(file)}>
+                              {fileLabel(file)}
+                            </p>
+                          ))}
+                          {selectedFiles.length > 3 ? (
+                            <p>
+                              +{selectedFiles.length - 3} more file
+                              {selectedFiles.length - 3 === 1 ? "" : "s"}
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
 
                       {submitting ? (
                         <div className="mt-4">
@@ -471,10 +1072,137 @@ export function RenderDashboard() {
                         </div>
                       ) : (
                         <p className="mt-4 text-sm leading-6 text-steel">
-                          Large scenes take a moment to transfer before they are
-                          visible in the queue.
+                          {uploadSourceMode === "folder"
+                            ? "Using the primary scene .blend from the selected folder, while sibling assets stay attached to the job."
+                            : "Large scenes take a moment to transfer before they are visible in the queue."}
                         </p>
                       )}
+                    </div>
+                  ) : null}
+
+                  {selectedFiles.length ? (
+                    <div className="rounded-[1.2rem] border border-line bg-mist px-4 py-4">
+                      <div className="flex items-start justify-between gap-4">
+                        <div>
+                          <p className="font-subheading text-sm text-ink">
+                            Camera views
+                          </p>
+                          <p className="mt-1 text-sm text-steel">
+                            {cameraScanAvailable
+                              ? cameraScanLabel
+                              : "Camera previews are available when one blend file is selected at a time."}
+                          </p>
+                          {cameraInspection ? (
+                            <p className="mt-1 text-sm text-steel">
+                              This scan upload will be reused when you queue the render.
+                            </p>
+                          ) : null}
+                        </div>
+                        {cameraScanAvailable ? (
+                          <Button
+                            disabled={inspectingCameras || submitting}
+                            onClick={handleInspectCameras}
+                            type="button"
+                            variant="secondary"
+                          >
+                            {inspectingCameras
+                              ? "Scanning cameras"
+                              : cameraInspection
+                                ? "Rescan cameras"
+                                : "Scan cameras"}
+                          </Button>
+                        ) : null}
+                      </div>
+
+                      {inspectingCameras ? (
+                        <div className="mt-4 rounded-[1rem] border border-line bg-white px-4 py-3">
+                          <div className="flex items-center gap-3 text-sm text-ink">
+                            <LoaderCircle className="h-4 w-4 animate-spin text-ember" />
+                            <span>
+                              {cameraScanPhase === "uploading"
+                                ? "Uploading blend for camera scan."
+                                : "Generating preview thumbnails in Blender."}
+                            </span>
+                          </div>
+                          <div className="mt-3 flex items-center justify-between gap-3 text-sm text-steel">
+                            <span>{cameraScanLabel}</span>
+                            <div className="text-right">
+                              {cameraScanElapsedLabel ? (
+                                <p>{cameraScanElapsedLabel}</p>
+                              ) : null}
+                              <p>{Math.round(cameraScanProgress)}%</p>
+                            </div>
+                          </div>
+                          <div className="mt-3">
+                            <Progress value={cameraScanProgress} />
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {cameraInspection?.cameras.length ? (
+                        <div className="mt-4 space-y-3">
+                          <p className="text-sm text-steel">
+                            Preview frame {cameraInspection.frame}. Selected{" "}
+                            {selectedCameraNames.length || 0} camera
+                            {selectedCameraNames.length === 1 ? "" : "s"}.
+                            {cameraScanElapsedLabel
+                              ? ` Scan took ${cameraScanElapsedLabel}.`
+                              : ""}
+                          </p>
+                          <div className="grid gap-3 sm:grid-cols-2">
+                            {cameraInspection.cameras.map((camera) => {
+                              const active = selectedCameraNames.includes(
+                                camera.name,
+                              );
+                              return (
+                                <button
+                                  className={`overflow-hidden rounded-[1.15rem] border text-left transition ${
+                                    active
+                                      ? "border-ember bg-white shadow-[0_14px_30px_rgba(207,32,46,0.12)]"
+                                      : "border-line bg-white hover:border-ink/25"
+                                  }`}
+                                  key={camera.name}
+                                  onClick={() => toggleCamera(camera.name)}
+                                  type="button"
+                                >
+                                  {camera.preview_data_url ? (
+                                    <img
+                                      alt={`${camera.name} preview`}
+                                      className="h-28 w-full object-cover"
+                                      src={camera.preview_data_url}
+                                    />
+                                  ) : (
+                                    <div className="flex h-28 items-center justify-center bg-sand text-steel">
+                                      <Camera className="h-5 w-5" />
+                                    </div>
+                                  )}
+                                  <div className="flex items-center justify-between gap-3 px-3 py-3">
+                                    <span className="min-w-0 truncate font-subheading text-sm text-ink">
+                                      {camera.name}
+                                    </span>
+                                    <span
+                                      className={`rounded-full px-2 py-1 font-subheading text-[10px] uppercase tracking-[0.08em] ${
+                                        active
+                                          ? "bg-ember text-white"
+                                          : "bg-sand text-steel"
+                                      }`}
+                                    >
+                                      {active ? "Selected" : "Select"}
+                                    </span>
+                                  </div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ) : cameraInspection ? (
+                        <p className="mt-4 text-sm text-steel">
+                          No cameras were found in this blend file.
+                          {cameraScanElapsedLabel
+                            ? ` Scan took ${cameraScanElapsedLabel}.`
+                            : ""}
+                        </p>
+                      ) : null}
                     </div>
                   ) : null}
 
@@ -604,14 +1332,18 @@ export function RenderDashboard() {
 
                   <Button
                     className="w-full"
-                    disabled={submitting || loading}
+                    disabled={submitting || loading || inspectingCameras}
                     type="submit"
                   >
                     {submitting
-                      ? uploadProgress >= 100
-                        ? "Creating render job"
-                        : `Uploading ${Math.round(uploadProgress)}%`
-                      : "Queue render"}
+                      ? `Uploading ${Math.round(uploadProgress)}%`
+                      : inspectingCameras
+                        ? `Scanning ${Math.round(cameraScanProgress)}%`
+                      : selectedCameraNames.length > 1 && selectedFiles.length === 1
+                        ? `Queue ${selectedCameraNames.length} camera renders`
+                      : selectedFiles.length > 1
+                        ? `Queue ${selectedFiles.length} renders`
+                        : "Queue render"}
                   </Button>
                 </form>
               </Card>

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -132,6 +134,7 @@ class RenderRunner:
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=self._blender_env(job.camera_name),
         )
 
         lines: list[str] = []
@@ -161,7 +164,7 @@ class RenderRunner:
             str(job.source_file),
             "-noaudio",
             "-P",
-            "/app/app/prepare_render.py",
+            str(self._script_path("prepare_render.py")),
             "-E",
             "CYCLES",
             "-o",
@@ -186,6 +189,53 @@ class RenderRunner:
             )
         command.extend(["--", "--cycles-print-stats", "--cycles-device", device])
         return command
+
+    async def inspect_blend(self, source_file: Path, preview_frame: int | None = None) -> dict:
+        with tempfile.TemporaryDirectory(dir=self.settings.temp_root) as temp_dir:
+            temp_root = Path(temp_dir)
+            output_json = temp_root / "inspection.json"
+            preview_dir = temp_root / "previews"
+            preview_dir.mkdir(parents=True, exist_ok=True)
+
+            command = [
+                self.settings.blender_binary,
+                "-b",
+                str(source_file),
+                "-noaudio",
+                "-P",
+                str(self._script_path("prepare_render.py")),
+                "-P",
+                str(self._script_path("inspect_blend.py")),
+                "--",
+                "--output-json",
+                str(output_json),
+                "--preview-dir",
+                str(preview_dir),
+            ]
+            if preview_frame is not None:
+                command.extend(["--frame", str(preview_frame)])
+
+            output = await self._run_command(
+                command,
+                env=self._blender_env(),
+                capture_failure_output=True,
+            )
+            if not output_json.exists():
+                message = output.splitlines()[-1] if output else "Failed to inspect blend file."
+                raise RuntimeError(message)
+
+            payload = json.loads(output_json.read_text("utf-8"))
+            cameras = payload.get("cameras", [])
+            for camera in cameras:
+                preview_path = camera.get("preview_path")
+                if not preview_path:
+                    continue
+                path = Path(preview_path)
+                if not path.exists():
+                    continue
+                camera["preview_data_url"] = self._preview_data_url(path)
+                camera.pop("preview_path", None)
+            return payload
 
     def _parse_progress(
         self, job: JobRecord, tracker: ProgressTracker, line: str
@@ -315,17 +365,41 @@ class RenderRunner:
                 continue
         return {"available_types": [], "cuda": [], "optix": [], "hip": [], "cpu": []}
 
-    async def _run_command(self, command: list[str]) -> str:
+    def _blender_env(self, camera_name: str | None = None) -> dict[str, str]:
+        env = os.environ.copy()
+        env.pop("RENDER_CAMERA_NAME", None)
+        if camera_name:
+            env["RENDER_CAMERA_NAME"] = camera_name
+        return env
+
+    async def _run_command(
+        self,
+        command: list[str],
+        env: dict[str, str] | None = None,
+        *,
+        capture_failure_output: bool = False,
+    ) -> str:
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=env,
             )
         except FileNotFoundError:
             return ""
 
         stdout, _ = await process.communicate()
+        output = stdout.decode("utf-8", errors="replace").strip()
         if process.returncode != 0:
-            return ""
-        return stdout.decode("utf-8", errors="replace").strip()
+            return output if capture_failure_output else ""
+        return output
+
+    def _script_path(self, script_name: str) -> Path:
+        return Path(__file__).with_name(script_name)
+
+    def _preview_data_url(self, path: Path) -> str:
+        import base64
+
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"

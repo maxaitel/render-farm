@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import shutil
+import time
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import aiofiles
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -18,6 +21,12 @@ from .renderer import RenderRunner
 from .store import JobStore
 
 FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+INSPECT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+INSPECT_SESSION_MAX_AGE_SECONDS = 60 * 60
+INSPECT_SESSION_CLEANUP_INTERVAL_SECONDS = 5 * 60
+INSPECT_SESSION_TOUCH_INTERVAL_SECONDS = 60
+INSPECT_SESSION_PENDING_DELETE_NAME = ".cleanup-pending"
 
 
 class AppState:
@@ -27,6 +36,7 @@ class AppState:
         self.runner = runner
         self.queue = queue
         self.worker_task: asyncio.Task[None] | None = None
+        self.inspect_cleanup_task: asyncio.Task[None] | None = None
 
 
 def sanitize_filename(filename: str) -> str:
@@ -34,10 +44,186 @@ def sanitize_filename(filename: str) -> str:
     return cleaned or "project.blend"
 
 
+def sanitize_relative_path(path_value: str) -> Path:
+    cleaned = path_value.strip().replace("\\", "/")
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Invalid project file path.")
+
+    path = PurePosixPath(cleaned)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise HTTPException(status_code=400, detail="Invalid project file path.")
+
+    return Path(*path.parts)
+
+
+def unique_camera_names(camera_names: list[str] | None) -> list[str]:
+    if not camera_names:
+        return []
+
+    seen: set[str] = set()
+    names: list[str] = []
+    for camera_name in camera_names:
+        cleaned = camera_name.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        names.append(cleaned)
+    return names
+
+
+def validate_inspect_token(token: str) -> str:
+    cleaned = token.strip()
+    if not INSPECT_TOKEN_RE.fullmatch(cleaned):
+        raise HTTPException(status_code=400, detail="Invalid camera scan token.")
+    return cleaned
+
+
+def link_or_copy_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def link_or_copy_tree(source_root: Path, destination_root: Path) -> None:
+    for source in source_root.rglob("*"):
+        if not source.is_file():
+            continue
+        relative_path = source.relative_to(source_root)
+        link_or_copy_file(source, destination_root / relative_path)
+
+
+def inspect_session_root(settings: Settings, token: str) -> Path:
+    return settings.temp_root / "inspect" / validate_inspect_token(token)
+
+
+def inspect_session_meta_path(settings: Settings, token: str) -> Path:
+    return inspect_session_root(settings, token) / "session.json"
+
+
+def inspect_session_pending_delete_path(settings: Settings, token: str) -> Path:
+    return inspect_session_root(settings, token) / INSPECT_SESSION_PENDING_DELETE_NAME
+
+
+def _clear_inspect_session_pending_delete(settings: Settings, token: str) -> None:
+    inspect_session_pending_delete_path(settings, token).unlink(missing_ok=True)
+
+
+def _invalid_inspect_session(settings: Settings, token: str) -> HTTPException:
+    delete_inspect_session(settings, token)
+    return HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+
+
+def write_inspect_session(
+    settings: Settings,
+    token: str,
+    *,
+    source_filename: str,
+    source_path: Path,
+    state: str,
+) -> None:
+    validated_token = validate_inspect_token(token)
+    meta_path = inspect_session_meta_path(settings, validated_token)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = meta_path.with_name(f"{meta_path.name}.tmp")
+    temp_path.write_text(
+        json.dumps(
+            {
+                "source_filename": source_filename,
+                "source_path": str(source_path),
+                "state": state,
+            }
+        ),
+        encoding="utf-8",
+    )
+    temp_path.replace(meta_path)
+    _clear_inspect_session_pending_delete(settings, validated_token)
+
+
+def load_inspect_session(settings: Settings, token: str) -> dict:
+    validated_token = validate_inspect_token(token)
+    meta_path = inspect_session_meta_path(settings, validated_token)
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+    try:
+        payload = json.loads(meta_path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise _invalid_inspect_session(settings, validated_token)
+
+    if not isinstance(payload, dict):
+        raise _invalid_inspect_session(settings, validated_token)
+
+    required_keys = {"source_filename", "source_path"}
+    if not required_keys.issubset(payload):
+        raise _invalid_inspect_session(settings, validated_token)
+
+    if not isinstance(payload["source_filename"], str) or not isinstance(payload["source_path"], str):
+        raise _invalid_inspect_session(settings, validated_token)
+
+    try:
+        touch_inspect_session(settings, validated_token)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.") from exc
+    return payload
+
+
+def delete_inspect_session(settings: Settings, token: str) -> None:
+    shutil.rmtree(inspect_session_root(settings, token), ignore_errors=True)
+
+
+def touch_inspect_session(settings: Settings, token: str) -> None:
+    validated_token = validate_inspect_token(token)
+    meta_path = inspect_session_meta_path(settings, validated_token)
+    if not meta_path.exists():
+        raise FileNotFoundError(meta_path)
+    meta_path.touch()
+    _clear_inspect_session_pending_delete(settings, validated_token)
+
+
+def cleanup_expired_inspect_sessions(settings: Settings, max_age_seconds: int = INSPECT_SESSION_MAX_AGE_SECONDS) -> None:
+    inspect_root = settings.temp_root / "inspect"
+    if not inspect_root.exists():
+        return
+
+    cutoff = time.time() - max_age_seconds
+    for entry in inspect_root.iterdir():
+        try:
+            if not entry.is_dir():
+                continue
+            if not INSPECT_TOKEN_RE.fullmatch(entry.name):
+                continue
+            meta_path = entry / "session.json"
+            pending_delete_path = entry / INSPECT_SESSION_PENDING_DELETE_NAME
+            if not meta_path.exists():
+                if entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry, ignore_errors=True)
+                continue
+            reference_path = meta_path
+            reference_mtime = reference_path.stat().st_mtime
+            if reference_mtime >= cutoff:
+                pending_delete_path.unlink(missing_ok=True)
+                continue
+            if not pending_delete_path.exists():
+                pending_delete_path.touch()
+                continue
+        except FileNotFoundError:
+            continue
+
+        try:
+            if reference_path.stat().st_mtime > pending_delete_path.stat().st_mtime:
+                pending_delete_path.unlink(missing_ok=True)
+                continue
+        except FileNotFoundError:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+
+
 async def save_upload(upload: UploadFile, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
     async with aiofiles.open(destination, "wb") as out_file:
         while True:
-            chunk = await upload.read(1024 * 1024)
+            chunk = await upload.read(UPLOAD_CHUNK_SIZE)
             if not chunk:
                 break
             await out_file.write(chunk)
@@ -58,6 +244,28 @@ async def worker_loop(state: AppState) -> None:
             state.queue.task_done()
 
 
+async def inspect_session_cleanup_loop(
+    settings: Settings,
+    interval_seconds: int = INSPECT_SESSION_CLEANUP_INTERVAL_SECONDS,
+) -> None:
+    while True:
+        cleanup_expired_inspect_sessions(settings)
+        await asyncio.sleep(interval_seconds)
+
+
+async def keep_inspect_session_alive(
+    settings: Settings,
+    token: str,
+    interval_seconds: int = INSPECT_SESSION_TOUCH_INTERVAL_SECONDS,
+) -> None:
+    while True:
+        try:
+            touch_inspect_session(settings, token)
+        except FileNotFoundError:
+            return
+        await asyncio.sleep(interval_seconds)
+
+
 def mark_internal_failure(job: JobRecord, message: str) -> None:
     job.phase = JobPhase.failed
     job.finished_at = utc_now()
@@ -70,14 +278,17 @@ async def lifespan(app: FastAPI):
     settings = load_settings()
     settings.jobs_root.mkdir(parents=True, exist_ok=True)
     settings.temp_root.mkdir(parents=True, exist_ok=True)
-    store = JobStore(settings.jobs_root)
+    cleanup_expired_inspect_sessions(settings)
+    store = JobStore(settings.database_path)
     await store.load()
     queue: asyncio.Queue[str] = asyncio.Queue()
     for job_id in await store.queued_job_ids():
         queue.put_nowait(job_id)
     runner = RenderRunner(settings, store)
     state = AppState(settings, store, runner, queue)
-    state.worker_task = asyncio.create_task(worker_loop(state))
+    if not settings.disable_worker:
+        state.worker_task = asyncio.create_task(worker_loop(state))
+    state.inspect_cleanup_task = asyncio.create_task(inspect_session_cleanup_loop(settings))
     app.state.runtime = state
     try:
         yield
@@ -88,6 +299,13 @@ async def lifespan(app: FastAPI):
                 await state.worker_task
             except asyncio.CancelledError:
                 pass
+        if state.inspect_cleanup_task:
+            state.inspect_cleanup_task.cancel()
+            try:
+                await state.inspect_cleanup_task
+            except asyncio.CancelledError:
+                pass
+        await store.close()
 
 
 app = FastAPI(title="Render Farm", lifespan=lifespan)
@@ -137,58 +355,158 @@ async def get_job(job_id: str) -> dict:
 
 @app.post("/api/jobs")
 async def create_job(
-    blend_file: UploadFile = File(...),
+    blend_file: UploadFile | None = File(None),
+    blend_file_path: str | None = Form(None),
+    project_files: list[UploadFile] | None = File(None),
+    project_paths: list[str] | None = Form(None),
+    inspect_token: str | None = Form(None),
     render_mode: RenderMode = Form(RenderMode.still),
     output_format: OutputFormat = Form(OutputFormat.png),
     device_preference: RenderDevice = Form(RenderDevice.auto),
+    camera_name: str | None = Form(None),
     frame: int | None = Form(None),
     start_frame: int | None = Form(None),
     end_frame: int | None = Form(None),
 ) -> dict:
-    state = runtime_state()
-    filename = sanitize_filename(blend_file.filename or "project.blend")
-    if not filename.lower().endswith(".blend"):
-        raise HTTPException(status_code=400, detail="Only .blend files are accepted.")
-
-    if render_mode == RenderMode.still:
-        frame = frame or 1
-        start_frame = None
-        end_frame = None
-        total_frames = 1
-    else:
-        start_frame = start_frame or 1
-        end_frame = end_frame or start_frame
-        if end_frame < start_frame:
-            raise HTTPException(status_code=400, detail="End frame must be greater than or equal to start frame.")
-        frame = None
-        total_frames = end_frame - start_frame + 1
-
-    job_id = uuid.uuid4().hex[:12]
-    job_root = state.settings.jobs_root / job_id
-    input_dir = job_root / "input"
-    output_dir = job_root / "outputs"
-    input_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    source_path = input_dir / filename
-    await save_upload(blend_file, source_path)
-
-    job = JobRecord(
-        id=job_id,
-        source_filename=filename,
-        source_path=str(source_path),
-        output_directory=str(output_dir),
+    jobs = await create_jobs_from_upload(
+        blend_file=blend_file,
+        blend_file_path=blend_file_path,
+        project_files=project_files,
+        project_paths=project_paths,
+        inspect_token=inspect_token,
         render_mode=render_mode,
         output_format=output_format,
-        requested_device=device_preference,
+        device_preference=device_preference,
+        camera_names=[camera_name] if camera_name else None,
         frame=frame,
         start_frame=start_frame,
         end_frame=end_frame,
-        total_frames=total_frames,
     )
-    snapshot = await state.store.create(job)
-    state.queue.put_nowait(job_id)
-    return snapshot.model_dump(mode="json")
+    return jobs[0]
+
+
+@app.post("/api/jobs/batch")
+async def create_jobs_batch(
+    blend_file: UploadFile | None = File(None),
+    blend_file_path: str | None = Form(None),
+    project_files: list[UploadFile] | None = File(None),
+    project_paths: list[str] | None = Form(None),
+    inspect_token: str | None = Form(None),
+    render_mode: RenderMode = Form(RenderMode.still),
+    output_format: OutputFormat = Form(OutputFormat.png),
+    device_preference: RenderDevice = Form(RenderDevice.auto),
+    camera_names: list[str] | None = Form(None),
+    frame: int | None = Form(None),
+    start_frame: int | None = Form(None),
+    end_frame: int | None = Form(None),
+) -> list[dict]:
+    return await create_jobs_from_upload(
+        blend_file=blend_file,
+        blend_file_path=blend_file_path,
+        project_files=project_files,
+        project_paths=project_paths,
+        inspect_token=inspect_token,
+        render_mode=render_mode,
+        output_format=output_format,
+        device_preference=device_preference,
+        camera_names=camera_names,
+        frame=frame,
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
+
+
+@app.post("/api/blend-inspect")
+async def inspect_blend_file(
+    blend_file: UploadFile = File(...),
+    blend_file_path: str | None = Form(None),
+    project_files: list[UploadFile] | None = File(None),
+    project_paths: list[str] | None = Form(None),
+    frame: int | None = Form(None),
+) -> dict:
+    state = runtime_state()
+    relative_source_path = (
+        sanitize_relative_path(blend_file_path)
+        if blend_file_path and blend_file_path.strip()
+        else Path(sanitize_filename(blend_file.filename or "project.blend"))
+    )
+    filename = relative_source_path.as_posix()
+    if not filename.lower().endswith(".blend"):
+        raise HTTPException(status_code=400, detail="Only .blend files are accepted.")
+
+    normalized_project_files = project_files or []
+    normalized_project_paths = project_paths or []
+    if len(normalized_project_files) != len(normalized_project_paths):
+        raise HTTPException(status_code=400, detail="Project files are missing relative paths.")
+
+    cleanup_expired_inspect_sessions(state.settings)
+    inspection_token = uuid.uuid4().hex[:12]
+    inspect_root = inspect_session_root(state.settings, inspection_token)
+    inspect_root.mkdir(parents=True, exist_ok=True)
+    source_root = inspect_root / "source"
+    source_path = source_root / relative_source_path
+    keepalive_task: asyncio.Task[None] | None = None
+    try:
+        write_inspect_session(
+            state.settings,
+            inspection_token,
+            source_filename=filename,
+            source_path=source_path,
+            state="processing",
+        )
+        keepalive_task = asyncio.create_task(
+            keep_inspect_session_alive(state.settings, inspection_token)
+        )
+        await save_upload(blend_file, source_path)
+        for upload, path_value in zip(normalized_project_files, normalized_project_paths, strict=True):
+            relative_project_path = sanitize_relative_path(path_value)
+            if relative_project_path == relative_source_path:
+                await upload.close()
+                continue
+            await save_upload(upload, source_root / relative_project_path)
+        payload = await state.runner.inspect_blend(source_path, preview_frame=frame)
+        write_inspect_session(
+            state.settings,
+            inspection_token,
+            source_filename=filename,
+            source_path=source_path,
+            state="ready",
+        )
+        payload["inspection_token"] = inspection_token
+        return payload
+    except RuntimeError as exc:
+        delete_inspect_session(state.settings, inspection_token)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        delete_inspect_session(state.settings, inspection_token)
+        raise
+    finally:
+        if keepalive_task:
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
+
+
+@app.delete("/api/blend-inspect/{inspection_token}")
+async def release_blend_inspection(inspection_token: str) -> dict:
+    state = runtime_state()
+    delete_inspect_session(state.settings, inspection_token)
+    return {"ok": True}
+
+
+@app.post("/api/blend-inspect/{inspection_token}/touch")
+async def touch_blend_inspection(inspection_token: str) -> dict:
+    state = runtime_state()
+    token = validate_inspect_token(inspection_token)
+    if not inspect_session_meta_path(state.settings, token).exists():
+        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
+    try:
+        touch_inspect_session(state.settings, token)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.") from exc
+    return {"ok": True}
 
 
 @app.get("/api/jobs/{job_id}/events")
@@ -208,6 +526,151 @@ async def stream_job(job_id: str) -> StreamingResponse:
             await state.store.unsubscribe(job_id, queue)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+async def create_jobs_from_upload(
+    *,
+    blend_file: UploadFile | None,
+    blend_file_path: str | None,
+    project_files: list[UploadFile] | None,
+    project_paths: list[str] | None,
+    inspect_token: str | None,
+    render_mode: RenderMode,
+    output_format: OutputFormat,
+    device_preference: RenderDevice,
+    camera_names: list[str] | None,
+    frame: int | None,
+    start_frame: int | None,
+    end_frame: int | None,
+) -> list[dict]:
+    state = runtime_state()
+    has_blend_file = blend_file is not None
+    has_inspect_token = inspect_token is not None and inspect_token.strip() != ""
+    if has_blend_file == has_inspect_token:
+        raise HTTPException(status_code=400, detail="Provide either a blend file or a saved camera scan token.")
+
+    session_root: Path | None = None
+    prepared_source_path: Path | None = None
+    validated_inspect_token: str | None = None
+    relative_source_path: Path | None = None
+    if has_inspect_token:
+        assert inspect_token is not None
+        validated_inspect_token = validate_inspect_token(inspect_token)
+        session = load_inspect_session(state.settings, validated_inspect_token)
+        relative_source_path = sanitize_relative_path(session["source_filename"])
+        filename = relative_source_path.as_posix()
+        prepared_source_path = Path(session["source_path"])
+        session_root = inspect_session_root(state.settings, validated_inspect_token)
+    else:
+        assert blend_file is not None
+        relative_source_path = (
+            sanitize_relative_path(blend_file_path)
+            if blend_file_path and blend_file_path.strip()
+            else Path(sanitize_filename(blend_file.filename or "project.blend"))
+        )
+        filename = relative_source_path.as_posix()
+
+    if not filename.lower().endswith(".blend"):
+        raise HTTPException(status_code=400, detail="Only .blend files are accepted.")
+
+    normalized_project_files = project_files or []
+    normalized_project_paths = project_paths or []
+    if len(normalized_project_files) != len(normalized_project_paths):
+        raise HTTPException(status_code=400, detail="Project files are missing relative paths.")
+
+    if render_mode == RenderMode.still:
+        frame = frame or 1
+        start_frame = None
+        end_frame = None
+        total_frames = 1
+    else:
+        start_frame = start_frame or 1
+        end_frame = end_frame or start_frame
+        if end_frame < start_frame:
+            raise HTTPException(status_code=400, detail="End frame must be greater than or equal to start frame.")
+        frame = None
+        total_frames = end_frame - start_frame + 1
+
+    requested_cameras = unique_camera_names(camera_names)
+    job_camera_names: list[str | None] = requested_cameras or [None]
+    jobs: list[JobRecord] = []
+    job_roots: list[Path] = []
+
+    for camera_name in job_camera_names:
+        job_id = uuid.uuid4().hex[:12]
+        job_root = state.settings.jobs_root / job_id
+        input_dir = job_root / "input"
+        output_dir = job_root / "outputs"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        job_roots.append(job_root)
+        jobs.append(
+            JobRecord(
+                id=job_id,
+                source_filename=filename,
+                source_path=str(input_dir / filename),
+                output_directory=str(output_dir),
+                render_mode=render_mode,
+                output_format=output_format,
+                requested_device=device_preference,
+                camera_name=camera_name,
+                frame=frame,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                total_frames=total_frames,
+            )
+        )
+
+    first_job = jobs[0]
+    first_input_root = job_roots[0] / "input"
+    first_source_path = Path(first_job.source_path)
+    if prepared_source_path is not None:
+        if not prepared_source_path.exists():
+            raise HTTPException(status_code=404, detail="Saved camera scan source file is missing. Scan the blend file again.")
+        try:
+            if session_root is not None:
+                link_or_copy_tree(session_root / "source", first_input_root)
+                if not first_source_path.exists():
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Saved camera scan source file is missing. Scan the blend file again.",
+                    )
+            else:
+                link_or_copy_file(prepared_source_path, first_source_path)
+            for job_root in job_roots[1:]:
+                link_or_copy_tree(first_input_root, job_root / "input")
+        except Exception:
+            for job_root in job_roots:
+                shutil.rmtree(job_root, ignore_errors=True)
+            raise
+    else:
+        assert blend_file is not None
+        try:
+            await save_upload(blend_file, first_source_path)
+            for upload, path_value in zip(normalized_project_files, normalized_project_paths, strict=True):
+                relative_project_path = sanitize_relative_path(path_value)
+                if relative_source_path and relative_project_path == relative_source_path:
+                    await upload.close()
+                    continue
+                await save_upload(upload, first_input_root / relative_project_path)
+            for job_root in job_roots[1:]:
+                link_or_copy_tree(first_input_root, job_root / "input")
+        except Exception:
+            for job_root in job_roots:
+                shutil.rmtree(job_root, ignore_errors=True)
+            raise
+
+    try:
+        snapshots = await state.store.create_many(jobs)
+    except Exception:
+        for job_root in job_roots:
+            shutil.rmtree(job_root, ignore_errors=True)
+        raise
+
+    for snapshot in snapshots:
+        state.queue.put_nowait(snapshot.id)
+
+    return [snapshot.model_dump(mode="json") for snapshot in snapshots]
 
 
 @app.get("/api/jobs/{job_id}/download")
