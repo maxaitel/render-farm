@@ -29,11 +29,16 @@ from .models import (
     utc_now,
 )
 from .renderer import RenderRunner
-from .security import hash_session_token, is_private_ip, is_trusted_proxy, new_session_token
+from .security import (
+    hash_session_token,
+    is_private_ip,
+    is_trusted_proxy,
+    new_session_token,
+    normalize_username as normalize_username_value,
+)
 from .store import JobStore
 
 FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
-USERNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{1,30}[a-z0-9])?$")
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 
 
@@ -82,13 +87,13 @@ def sanitize_relative_path(path_value: str) -> Path:
 
 
 def normalize_username(username: str) -> str:
-    cleaned = username.strip().lower()
-    if not USERNAME_RE.fullmatch(cleaned):
+    try:
+        return normalize_username_value(username)
+    except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail="Usernames must be 3-32 characters and use lowercase letters, numbers, dots, dashes, or underscores.",
-        )
-    return cleaned
+            detail=str(exc),
+        ) from exc
 
 
 def unique_camera_names(camera_names: list[str] | None) -> list[str]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import re
 import secrets
 from ipaddress import ip_address, ip_network
 
@@ -11,6 +12,7 @@ SCRYPT_N = 2**14
 SCRYPT_R = 8
 SCRYPT_P = 1
 SCRYPT_KEY_LENGTH = 32
+USERNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{1,30}[a-z0-9])?$")
 
 
 def hash_password(password: str) -> str:
@@ -70,6 +72,15 @@ def new_session_token() -> str:
 
 def hash_session_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def normalize_username(username: str) -> str:
+    cleaned = username.strip().lower()
+    if not USERNAME_RE.fullmatch(cleaned):
+        raise ValueError(
+            "Usernames must be 3-32 characters and use lowercase letters, numbers, dots, dashes, or underscores."
+        )
+    return cleaned
 
 
 def is_private_ip(value: str | None) -> bool:

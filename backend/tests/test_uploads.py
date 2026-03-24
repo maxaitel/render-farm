@@ -9,7 +9,12 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 
-def _set_test_env(storage_root: Path, *, trusted_proxies: str = "testclient") -> dict[str, str | None]:
+def _set_test_env(
+    storage_root: Path,
+    *,
+    trusted_proxies: str = "testclient",
+    bootstrap_username: str = "admin",
+) -> dict[str, str | None]:
     previous = {
         "RENDER_STORAGE_ROOT": os.environ.get("RENDER_STORAGE_ROOT"),
         "DISABLE_RENDER_WORKER": os.environ.get("DISABLE_RENDER_WORKER"),
@@ -22,7 +27,7 @@ def _set_test_env(storage_root: Path, *, trusted_proxies: str = "testclient") ->
     os.environ["RENDER_STORAGE_ROOT"] = str(storage_root)
     os.environ["DISABLE_RENDER_WORKER"] = "1"
     os.environ["BLENDER_BINARY"] = "/bin/true"
-    os.environ["ADMIN_BOOTSTRAP_USERNAME"] = "admin"
+    os.environ["ADMIN_BOOTSTRAP_USERNAME"] = bootstrap_username
     os.environ["ADMIN_BOOTSTRAP_PASSWORD"] = "admin-password-123"
     os.environ["AUTH_COOKIE_SECURE"] = "false"
     os.environ["TRUSTED_PROXIES"] = trusted_proxies
@@ -232,5 +237,19 @@ def test_trusted_proxy_uses_forwarded_ip_for_admin_lan_check(tmp_path: Path) -> 
             )
             assert response.status_code == 200
             assert response.json()["lan_admin_access"] is False
+    finally:
+        _restore_env(previous)
+
+
+def test_bootstrap_admin_username_is_normalized_for_sign_in(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path, bootstrap_username="Admin")
+    try:
+        with _client() as client:
+            response = client.post(
+                "/api/auth/sign-in",
+                json={"username": "admin", "password": "admin-password-123"},
+            )
+            assert response.status_code == 200
+            assert response.json()["user"]["username"] == "admin"
     finally:
         _restore_env(previous)

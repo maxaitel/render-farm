@@ -21,7 +21,7 @@ from .models import (
     UserStatus,
     utc_now,
 )
-from .security import hash_password, verify_password
+from .security import hash_password, normalize_username, verify_password
 
 
 Mutator = Callable[[JobRecord], None]
@@ -140,6 +140,12 @@ class JobStore:
         if self._conn is None or not username or not password:
             return
 
+        try:
+            normalized_username = normalize_username(username)
+        except ValueError as exc:
+            print(f"Skipping bootstrap admin update for {username!r}: {exc}")
+            return
+
         now = utc_now().isoformat()
         try:
             password_hash = hash_password(password)
@@ -147,7 +153,7 @@ class JobStore:
             print(f"Skipping bootstrap admin update for {username!r}: {exc}")
             return
         async with self._db_lock:
-            await asyncio.to_thread(self._ensure_bootstrap_admin_sync, username, password_hash, now)
+            await asyncio.to_thread(self._ensure_bootstrap_admin_sync, normalized_username, password_hash, now)
 
     def _ensure_bootstrap_admin_sync(self, username: str, password_hash: str, now: str) -> None:
         if self._conn is None:
