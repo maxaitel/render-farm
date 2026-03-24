@@ -25,6 +25,7 @@ class Settings:
     admin_bootstrap_username: str | None
     admin_bootstrap_password: str | None
     allow_signups: bool
+    trusted_proxies: list[str]
 
     @property
     def database_path(self) -> Path:
@@ -49,6 +50,8 @@ def load_settings() -> Settings:
     default_device = os.getenv("BLENDER_CYCLES_DEVICE", "AUTO").upper()
     gpu_order_raw = os.getenv("BLENDER_GPU_ORDER", "CUDA,OPTIX,CPU")
     gpu_order = [item.strip().upper() for item in gpu_order_raw.split(",") if item.strip()]
+    trusted_proxies_raw = os.getenv("TRUSTED_PROXIES", "")
+    trusted_proxies = [item.strip() for item in trusted_proxies_raw.split(",") if item.strip()]
     disable_worker = _parse_bool(os.getenv("DISABLE_RENDER_WORKER"))
     admin_panel_path = os.getenv("ADMIN_PANEL_PATH", "control-tower").strip().strip("/")
     return Settings(
@@ -64,4 +67,5 @@ def load_settings() -> Settings:
         admin_bootstrap_username=os.getenv("ADMIN_BOOTSTRAP_USERNAME", "").strip() or None,
         admin_bootstrap_password=os.getenv("ADMIN_BOOTSTRAP_PASSWORD", "").strip() or None,
         allow_signups=_parse_bool(os.getenv("ALLOW_SIGNUPS"), default=True),
+        trusted_proxies=trusted_proxies,
     )

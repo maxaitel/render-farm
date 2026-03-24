@@ -1143,6 +1143,12 @@ export function RenderDashboard({
   const [adminActivity, setAdminActivity] = useState<ActivityRecord[]>([]);
   const [adminRuns, setAdminRuns] = useState<RenderJob[]>([]);
   const sourcesRef = useRef<Map<string, EventSource>>(new Map());
+  const activeJobIds = Array.from(
+    new Set(files.flatMap((file) => file.jobs).filter(activePhase).map((job) => job.id)),
+  ).sort();
+  const activeJobIdsKey = JSON.stringify(activeJobIds);
+  const activeJobSessionKey =
+    session && session.user.status === "approved" ? `${session.user.id}:approved` : "closed";
 
   const selectedFile = fileId
     ? files.find((item) => item.id === fileId) ?? null
@@ -1262,8 +1268,13 @@ export function RenderDashboard({
   }, [session, view]);
 
   useEffect(() => {
-    const activeJobs = files.flatMap((file) => file.jobs).filter(activePhase);
-    const activeIds = new Set(activeJobs.map((job) => job.id));
+    if (!session || session.user.status !== "approved") {
+      sourcesRef.current.forEach((source) => source.close());
+      sourcesRef.current.clear();
+      return;
+    }
+
+    const activeIds = new Set(JSON.parse(activeJobIdsKey) as string[]);
 
     sourcesRef.current.forEach((source, jobId) => {
       if (!activeIds.has(jobId)) {
@@ -1287,12 +1298,14 @@ export function RenderDashboard({
       };
       sourcesRef.current.set(jobId, source);
     });
+  }, [activeJobIdsKey, activeJobSessionKey]);
 
+  useEffect(() => {
     return () => {
       sourcesRef.current.forEach((source) => source.close());
       sourcesRef.current.clear();
     };
-  }, [files]);
+  }, []);
 
   async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

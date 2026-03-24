@@ -4,7 +4,7 @@ import base64
 import hashlib
 import hmac
 import secrets
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 
 
 SCRYPT_N = 2**14
@@ -87,3 +87,33 @@ def is_private_ip(value: str | None) -> bool:
     except ValueError:
         return False
     return parsed.is_private or parsed.is_loopback or parsed.is_link_local
+
+
+def is_trusted_proxy(value: str | None, trusted_proxies: list[str]) -> bool:
+    if not value:
+        return False
+
+    candidate = value.strip()
+    if not candidate:
+        return False
+
+    parsed_candidate = None
+    try:
+        parsed_candidate = ip_address(candidate)
+    except ValueError:
+        pass
+
+    for trusted_proxy in trusted_proxies:
+        trusted_candidate = trusted_proxy.strip()
+        if not trusted_candidate:
+            continue
+        if candidate.lower() == trusted_candidate.lower():
+            return True
+        if parsed_candidate is None:
+            continue
+        try:
+            if parsed_candidate in ip_network(trusted_candidate, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False

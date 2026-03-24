@@ -29,7 +29,7 @@ from .models import (
     utc_now,
 )
 from .renderer import RenderRunner
-from .security import hash_session_token, is_private_ip, new_session_token
+from .security import hash_session_token, is_private_ip, is_trusted_proxy, new_session_token
 from .store import JobStore
 
 FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -115,17 +115,20 @@ def cookie_secure_setting(settings: Settings, request: Request) -> bool:
     return forwarded_proto == "https" or request.url.scheme == "https"
 
 
-def client_ip(request: Request) -> str | None:
+def client_ip(request: Request, settings: Settings) -> str | None:
+    remote_host = request.client.host if request.client else None
     forwarded_for = request.headers.get("x-forwarded-for", "")
     if forwarded_for:
+        if not is_trusted_proxy(remote_host, settings.trusted_proxies):
+            return None
         candidate = forwarded_for.split(",")[0].strip()
         if candidate:
             return candidate
-    return request.client.host if request.client else None
+    return remote_host
 
 
-def lan_admin_access(request: Request) -> bool:
-    return is_private_ip(client_ip(request))
+def lan_admin_access(request: Request, settings: Settings) -> bool:
+    return is_private_ip(client_ip(request, settings))
 
 
 async def save_upload(upload: UploadFile, destination: Path) -> int:
@@ -259,10 +262,15 @@ async def require_admin_user(
     request: Request,
     session_data: tuple[UserRecord, str] | None = Depends(current_session),
 ) -> UserRecord:
+    state = runtime_state()
     if session_data is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
     user = session_data[0]
-    if user.role != UserRole.admin or user.status != UserStatus.approved or not lan_admin_access(request):
+    if (
+        user.role != UserRole.admin
+        or user.status != UserStatus.approved
+        or not lan_admin_access(request, state.settings)
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found.")
     return user
 
@@ -273,7 +281,7 @@ def session_payload_for_user(user: UserRecord, request: Request) -> AuthSessionP
         user=user,
         session=None,
         admin_panel_path=state.settings.admin_panel_path if user.role == UserRole.admin else None,
-        lan_admin_access=user.role == UserRole.admin and lan_admin_access(request),
+        lan_admin_access=user.role == UserRole.admin and lan_admin_access(request, state.settings),
     )
 
 
@@ -385,7 +393,7 @@ async def sign_up(payload: SignUpRequest, request: Request, response: Response) 
         description=f"{user.username} created an account and is awaiting approval.",
         actor_user_id=user.id,
         subject_user_id=user.id,
-        metadata={"ip_address": client_ip(request)},
+        metadata={"ip_address": client_ip(request, state.settings)},
     )
     return session_payload_for_user(user, request).model_dump(mode="json")
 
@@ -403,7 +411,7 @@ async def sign_in(payload: SignInRequest, request: Request, response: Response) 
         user_id=user.id,
         token_hash=hash_session_token(session_token),
         expires_in_hours=state.settings.session_ttl_hours,
-        ip_address=client_ip(request),
+        ip_address=client_ip(request, state.settings),
         user_agent=request.headers.get("user-agent"),
     )
     response.set_cookie(
@@ -420,7 +428,7 @@ async def sign_in(payload: SignInRequest, request: Request, response: Response) 
         description=f"{user.username} signed in.",
         actor_user_id=user.id,
         subject_user_id=user.id,
-        metadata={"ip_address": client_ip(request)},
+        metadata={"ip_address": client_ip(request, state.settings)},
     )
     return session_payload_for_user(user, request).model_dump(mode="json")
 

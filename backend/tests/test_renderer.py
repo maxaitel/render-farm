@@ -28,6 +28,7 @@ def test_multi_camera_render_creates_single_archive_with_camera_named_outputs(
             admin_bootstrap_username=None,
             admin_bootstrap_password=None,
             allow_signups=True,
+            trusted_proxies=[],
         )
         store = JobStore(settings.database_path)
         await store.load()

@@ -17,6 +17,7 @@ def _set_test_env(storage_root: Path) -> dict[str, str | None]:
         "ADMIN_BOOTSTRAP_USERNAME": os.environ.get("ADMIN_BOOTSTRAP_USERNAME"),
         "ADMIN_BOOTSTRAP_PASSWORD": os.environ.get("ADMIN_BOOTSTRAP_PASSWORD"),
         "AUTH_COOKIE_SECURE": os.environ.get("AUTH_COOKIE_SECURE"),
+        "TRUSTED_PROXIES": os.environ.get("TRUSTED_PROXIES"),
     }
     os.environ["RENDER_STORAGE_ROOT"] = str(storage_root)
     os.environ["DISABLE_RENDER_WORKER"] = "1"
@@ -24,6 +25,7 @@ def _set_test_env(storage_root: Path) -> dict[str, str | None]:
     os.environ["ADMIN_BOOTSTRAP_USERNAME"] = "admin"
     os.environ["ADMIN_BOOTSTRAP_PASSWORD"] = "admin-password-123"
     os.environ["AUTH_COOKIE_SECURE"] = "false"
+    os.environ["TRUSTED_PROXIES"] = "testclient"
     return previous
 
 
@@ -180,6 +182,20 @@ def test_non_admin_user_cannot_access_admin_routes(tmp_path: Path) -> None:
         with _client() as user_client:
             _sign_in(user_client, "artist_three", "artist-password-789")
             response = user_client.get(
+                "/api/admin/users",
+                headers={"x-forwarded-for": "127.0.0.1"},
+            )
+            assert response.status_code == 404
+    finally:
+        _restore_env(previous)
+
+
+def test_spoofed_forwarded_for_header_does_not_grant_admin_access(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with TestClient(app, client=("198.51.100.24", 50000)) as client:
+            _sign_in(client, "admin", "admin-password-123")
+            response = client.get(
                 "/api/admin/users",
                 headers={"x-forwarded-for": "127.0.0.1"},
             )
