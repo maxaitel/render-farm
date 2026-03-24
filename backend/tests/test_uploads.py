@@ -1111,6 +1111,49 @@ def test_corrupted_inspect_session_is_deleted_when_loaded(tmp_path: Path) -> Non
         _restore_env(previous)
 
 
+def test_inspect_session_touch_race_returns_404(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        inspect_token = "inspect-touch-race"
+        inspect_root = tmp_path / "tmp" / "inspect" / inspect_token
+        source_dir = inspect_root / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        source_path = source_dir / "scene.blend"
+        source_path.write_bytes(b"stale")
+        (inspect_root / "session.json").write_text(
+            json.dumps(
+                {
+                    "source_filename": "scene.blend",
+                    "source_path": str(source_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        from app import main as main_module
+
+        monkeypatch.setattr(
+            main_module,
+            "touch_inspect_session",
+            lambda settings, token: (_ for _ in ()).throw(FileNotFoundError(token)),
+        )
+
+        with _client_for(tmp_path) as client:
+            response = client.post(
+                "/api/jobs",
+                data={
+                    "inspect_token": inspect_token,
+                    "render_mode": "still",
+                    "frame": "1",
+                },
+            )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Saved camera scan was not found. Scan the blend file again."
+    finally:
+        _restore_env(previous)
+
+
 def test_existing_job_json_is_imported_into_sqlite(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:

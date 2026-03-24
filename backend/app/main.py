@@ -156,7 +156,10 @@ def load_inspect_session(settings: Settings, token: str) -> dict:
         delete_inspect_session(settings, validated_token)
         raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.")
 
-    touch_inspect_session(settings, validated_token)
+    try:
+        touch_inspect_session(settings, validated_token)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Saved camera scan was not found. Scan the blend file again.") from exc
     return payload
 
 

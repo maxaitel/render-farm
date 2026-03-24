@@ -5,6 +5,21 @@ export type ProjectUploadEntry = {
   path: string;
 };
 
+function xhrJsonPayload<T>(request: XMLHttpRequest): T | { detail?: string } | null {
+  if (request.response !== null) {
+    return request.response as T | { detail?: string };
+  }
+  return null;
+}
+
+function responseDetail(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object" || !("detail" in payload)) {
+    return null;
+  }
+  const { detail } = payload as { detail?: unknown };
+  return typeof detail === "string" ? detail : null;
+}
+
 async function parseResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ detail: "Request failed." }));
@@ -39,8 +54,7 @@ export async function submitJob(formData: FormData): Promise<RenderJob> {
         return;
       }
 
-      const detail = payload && "detail" in payload ? payload.detail : null;
-      reject(new Error(detail ?? "Request failed."));
+      reject(new Error(responseDetail(payload) ?? "Request failed."));
     };
 
     request.onerror = () => {
@@ -132,11 +146,7 @@ export async function inspectBlendFile(
 
     request.onload = () => {
       clearProcessingProgress();
-      const payload =
-        request.response ??
-        (request.responseText
-          ? (JSON.parse(request.responseText) as BlendInspection | { detail?: string })
-          : null);
+      const payload = xhrJsonPayload<BlendInspection>(request);
 
       if (request.status >= 200 && request.status < 300 && payload) {
         onProgress(100);
@@ -144,8 +154,7 @@ export async function inspectBlendFile(
         return;
       }
 
-      const detail = payload && "detail" in payload ? payload.detail : null;
-      reject(new Error(detail ?? "Request failed."));
+      reject(new Error(responseDetail(payload) ?? "Request failed."));
     };
 
     request.onerror = () => {
@@ -208,9 +217,7 @@ function submitWithProgress<T>(
     };
 
     request.onload = () => {
-      const payload =
-        request.response ??
-        (request.responseText ? (JSON.parse(request.responseText) as T | { detail?: string }) : null);
+      const payload = xhrJsonPayload<T>(request);
 
       if (request.status >= 200 && request.status < 300 && payload) {
         onProgress(100);
@@ -218,8 +225,7 @@ function submitWithProgress<T>(
         return;
       }
 
-      const detail = payload && "detail" in payload ? payload.detail : null;
-      reject(new Error(detail ?? "Request failed."));
+      reject(new Error(responseDetail(payload) ?? "Request failed."));
     };
 
     request.onerror = () => {
