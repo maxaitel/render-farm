@@ -162,7 +162,7 @@ def test_jobs_reload_from_sqlite_across_app_restart(tmp_path: Path) -> None:
         _restore_env(previous)
 
 
-def test_batch_upload_creates_one_job_per_camera(tmp_path: Path) -> None:
+def test_batch_upload_creates_one_job_with_multiple_cameras(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:
         with _client_for(tmp_path) as client:
@@ -179,12 +179,13 @@ def test_batch_upload_creates_one_job_per_camera(tmp_path: Path) -> None:
 
         assert response.status_code == 200
         payload = response.json()
-        assert len(payload) == 2
-        assert {job["camera_name"] for job in payload} == {"Cam_A", "Cam_B"}
-        for job in payload:
-            source_file = tmp_path / "jobs" / job["id"] / "input" / "scene.blend"
-            assert source_file.exists()
-            assert source_file.read_bytes() == b"camera-job-data"
+        assert len(payload) == 1
+        job = payload[0]
+        assert job["camera_name"] is None
+        assert job["camera_names"] == ["Cam_A", "Cam_B"]
+        source_file = tmp_path / "jobs" / job["id"] / "input" / "scene.blend"
+        assert source_file.exists()
+        assert source_file.read_bytes() == b"camera-job-data"
     finally:
         _restore_env(previous)
 

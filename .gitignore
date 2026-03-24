@@ -27,3 +27,6 @@ backend/.blender-src/
 # Runtime job data
 data/*
 !data/.gitkeep
+
+# Local test assets
+test-blend-files/*.blend

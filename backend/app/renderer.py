@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ GPU_ERROR_RE = re.compile(
     r"(No compatible GPUs found|CUDA.+unavailable|OPTIX.+unavailable|is not a valid Cycles device|device type .* not available|Found no Cycles device of the specified type)",
     re.IGNORECASE,
 )
+SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 @dataclass(slots=True)
@@ -57,6 +59,7 @@ class RenderRunner:
                 job_id,
                 lambda item, current=device: self._prepare_attempt(item, current),
             )
+            self._reset_output_dir(job.output_dir)
             success, combined_output = await self._run_attempt(job, device)
             if success:
                 outputs = self._collect_outputs(job.output_dir)
@@ -86,12 +89,16 @@ class RenderRunner:
         job.started_at = job.started_at or utc_now()
         job.progress = max(job.progress, 1.0)
         job.error = None
+        job.outputs = []
+        job.archive_path = None
+        job.current_camera_name = None
         job.status_message = "Starting Blender render process."
 
     def _prepare_attempt(self, job: JobRecord, device: str) -> None:
         job.resolved_device = device
         job.progress = max(job.progress, 2.0)
         job.status_message = f"Rendering on {device}."
+        job.current_camera_name = None
         job.current_frame = None
         job.current_sample = None
         job.total_samples = None
@@ -105,6 +112,7 @@ class RenderRunner:
         job.archive_path = archive_path
         job.status_message = "Render complete."
         job.error = None
+        job.current_camera_name = None
         if job.render_mode == RenderMode.still and job.frame is not None:
             job.current_frame = job.frame
         elif job.end_frame is not None:
@@ -128,13 +136,52 @@ class RenderRunner:
         return [requested.value]
 
     async def _run_attempt(self, job: JobRecord, device: str) -> tuple[bool, str]:
+        requested_cameras = self._requested_cameras(job)
+        total_cameras = len(requested_cameras)
+        all_lines: list[str] = []
+
+        for camera_index, camera_name in enumerate(requested_cameras):
+            job = await self.store.mutate(
+                job.id,
+                lambda item,
+                current_camera=camera_name,
+                current_index=camera_index,
+                current_device=device,
+                current_total=total_cameras: self._mark_camera_started(
+                    item,
+                    current_camera,
+                    current_index,
+                    current_total,
+                    current_device,
+                ),
+            )
+            success, lines = await self._run_camera_attempt(
+                job,
+                device,
+                camera_name,
+                camera_index,
+                total_cameras,
+            )
+            all_lines.extend(lines)
+            if not success:
+                return False, "\n".join(all_lines[-80:])
+        return True, "\n".join(all_lines[-80:])
+
+    async def _run_camera_attempt(
+        self,
+        job: JobRecord,
+        device: str,
+        camera_name: str | None,
+        camera_index: int,
+        total_cameras: int,
+    ) -> tuple[bool, list[str]]:
         tracker = ProgressTracker(total_frames=self._total_frames(job))
-        command = self._build_command(job, device)
+        command = self._build_command(job, device, camera_name, camera_index, total_cameras)
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env=self._blender_env(job.camera_name),
+            env=self._blender_env(camera_name),
         )
 
         lines: list[str] = []
@@ -143,21 +190,36 @@ class RenderRunner:
             line = raw_line.decode("utf-8", errors="replace").rstrip()
             lines.append(line)
             await self.store.append_log(job.id, line)
-            progress, message = self._parse_progress(job, tracker, line)
+            progress, message = self._parse_progress(job, tracker, line, camera_name)
             if progress is not None:
+                overall_progress = self._overall_progress(camera_index, total_cameras, progress)
                 await self.store.mutate(
                     job.id,
-                    lambda item, pct=progress, tracker_state=tracker, status=message: self._apply_progress(
-                        item, pct, tracker_state, status
+                    lambda item,
+                    pct=overall_progress,
+                    tracker_state=tracker,
+                    status=message,
+                    current_camera=camera_name: self._apply_progress(
+                        item,
+                        pct,
+                        tracker_state,
+                        status,
+                        current_camera,
                     ),
                 )
 
         exit_code = await process.wait()
-        combined_output = "\n".join(lines[-80:])
-        return exit_code == 0, combined_output
+        return exit_code == 0, lines[-80:]
 
-    def _build_command(self, job: JobRecord, device: str) -> list[str]:
-        output_pattern = str(job.output_dir / "frame_#####")
+    def _build_command(
+        self,
+        job: JobRecord,
+        device: str,
+        camera_name: str | None,
+        camera_index: int,
+        total_cameras: int,
+    ) -> list[str]:
+        output_pattern = self._output_pattern(job, camera_name, camera_index, total_cameras)
         command = [
             self.settings.blender_binary,
             "-b",
@@ -238,25 +300,30 @@ class RenderRunner:
             return payload
 
     def _parse_progress(
-        self, job: JobRecord, tracker: ProgressTracker, line: str
+        self,
+        job: JobRecord,
+        tracker: ProgressTracker,
+        line: str,
+        camera_name: str | None,
     ) -> tuple[float | None, str | None]:
         message: str | None = None
+        camera_prefix = self._camera_message_prefix(camera_name)
         frame_match = FRAME_RE.search(line)
         if frame_match:
             tracker.current_frame = int(frame_match.group(1))
-            message = f"Rendering frame {tracker.current_frame}."
+            message = f"{camera_prefix} rendering frame {tracker.current_frame}."
 
         sample_match = SAMPLE_RE.search(line) or PATH_SAMPLE_RE.search(line)
         if sample_match:
             tracker.current_sample = int(sample_match.group(1))
             tracker.total_samples = int(sample_match.group(2))
-            message = f"Path tracing sample {tracker.current_sample}/{tracker.total_samples}."
+            message = f"{camera_prefix} sample {tracker.current_sample}/{tracker.total_samples}."
 
         tile_match = TILE_RE.search(line) or PATH_TILE_RE.search(line)
         if tile_match:
             tracker.current_tile = int(tile_match.group(1))
             tracker.total_tiles = int(tile_match.group(2))
-            message = f"Tile {tracker.current_tile}/{tracker.total_tiles}."
+            message = f"{camera_prefix} tile {tracker.current_tile}/{tracker.total_tiles}."
 
         if tracker.total_frames <= 0:
             tracker.total_frames = 1
@@ -287,15 +354,38 @@ class RenderRunner:
         return progress, message
 
     def _apply_progress(
-        self, job: JobRecord, progress: float, tracker: ProgressTracker, message: str | None
+        self,
+        job: JobRecord,
+        progress: float,
+        tracker: ProgressTracker,
+        message: str | None,
+        camera_name: str | None,
     ) -> None:
         job.progress = progress
+        job.current_camera_name = camera_name
         job.current_frame = tracker.current_frame
         job.total_frames = tracker.total_frames
         job.current_sample = tracker.current_sample
         job.total_samples = tracker.total_samples
         if message:
             job.status_message = message
+
+    def _mark_camera_started(
+        self,
+        job: JobRecord,
+        camera_name: str | None,
+        camera_index: int,
+        total_cameras: int,
+        device: str,
+    ) -> None:
+        job.current_camera_name = camera_name
+        job.current_frame = None
+        job.current_sample = None
+        job.total_samples = None
+        job.total_frames = self._total_frames(job)
+        job.progress = self._overall_progress(camera_index, total_cameras, 2.0)
+        camera_position = f" ({camera_index + 1}/{total_cameras})" if total_cameras > 1 else ""
+        job.status_message = f"Rendering {self._camera_message_prefix(camera_name)}{camera_position} on {device}."
 
     def _should_retry(self, device: str, output: str) -> bool:
         return device != "CPU" and bool(GPU_ERROR_RE.search(output))
@@ -322,6 +412,52 @@ class RenderRunner:
         start = job.start_frame or 1
         end = job.end_frame or start
         return max(1, end - start + 1)
+
+    def _requested_cameras(self, job: JobRecord) -> list[str | None]:
+        if job.camera_names:
+            return list(job.camera_names)
+        if job.camera_name:
+            return [job.camera_name]
+        return [None]
+
+    def _overall_progress(self, camera_index: int, total_cameras: int, camera_progress: float) -> float:
+        if total_cameras <= 1:
+            return camera_progress
+        scaled = ((camera_index + (camera_progress / 100.0)) / total_cameras) * 100.0
+        return max(2.0, min(scaled, 99.0))
+
+    def _camera_message_prefix(self, camera_name: str | None) -> str:
+        if not camera_name:
+            return "Default camera"
+        return f"Camera {camera_name}"
+
+    def _output_pattern(
+        self,
+        job: JobRecord,
+        camera_name: str | None,
+        camera_index: int,
+        total_cameras: int,
+    ) -> str:
+        if not camera_name:
+            stem = "frame_#####"
+        else:
+            safe_camera = self._safe_output_name(camera_name, "camera")
+            if total_cameras > 1:
+                safe_camera = f"{camera_index + 1:02d}_{safe_camera}"
+            stem = f"{safe_camera}_frame_#####"
+        return str(job.output_dir / stem)
+
+    def _safe_output_name(self, value: str, fallback: str) -> str:
+        cleaned = SAFE_NAME_RE.sub("_", value).strip("._-")
+        return cleaned or fallback
+
+    def _reset_output_dir(self, output_dir: Path) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for path in output_dir.iterdir():
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
 
     async def system_status(self) -> dict:
         blender_version = await self._run_command([self.settings.blender_binary, "--version"])

@@ -592,85 +592,67 @@ async def create_jobs_from_upload(
         total_frames = end_frame - start_frame + 1
 
     requested_cameras = unique_camera_names(camera_names)
-    job_camera_names: list[str | None] = requested_cameras or [None]
-    jobs: list[JobRecord] = []
-    job_roots: list[Path] = []
+    job_id = uuid.uuid4().hex[:12]
+    job_root = state.settings.jobs_root / job_id
+    input_dir = job_root / "input"
+    output_dir = job_root / "outputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    job = JobRecord(
+        id=job_id,
+        source_filename=filename,
+        source_path=str(input_dir / filename),
+        output_directory=str(output_dir),
+        render_mode=render_mode,
+        output_format=output_format,
+        requested_device=device_preference,
+        camera_name=requested_cameras[0] if len(requested_cameras) == 1 else None,
+        camera_names=requested_cameras,
+        frame=frame,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        total_frames=total_frames,
+    )
 
-    for camera_name in job_camera_names:
-        job_id = uuid.uuid4().hex[:12]
-        job_root = state.settings.jobs_root / job_id
-        input_dir = job_root / "input"
-        output_dir = job_root / "outputs"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        job_roots.append(job_root)
-        jobs.append(
-            JobRecord(
-                id=job_id,
-                source_filename=filename,
-                source_path=str(input_dir / filename),
-                output_directory=str(output_dir),
-                render_mode=render_mode,
-                output_format=output_format,
-                requested_device=device_preference,
-                camera_name=camera_name,
-                frame=frame,
-                start_frame=start_frame,
-                end_frame=end_frame,
-                total_frames=total_frames,
-            )
-        )
-
-    first_job = jobs[0]
-    first_input_root = job_roots[0] / "input"
-    first_source_path = Path(first_job.source_path)
+    source_path = Path(job.source_path)
     if prepared_source_path is not None:
         if not prepared_source_path.exists():
             raise HTTPException(status_code=404, detail="Saved camera scan source file is missing. Scan the blend file again.")
         try:
             if session_root is not None:
-                link_or_copy_tree(session_root / "source", first_input_root)
-                if not first_source_path.exists():
+                link_or_copy_tree(session_root / "source", input_dir)
+                if not source_path.exists():
                     raise HTTPException(
                         status_code=404,
                         detail="Saved camera scan source file is missing. Scan the blend file again.",
                     )
             else:
-                link_or_copy_file(prepared_source_path, first_source_path)
-            for job_root in job_roots[1:]:
-                link_or_copy_tree(first_input_root, job_root / "input")
+                link_or_copy_file(prepared_source_path, source_path)
         except Exception:
-            for job_root in job_roots:
-                shutil.rmtree(job_root, ignore_errors=True)
+            shutil.rmtree(job_root, ignore_errors=True)
             raise
     else:
         assert blend_file is not None
         try:
-            await save_upload(blend_file, first_source_path)
+            await save_upload(blend_file, source_path)
             for upload, path_value in zip(normalized_project_files, normalized_project_paths, strict=True):
                 relative_project_path = sanitize_relative_path(path_value)
                 if relative_source_path and relative_project_path == relative_source_path:
                     await upload.close()
                     continue
-                await save_upload(upload, first_input_root / relative_project_path)
-            for job_root in job_roots[1:]:
-                link_or_copy_tree(first_input_root, job_root / "input")
+                await save_upload(upload, input_dir / relative_project_path)
         except Exception:
-            for job_root in job_roots:
-                shutil.rmtree(job_root, ignore_errors=True)
+            shutil.rmtree(job_root, ignore_errors=True)
             raise
 
     try:
-        snapshots = await state.store.create_many(jobs)
+        snapshot = await state.store.create(job)
     except Exception:
-        for job_root in job_roots:
-            shutil.rmtree(job_root, ignore_errors=True)
+        shutil.rmtree(job_root, ignore_errors=True)
         raise
 
-    for snapshot in snapshots:
-        state.queue.put_nowait(snapshot.id)
-
-    return [snapshot.model_dump(mode="json") for snapshot in snapshots]
+    state.queue.put_nowait(snapshot.id)
+    return [snapshot.model_dump(mode="json")]
 
 
 @app.get("/api/jobs/{job_id}/download")

@@ -109,6 +109,19 @@ function outputLabel(job: RenderJob) {
   return `${job.outputs.length} file${job.outputs.length === 1 ? "" : "s"} ready`;
 }
 
+function cameraLabel(job: RenderJob) {
+  if (job.camera_names.length > 1) {
+    return `${job.camera_names.length} cameras`;
+  }
+  if (job.camera_names.length === 1) {
+    return `Camera ${job.camera_names[0]}`;
+  }
+  if (job.camera_name) {
+    return `Camera ${job.camera_name}`;
+  }
+  return null;
+}
+
 function activePhase(job: RenderJob) {
   return job.phase === "queued" || job.phase === "running";
 }
@@ -279,16 +292,19 @@ function deviceSummary(system: SystemStatus | null) {
 }
 
 function liveDetail(job: RenderJob) {
+  const cameraPrefix = job.current_camera_name
+    ? `${job.current_camera_name} • `
+    : "";
   if (job.render_mode === "animation" && job.current_frame) {
-    return `Frame ${job.current_frame} of ${job.total_frames}`;
+    return `${cameraPrefix}Frame ${job.current_frame} of ${job.total_frames}`;
   }
 
   if (job.current_sample !== null && job.total_samples) {
-    return `Sample ${job.current_sample} of ${job.total_samples}`;
+    return `${cameraPrefix}Sample ${job.current_sample} of ${job.total_samples}`;
   }
 
   return job.resolved_device
-    ? `Running on ${job.resolved_device}`
+    ? `${cameraPrefix}Running on ${job.resolved_device}`
     : "Waiting for worker";
 }
 
@@ -888,9 +904,7 @@ export function RenderDashboard() {
                         <div className="mt-3 flex flex-wrap gap-x-5 gap-y-2 text-sm text-steel">
                           <span>{frameLabel(job)}</span>
                           <span>{job.output_format}</span>
-                          {job.camera_name ? (
-                            <span>Camera {job.camera_name}</span>
-                          ) : null}
+                          {cameraLabel(job) ? <span>{cameraLabel(job)}</span> : null}
                           <span>Requested {job.requested_device}</span>
                           <span>{liveDetail(job)}</span>
                         </div>
@@ -1340,7 +1354,7 @@ export function RenderDashboard() {
                       : inspectingCameras
                         ? `Scanning ${Math.round(cameraScanProgress)}%`
                       : selectedCameraNames.length > 1 && selectedFiles.length === 1
-                        ? `Queue ${selectedCameraNames.length} camera renders`
+                        ? `Queue render for ${selectedCameraNames.length} cameras`
                       : selectedFiles.length > 1
                         ? `Queue ${selectedFiles.length} renders`
                         : "Queue render"}

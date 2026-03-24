@@ -53,6 +53,8 @@ class JobRecord(BaseModel):
     requested_device: RenderDevice = RenderDevice.auto
     resolved_device: str | None = None
     camera_name: str | None = None
+    camera_names: list[str] = Field(default_factory=list)
+    current_camera_name: str | None = None
     frame: int | None = None
     start_frame: int | None = None
     end_frame: int | None = None

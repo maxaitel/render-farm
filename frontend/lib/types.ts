@@ -18,6 +18,8 @@ export interface RenderJob {
   requested_device: string;
   resolved_device: string | null;
   camera_name: string | null;
+  camera_names: string[];
+  current_camera_name: string | null;
   frame: number | null;
   start_frame: number | null;
   end_frame: number | null;
