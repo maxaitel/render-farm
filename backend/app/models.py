@@ -72,7 +72,11 @@ class JobRecord(BaseModel):
     start_frame: int | None = None
     end_frame: int | None = None
     current_frame: int | None = None
+    current_frame_started_at: datetime | None = None
+    current_frame_elapsed_seconds: float | None = None
     total_frames: int = 1
+    last_frame_duration_seconds: float | None = None
+    average_frame_duration_seconds: float | None = None
     current_sample: int | None = None
     total_samples: int | None = None
     outputs: list[str] = Field(default_factory=list)

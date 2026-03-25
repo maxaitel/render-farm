@@ -218,6 +218,63 @@ function frameLabel(job: RenderJob) {
   return `Frames ${job.start_frame ?? 1}-${job.end_frame ?? job.start_frame ?? 1}`;
 }
 
+function formatDuration(seconds: number) {
+  const totalSeconds = Math.max(1, Math.round(seconds));
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainingSeconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  }
+  return `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s`;
+}
+
+function currentFrameValue(job: RenderJob) {
+  if (job.current_frame !== null) {
+    return job.current_frame;
+  }
+  if (job.phase !== "running") {
+    return null;
+  }
+  if (job.render_mode === "still") {
+    return job.frame;
+  }
+  return job.start_frame;
+}
+
+function currentFrameText(job: RenderJob) {
+  const frame = currentFrameValue(job);
+  if (frame === null) {
+    return null;
+  }
+  if (job.render_mode === "still") {
+    return `Current frame ${frame}`;
+  }
+  const start = job.start_frame ?? frame;
+  const end = job.end_frame ?? start;
+  return `Current frame ${frame} of ${start}-${end}`;
+}
+
+function timePerFrameText(job: RenderJob) {
+  const current =
+    job.phase === "running" ? job.current_frame_elapsed_seconds : null;
+  if (current !== null) {
+    return `Time / frame ${formatDuration(current)} so far`;
+  }
+  if (job.average_frame_duration_seconds !== null) {
+    return `Time / frame ${formatDuration(job.average_frame_duration_seconds)} avg`;
+  }
+  if (job.last_frame_duration_seconds !== null) {
+    return `Time / frame ${formatDuration(job.last_frame_duration_seconds)}`;
+  }
+  return null;
+}
+
 function cameraLabel(job: RenderJob) {
   if (job.camera_names.length > 1) {
     return `${job.camera_names.length} cameras`;
@@ -236,7 +293,9 @@ function liveDetail(job: RenderJob) {
     ? `${job.current_camera_name} • `
     : "";
   if (job.render_mode === "animation" && job.current_frame !== null) {
-    return `${cameraPrefix}Frame ${job.current_frame} of ${job.total_frames}`;
+    const start = job.start_frame ?? job.current_frame;
+    const end = job.end_frame ?? start;
+    return `${cameraPrefix}Frame ${job.current_frame} of ${start}-${end}`;
   }
   if (job.current_sample !== null && job.total_samples) {
     return `${cameraPrefix}Sample ${job.current_sample} of ${job.total_samples}`;
@@ -311,6 +370,13 @@ function upsertRun(files: UserFile[], nextRun: RenderJob) {
       (left, right) =>
         new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
     );
+}
+
+function upsertAdminRun(jobs: RenderJob[], nextRun: RenderJob) {
+  return [nextRun, ...jobs.filter((job) => job.id !== nextRun.id)].sort(
+    (left, right) =>
+      new Date(right.created_at).getTime() - new Date(left.created_at).getTime(),
+  );
 }
 
 function TopBar({
@@ -644,6 +710,29 @@ function FileGrid({ files }: { files: UserFile[] }) {
               <span>{formatBytes(file.original_size_bytes)}</span>
               <span>{file.jobs.length} run{file.jobs.length === 1 ? "" : "s"}</span>
             </div>
+            {file.latest_job ? (
+              <div className="space-y-2 rounded-lg border bg-muted/20 p-3 text-sm">
+                <p className="text-muted-foreground">
+                  {cameraLabel(file.latest_job)} • {frameLabel(file.latest_job)}
+                </p>
+                <p className="text-foreground/80">
+                  {activePhase(file.latest_job)
+                    ? liveDetail(file.latest_job)
+                    : file.latest_job.error || file.latest_job.status_message}
+                </p>
+                {currentFrameText(file.latest_job) || timePerFrameText(file.latest_job) ? (
+                  <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                    {currentFrameText(file.latest_job) ? (
+                      <span>{currentFrameText(file.latest_job)}</span>
+                    ) : null}
+                    {timePerFrameText(file.latest_job) ? (
+                      <span>{timePerFrameText(file.latest_job)}</span>
+                    ) : null}
+                  </div>
+                ) : null}
+                {activePhase(file.latest_job) ? <Progress value={file.latest_job.progress} /> : null}
+              </div>
+            ) : null}
             <Button asChild className="w-full" variant="outline">
               <Link href={`/files/${file.id}`}>
                 Open scene
@@ -966,6 +1055,12 @@ function FileDetailView({
                           ? liveDetail(job)
                           : job.error || job.status_message}
                       </p>
+                      {currentFrameText(job) || timePerFrameText(job) ? (
+                        <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground">
+                          {currentFrameText(job) ? <span>{currentFrameText(job)}</span> : null}
+                          {timePerFrameText(job) ? <span>{timePerFrameText(job)}</span> : null}
+                        </div>
+                      ) : null}
                     </div>
                     {job.archive_path ? (
                       <Button asChild size="sm" variant="outline">
@@ -1014,6 +1109,23 @@ function AdminView({
   adminUsers: UserAccount[];
   onStatusChange: (userId: number, status: UserStatus) => void;
 }) {
+  const runningRuns = adminRuns
+    .filter((job) => job.phase === "running")
+    .sort(
+      (left, right) =>
+        new Date(left.started_at ?? left.created_at).getTime() -
+        new Date(right.started_at ?? right.created_at).getTime(),
+    );
+  const queuedRuns = adminRuns
+    .filter((job) => job.phase === "queued")
+    .sort(
+      (left, right) =>
+        new Date(left.created_at).getTime() - new Date(right.created_at).getTime(),
+    );
+  const recentFinishedRuns = adminRuns.filter(
+    (job) => job.phase === "completed" || job.phase === "failed",
+  );
+
   return (
     <div className="space-y-6">
       <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-6">
@@ -1034,6 +1146,120 @@ function AdminView({
             </CardContent>
           </Card>
         ))}
+      </div>
+
+      <div className="grid gap-6 xl:grid-cols-2">
+        <Card className="subtle-panel rounded-2xl shadow-none">
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold">Running jobs</CardTitle>
+            <CardDescription>
+              Live renders with progress, frame state, and log tails.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {runningRuns.length ? (
+              runningRuns.map((job) => (
+                <Card className="rounded-xl shadow-none" key={job.id}>
+                  <CardContent className="space-y-4 p-4">
+                    <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Badge variant={runBadgeVariant(job)}>{job.phase}</Badge>
+                          <span className="text-sm font-medium">{job.source_filename}</span>
+                        </div>
+                        <p className="text-sm text-muted-foreground">
+                          User {job.user_id} • {cameraLabel(job)} • {frameLabel(job)}
+                        </p>
+                        <p className="text-sm text-muted-foreground">
+                          Queued {formatTimestamp(job.created_at)}
+                        </p>
+                        <p className="text-sm text-foreground/80">{liveDetail(job)}</p>
+                        {currentFrameText(job) || timePerFrameText(job) ? (
+                          <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground">
+                            {currentFrameText(job) ? <span>{currentFrameText(job)}</span> : null}
+                            {timePerFrameText(job) ? <span>{timePerFrameText(job)}</span> : null}
+                          </div>
+                        ) : null}
+                      </div>
+                      {job.archive_path ? (
+                        <Button asChild size="sm" variant="outline">
+                          <a href={`/backend/api/jobs/${job.id}/download`}>
+                            <Download />
+                            Download
+                          </a>
+                        </Button>
+                      ) : null}
+                    </div>
+                    <Progress value={job.progress} />
+                    {job.logs_tail.length ? (
+                      <details className="rounded-md border bg-muted/30 p-3">
+                        <summary className="cursor-pointer text-sm font-medium">
+                          Log tail
+                        </summary>
+                        <pre className="mt-3 overflow-x-auto whitespace-pre-wrap text-xs text-muted-foreground">
+                          {job.logs_tail.join("\n")}
+                        </pre>
+                      </details>
+                    ) : null}
+                  </CardContent>
+                </Card>
+              ))
+            ) : (
+              <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
+                No renders are running right now.
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="subtle-panel rounded-2xl shadow-none">
+          <CardHeader>
+            <CardTitle className="text-lg font-semibold">Queue</CardTitle>
+            <CardDescription>
+              Jobs waiting for a worker slot.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {queuedRuns.length ? (
+              queuedRuns.map((job) => (
+                <Card className="rounded-xl shadow-none" key={job.id}>
+                  <CardContent className="space-y-4 p-4">
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge variant={runBadgeVariant(job)}>{job.phase}</Badge>
+                        <span className="text-sm font-medium">{job.source_filename}</span>
+                      </div>
+                      <p className="text-sm text-muted-foreground">
+                        User {job.user_id} • {cameraLabel(job)} • {frameLabel(job)}
+                      </p>
+                      <p className="text-sm text-muted-foreground">
+                        Queued {formatTimestamp(job.created_at)}
+                      </p>
+                      <p className="text-sm text-foreground/80">
+                        {job.error || job.status_message}
+                      </p>
+                    </div>
+                    <Progress value={job.progress} />
+                    {job.logs_tail.length ? (
+                      <details className="rounded-md border bg-muted/30 p-3">
+                        <summary className="cursor-pointer text-sm font-medium">
+                          Log tail
+                        </summary>
+                        <pre className="mt-3 overflow-x-auto whitespace-pre-wrap text-xs text-muted-foreground">
+                          {job.logs_tail.join("\n")}
+                        </pre>
+                      </details>
+                    ) : null}
+                  </CardContent>
+                </Card>
+              ))
+            ) : (
+              <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
+                The queue is empty.
+              </div>
+            )}
+          </CardContent>
+        </Card>
       </div>
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
@@ -1089,20 +1315,33 @@ function AdminView({
           </Card>
           <Card className="subtle-panel rounded-2xl shadow-none">
             <CardHeader>
-              <CardTitle className="text-lg font-semibold">Recent runs</CardTitle>
+              <CardTitle className="text-lg font-semibold">Recent finished runs</CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
-              {adminRuns.slice(0, 8).map((job) => (
+              {recentFinishedRuns.slice(0, 8).map((job) => (
                 <div className="rounded-lg border p-4" key={job.id}>
                   <div className="flex items-center justify-between gap-3">
                     <p className="truncate text-sm font-medium">{job.source_filename}</p>
                     <Badge variant={runBadgeVariant(job)}>{job.phase}</Badge>
                   </div>
                   <p className="mt-2 text-xs text-muted-foreground">
-                    {cameraLabel(job)} • {frameLabel(job)}
+                    User {job.user_id} • {cameraLabel(job)} • {frameLabel(job)}
                   </p>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    {job.error || job.status_message}
+                  </p>
+                  {timePerFrameText(job) ? (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      {timePerFrameText(job)}
+                    </p>
+                  ) : null}
                 </div>
               ))}
+              {!recentFinishedRuns.length ? (
+                <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
+                  No completed or failed jobs yet.
+                </div>
+              ) : null}
             </CardContent>
           </Card>
         </div>
@@ -1144,7 +1383,11 @@ export function RenderDashboard({
   const [adminRuns, setAdminRuns] = useState<RenderJob[]>([]);
   const sourcesRef = useRef<Map<string, EventSource>>(new Map());
   const activeJobIds = Array.from(
-    new Set(files.flatMap((file) => file.jobs).filter(activePhase).map((job) => job.id)),
+    new Set(
+      (view === "admin" ? adminRuns : files.flatMap((file) => file.jobs))
+        .filter(activePhase)
+        .map((job) => job.id),
+    ),
   ).sort();
   const activeJobIdsKey = JSON.stringify(activeJobIds);
   const activeJobSessionKey =
@@ -1291,6 +1534,9 @@ export function RenderDashboard({
       source.onmessage = (event) => {
         const payload = JSON.parse(event.data) as RenderJob;
         setFiles((current) => upsertRun(current, payload));
+        if (view === "admin") {
+          setAdminRuns((current) => upsertAdminRun(current, payload));
+        }
       };
       source.onerror = () => {
         source.close();
@@ -1298,7 +1544,7 @@ export function RenderDashboard({
       };
       sourcesRef.current.set(jobId, source);
     });
-  }, [activeJobIdsKey, activeJobSessionKey]);
+  }, [activeJobIdsKey, activeJobSessionKey, view]);
 
   useEffect(() => {
     return () => {
