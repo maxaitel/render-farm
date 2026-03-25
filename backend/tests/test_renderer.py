@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
+from math import isclose
 from pathlib import Path
 from zipfile import ZipFile
 
 from app.config import Settings
 from app.models import JobPhase, JobRecord, OutputFormat, RenderDevice, RenderMode, UserFileRecord, UserStatus
-from app.renderer import RenderRunner
+from app.renderer import ProgressTracker, RenderRunner
 from app.store import JobStore
 
 
@@ -267,3 +269,65 @@ def test_animation_command_preserves_zero_start_frame(tmp_path: Path) -> None:
 
     assert command[command.index("-s") + 1] == "0"
     assert command[command.index("-e") + 1] == "24"
+
+
+def test_frame_timing_tracks_last_and_average_duration(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(
+        storage_root=tmp_path,
+        blender_binary="/bin/true",
+        default_device="AUTO",
+        gpu_order=["CPU"],
+        disable_worker=True,
+        session_cookie_name="renderfarm_session",
+        session_ttl_hours=24,
+        auth_cookie_secure="false",
+        admin_panel_path="control-tower",
+        admin_bootstrap_username=None,
+        admin_bootstrap_password=None,
+        allow_signups=True,
+        trusted_proxies=[],
+    )
+    store = JobStore(settings.database_path)
+    runner = RenderRunner(settings, store)
+
+    source_path = tmp_path / "scene.blend"
+    source_path.write_bytes(b"blend-data")
+
+    job = JobRecord(
+        id="anim-timing",
+        user_id=1,
+        file_id="file001",
+        source_filename="scene.blend",
+        source_path=str(source_path),
+        output_directory=str(tmp_path / "outputs"),
+        render_mode=RenderMode.animation,
+        output_format=OutputFormat.png,
+        requested_device=RenderDevice.auto,
+        start_frame=10,
+        end_frame=12,
+        total_frames=3,
+    )
+    tracker = ProgressTracker(total_frames=runner._total_frames(job))
+
+    timestamps = iter(
+        [
+            datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, 0, 0, 5, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, 0, 0, 12, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, 0, 0, 20, tzinfo=timezone.utc),
+        ]
+    )
+    monkeypatch.setattr("app.renderer.utc_now", lambda: next(timestamps))
+
+    runner._parse_progress(job, tracker, "Fra:10 Mem:1.00M", None)
+    runner._parse_progress(job, tracker, "Fra:11 Mem:1.00M", None)
+    runner._parse_progress(job, tracker, "Fra:12 Mem:1.00M", None)
+    runner._complete_active_frame(tracker)
+
+    assert tracker.completed_frame_count == 3
+    assert tracker.last_frame_duration_seconds is not None
+    assert isclose(tracker.last_frame_duration_seconds, 8.0)
+    assert isclose(tracker.total_completed_frame_duration, 20.0)
+    average_duration = runner._average_frame_duration(tracker)
+    assert average_duration is not None
+    assert isclose(average_duration, 20.0 / 3.0)

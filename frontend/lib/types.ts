@@ -28,7 +28,11 @@ export interface RenderJob {
   start_frame: number | null;
   end_frame: number | null;
   current_frame: number | null;
+  current_frame_started_at: string | null;
+  current_frame_elapsed_seconds: number | null;
   total_frames: number;
+  last_frame_duration_seconds: number | null;
+  average_frame_duration_seconds: number | null;
   current_sample: number | null;
   total_samples: number | null;
   outputs: string[];

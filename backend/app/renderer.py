@@ -8,6 +8,7 @@ import shutil
 import tempfile
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -31,7 +32,11 @@ SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 @dataclass(slots=True)
 class ProgressTracker:
     current_frame: int | None = None
+    current_frame_started_at: datetime | None = None
     total_frames: int = 1
+    last_frame_duration_seconds: float | None = None
+    total_completed_frame_duration: float = 0.0
+    completed_frame_count: int = 0
     current_sample: int | None = None
     total_samples: int | None = None
     current_tile: int | None = None
@@ -111,6 +116,10 @@ class RenderRunner:
         job.outputs = []
         job.archive_path = None
         job.current_camera_name = None
+        job.current_frame_started_at = None
+        job.current_frame_elapsed_seconds = None
+        job.last_frame_duration_seconds = None
+        job.average_frame_duration_seconds = None
         job.status_message = "Starting Blender render process."
 
     def _prepare_attempt(self, job: JobRecord, device: str) -> None:
@@ -119,6 +128,10 @@ class RenderRunner:
         job.status_message = f"Rendering on {device}."
         job.current_camera_name = None
         job.current_frame = None
+        job.current_frame_started_at = None
+        job.current_frame_elapsed_seconds = None
+        job.last_frame_duration_seconds = None
+        job.average_frame_duration_seconds = None
         job.current_sample = None
         job.total_samples = None
         job.logs_tail = []
@@ -132,6 +145,8 @@ class RenderRunner:
         job.status_message = "Render complete."
         job.error = None
         job.current_camera_name = None
+        job.current_frame_started_at = None
+        job.current_frame_elapsed_seconds = None
         if job.render_mode == RenderMode.still and job.frame is not None:
             job.current_frame = job.frame
         elif job.end_frame is not None:
@@ -141,6 +156,8 @@ class RenderRunner:
         job.phase = JobPhase.failed
         job.finished_at = utc_now()
         job.status_message = "Render failed."
+        job.current_frame_started_at = None
+        job.current_frame_elapsed_seconds = None
         job.error = reason
 
     def _device_attempts(self, requested: RenderDevice) -> list[str]:
@@ -230,6 +247,18 @@ class RenderRunner:
                 )
 
         exit_code = await process.wait()
+        if exit_code == 0:
+            self._complete_active_frame(tracker)
+            await self.store.mutate(
+                job.id,
+                lambda item, tracker_state=tracker, current_camera=camera_name: self._apply_progress(
+                    item,
+                    item.progress,
+                    tracker_state,
+                    item.status_message,
+                    current_camera,
+                ),
+            )
         return exit_code == 0, list(lines), retryable_gpu_error
 
     def _build_command(
@@ -319,7 +348,7 @@ class RenderRunner:
         camera_prefix = self._camera_message_prefix(camera_name)
         frame_match = FRAME_RE.search(line)
         if frame_match:
-            tracker.current_frame = int(frame_match.group(1))
+            self._track_frame_change(tracker, int(frame_match.group(1)))
             message = f"{camera_prefix} rendering frame {tracker.current_frame}."
 
         sample_match = SAMPLE_RE.search(line) or PATH_SAMPLE_RE.search(line)
@@ -333,6 +362,14 @@ class RenderRunner:
             tracker.current_tile = int(tile_match.group(1))
             tracker.total_tiles = int(tile_match.group(2))
             message = f"{camera_prefix} tile {tracker.current_tile}/{tracker.total_tiles}."
+
+        if message and tracker.current_frame_started_at is None:
+            tracker.current_frame_started_at = utc_now()
+            if tracker.current_frame is None:
+                if job.render_mode == RenderMode.still and job.frame is not None:
+                    tracker.current_frame = job.frame
+                elif job.start_frame is not None:
+                    tracker.current_frame = job.start_frame
 
         if tracker.total_frames <= 0:
             tracker.total_frames = 1
@@ -373,7 +410,11 @@ class RenderRunner:
         job.progress = progress
         job.current_camera_name = camera_name
         job.current_frame = tracker.current_frame
+        job.current_frame_started_at = tracker.current_frame_started_at
+        job.current_frame_elapsed_seconds = self._current_frame_elapsed_seconds(tracker)
         job.total_frames = tracker.total_frames
+        job.last_frame_duration_seconds = tracker.last_frame_duration_seconds
+        job.average_frame_duration_seconds = self._average_frame_duration(tracker)
         job.current_sample = tracker.current_sample
         job.total_samples = tracker.total_samples
         if message:
@@ -388,13 +429,52 @@ class RenderRunner:
         device: str,
     ) -> None:
         job.current_camera_name = camera_name
-        job.current_frame = None
+        if job.render_mode == RenderMode.still and job.frame is not None:
+            job.current_frame = job.frame
+        elif job.start_frame is not None:
+            job.current_frame = job.start_frame
+        else:
+            job.current_frame = None
+        job.current_frame_started_at = None
+        job.current_frame_elapsed_seconds = None
+        job.last_frame_duration_seconds = None
+        job.average_frame_duration_seconds = None
         job.current_sample = None
         job.total_samples = None
         job.total_frames = self._total_frames(job)
         job.progress = self._overall_progress(camera_index, total_cameras, 2.0)
         camera_position = f" ({camera_index + 1}/{total_cameras})" if total_cameras > 1 else ""
         job.status_message = f"Rendering {self._camera_message_prefix(camera_name)}{camera_position} on {device}."
+
+    def _track_frame_change(self, tracker: ProgressTracker, frame_number: int) -> None:
+        if tracker.current_frame == frame_number:
+            if tracker.current_frame_started_at is None:
+                tracker.current_frame_started_at = utc_now()
+            return
+
+        self._complete_active_frame(tracker)
+        tracker.current_frame = frame_number
+        tracker.current_frame_started_at = utc_now()
+
+    def _complete_active_frame(self, tracker: ProgressTracker) -> None:
+        if tracker.current_frame is None or tracker.current_frame_started_at is None:
+            return
+
+        duration = max(0.0, (utc_now() - tracker.current_frame_started_at).total_seconds())
+        tracker.last_frame_duration_seconds = duration
+        tracker.total_completed_frame_duration += duration
+        tracker.completed_frame_count += 1
+        tracker.current_frame_started_at = None
+
+    def _average_frame_duration(self, tracker: ProgressTracker) -> float | None:
+        if tracker.completed_frame_count <= 0:
+            return None
+        return tracker.total_completed_frame_duration / tracker.completed_frame_count
+
+    def _current_frame_elapsed_seconds(self, tracker: ProgressTracker) -> float | None:
+        if tracker.current_frame_started_at is None:
+            return None
+        return max(0.0, (utc_now() - tracker.current_frame_started_at).total_seconds())
 
     def _should_retry(self, device: str, retryable_gpu_error: bool) -> bool:
         return device != "CPU" and retryable_gpu_error
