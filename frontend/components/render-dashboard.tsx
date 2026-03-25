@@ -79,7 +79,7 @@ type JobFormState = {
 const INITIAL_FORM: JobFormState = {
   renderMode: "still",
   frame: 1,
-  startFrame: 1,
+  startFrame: 0,
   endFrame: 24,
   outputFormat: "PNG",
 };
@@ -834,13 +834,13 @@ function FileDetailView({
                     <label className="space-y-2 text-sm font-medium">
                       <span>Start</span>
                       <Input
-                        min={1}
+                        min={0}
                         type="number"
                         value={form.startFrame}
                         onChange={(event) =>
                           setForm((current) => ({
                             ...current,
-                            startFrame: Number(event.target.value || 1),
+                            startFrame: Number(event.target.value || 0),
                           }))
                         }
                       />

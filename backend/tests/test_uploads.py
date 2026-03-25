@@ -161,6 +161,55 @@ def test_admin_can_approve_user_upload_scene_and_queue_run(tmp_path: Path) -> No
         _restore_env(previous)
 
 
+def test_animation_run_can_start_at_frame_zero(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with _client() as client:
+            create_user_response = client.post(
+                "/api/auth/sign-up",
+                json={"username": "artist_zero", "password": "artist-password-000"},
+            )
+            assert create_user_response.status_code == 200
+            pending_user_id = create_user_response.json()["user"]["id"]
+
+            _sign_in(client, "admin", "admin-password-123")
+            approve_response = client.post(
+                f"/api/admin/users/{pending_user_id}/status",
+                json={"status": "approved"},
+                headers={"x-forwarded-for": "127.0.0.1"},
+            )
+            assert approve_response.status_code == 200
+
+        with _client() as user_client:
+            _sign_in(user_client, "artist_zero", "artist-password-000")
+
+            upload_response = user_client.post(
+                "/api/files",
+                data=[("blend_file_path", "Scene 0.blend")],
+                files=[("blend_file", ("Scene 0.blend", b"blend-bytes", "application/octet-stream"))],
+            )
+            assert upload_response.status_code == 200, upload_response.text
+            file_payload = upload_response.json()
+
+            run_response = user_client.post(
+                f"/api/files/{file_payload['id']}/runs",
+                data={
+                    "render_mode": "animation",
+                    "output_format": "PNG",
+                    "device_preference": "AUTO",
+                    "start_frame": "0",
+                    "end_frame": "24",
+                },
+            )
+            assert run_response.status_code == 200, run_response.text
+            run_payload = run_response.json()
+            assert run_payload["start_frame"] == 0
+            assert run_payload["end_frame"] == 24
+            assert run_payload["total_frames"] == 25
+    finally:
+        _restore_env(previous)
+
+
 def test_non_admin_user_cannot_access_admin_routes(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:

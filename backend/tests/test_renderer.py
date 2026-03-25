@@ -119,3 +119,49 @@ def test_multi_camera_render_creates_single_archive_with_camera_named_outputs(
             await store.close()
 
     asyncio.run(scenario())
+
+
+def test_animation_command_preserves_zero_start_frame(tmp_path: Path) -> None:
+    settings = Settings(
+        storage_root=tmp_path,
+        blender_binary="/bin/true",
+        default_device="AUTO",
+        gpu_order=["CPU"],
+        disable_worker=True,
+        session_cookie_name="renderfarm_session",
+        session_ttl_hours=24,
+        auth_cookie_secure="false",
+        admin_panel_path="control-tower",
+        admin_bootstrap_username=None,
+        admin_bootstrap_password=None,
+        allow_signups=True,
+        trusted_proxies=[],
+    )
+    store = JobStore(settings.database_path)
+    runner = RenderRunner(settings, store)
+
+    job_root = settings.jobs_root / "anim000"
+    output_dir = job_root / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_path = tmp_path / "scene.blend"
+    source_path.write_bytes(b"blend-data")
+
+    job = JobRecord(
+        id="anim000",
+        user_id=1,
+        file_id="file001",
+        source_filename="scene.blend",
+        source_path=str(source_path),
+        output_directory=str(output_dir),
+        render_mode=RenderMode.animation,
+        output_format=OutputFormat.png,
+        requested_device=RenderDevice.auto,
+        start_frame=0,
+        end_frame=24,
+        total_frames=25,
+    )
+
+    command = runner._build_command(job, "CPU", None, 0, 1)
+
+    assert command[command.index("-s") + 1] == "0"
+    assert command[command.index("-e") + 1] == "24"
