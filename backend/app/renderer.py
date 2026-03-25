@@ -258,15 +258,17 @@ class RenderRunner:
             "1",
         ]
         if job.render_mode == RenderMode.still:
-            frame = job.frame or 1
+            frame = 1 if job.frame is None else job.frame
             command.extend(["-f", str(frame)])
         else:
+            start_frame = 0 if job.start_frame is None else job.start_frame
+            end_frame = start_frame if job.end_frame is None else job.end_frame
             command.extend(
                 [
                     "-s",
-                    str(job.start_frame or 1),
+                    str(start_frame),
                     "-e",
-                    str(job.end_frame or job.start_frame or 1),
+                    str(end_frame),
                     "-a",
                 ]
             )
@@ -416,8 +418,8 @@ class RenderRunner:
     def _total_frames(self, job: JobRecord) -> int:
         if job.render_mode == RenderMode.still:
             return 1
-        start = job.start_frame or 1
-        end = job.end_frame or start
+        start = 0 if job.start_frame is None else job.start_frame
+        end = start if job.end_frame is None else job.end_frame
         return max(1, end - start + 1)
 
     def _requested_cameras(self, job: JobRecord) -> list[str | None]:

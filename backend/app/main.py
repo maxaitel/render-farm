@@ -338,13 +338,13 @@ async def create_render_run(
     state = runtime_state()
 
     if render_mode == RenderMode.still:
-        frame = frame or 1
+        frame = 1 if frame is None else frame
         start_frame = None
         end_frame = None
         total_frames = 1
     else:
-        start_frame = start_frame or 1
-        end_frame = end_frame or start_frame
+        start_frame = 0 if start_frame is None else start_frame
+        end_frame = start_frame if end_frame is None else end_frame
         if end_frame < start_frame:
             raise HTTPException(status_code=400, detail="End frame must be greater than or equal to start frame.")
         frame = None
