@@ -2,7 +2,7 @@
 	admin off
 }
 
-{$CADDY_SITE_ADDRESS:renders.maxaitel.org} {
+{$CADDY_SITE_ADDRESS:localhost} {
 	encode zstd gzip
 
 	handle_path /backend/* {

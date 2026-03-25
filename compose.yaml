@@ -2,7 +2,7 @@ services:
   caddy:
     image: caddy:2-alpine
     environment:
-      CADDY_SITE_ADDRESS: ${CADDY_SITE_ADDRESS:-renders.maxaitel.org}
+      CADDY_SITE_ADDRESS: ${CADDY_SITE_ADDRESS:-localhost}
     ports:
       - "80:80"
       - "443:443"
