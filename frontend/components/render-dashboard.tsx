@@ -235,7 +235,7 @@ function liveDetail(job: RenderJob) {
   const cameraPrefix = job.current_camera_name
     ? `${job.current_camera_name} • `
     : "";
-  if (job.render_mode === "animation" && job.current_frame) {
+  if (job.render_mode === "animation" && job.current_frame !== null) {
     return `${cameraPrefix}Frame ${job.current_frame} of ${job.total_frames}`;
   }
   if (job.current_sample !== null && job.total_samples) {
