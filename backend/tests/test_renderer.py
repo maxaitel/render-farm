@@ -331,3 +331,56 @@ def test_frame_timing_tracks_last_and_average_duration(tmp_path: Path, monkeypat
     average_duration = runner._average_frame_duration(tracker)
     assert average_duration is not None
     assert isclose(average_duration, 20.0 / 3.0)
+
+
+def test_progress_parser_handles_blender_stat_spacing(tmp_path: Path) -> None:
+    settings = Settings(
+        storage_root=tmp_path,
+        blender_binary="/bin/true",
+        default_device="AUTO",
+        gpu_order=["CPU"],
+        disable_worker=True,
+        session_cookie_name="renderfarm_session",
+        session_ttl_hours=24,
+        auth_cookie_secure="false",
+        admin_panel_path="control-tower",
+        admin_bootstrap_username=None,
+        admin_bootstrap_password=None,
+        allow_signups=True,
+        trusted_proxies=[],
+    )
+    store = JobStore(settings.database_path)
+    runner = RenderRunner(settings, store)
+
+    source_path = tmp_path / "scene.blend"
+    source_path.write_bytes(b"blend-data")
+
+    job = JobRecord(
+        id="anim-spacing",
+        user_id=1,
+        file_id="file001",
+        source_filename="scene.blend",
+        source_path=str(source_path),
+        output_directory=str(tmp_path / "outputs"),
+        render_mode=RenderMode.animation,
+        output_format=OutputFormat.png,
+        requested_device=RenderDevice.auto,
+        start_frame=0,
+        end_frame=24,
+        total_frames=25,
+    )
+    tracker = ProgressTracker(total_frames=runner._total_frames(job))
+
+    progress, message = runner._parse_progress(
+        job,
+        tracker,
+        "Fra: 17 | Remaining: 10:27.76 | Mem: 1978M | Sample 64/2048",
+        None,
+    )
+
+    assert tracker.current_frame == 17
+    assert tracker.current_sample == 64
+    assert tracker.total_samples == 2048
+    assert message == "Default camera sample 64/2048."
+    assert progress is not None
+    assert progress > 68.0

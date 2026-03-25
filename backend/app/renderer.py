@@ -17,11 +17,11 @@ from .config import Settings
 from .models import JobPhase, JobRecord, RenderDevice, RenderMode, utc_now
 from .store import JobStore
 
-FRAME_RE = re.compile(r"Fra:(\d+)")
-SAMPLE_RE = re.compile(r"Sample (\d+)/(\d+)")
-PATH_SAMPLE_RE = re.compile(r"Path Tracing Sample (\d+)/(\d+)")
-TILE_RE = re.compile(r"Rendered (\d+)/(\d+) Tiles")
-PATH_TILE_RE = re.compile(r"Path Tracing Tile (\d+)/(\d+)")
+FRAME_RE = re.compile(r"Fra:\s*(\d+)")
+SAMPLE_RE = re.compile(r"Sample\s+(\d+)\s*/\s*(\d+)")
+PATH_SAMPLE_RE = re.compile(r"Path Tracing Sample\s+(\d+)\s*/\s*(\d+)")
+TILE_RE = re.compile(r"Rendered\s+(\d+)\s*/\s*(\d+)\s+Tiles")
+PATH_TILE_RE = re.compile(r"Path Tracing Tile\s+(\d+)\s*/\s*(\d+)")
 GPU_ERROR_RE = re.compile(
     r"(No compatible GPUs found|CUDA.+unavailable|OPTIX.+unavailable|is not a valid Cycles device|device type .* not available|Found no Cycles device of the specified type)",
     re.IGNORECASE,
