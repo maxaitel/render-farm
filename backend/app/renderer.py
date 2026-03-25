@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -60,7 +61,7 @@ class RenderRunner:
                 lambda item, current=device: self._prepare_attempt(item, current),
             )
             self._reset_output_dir(job.output_dir)
-            success, combined_output = await self._run_attempt(job, device)
+            success, combined_output, retryable_gpu_error = await self._run_attempt(job, device)
             if success:
                 outputs = self._collect_outputs(job.output_dir)
                 archive_path = await self._create_archive(job.id, outputs)
@@ -81,7 +82,7 @@ class RenderRunner:
                 )
                 return
             collected_error = combined_output.strip() or "Blender exited with an error."
-            if index == len(attempts) - 1 or not self._should_retry(device, combined_output):
+            if index == len(attempts) - 1 or not self._should_retry(device, retryable_gpu_error):
                 break
             await self.store.append_log(
                 job_id,
@@ -153,10 +154,10 @@ class RenderRunner:
             return seen
         return [requested.value]
 
-    async def _run_attempt(self, job: JobRecord, device: str) -> tuple[bool, str]:
+    async def _run_attempt(self, job: JobRecord, device: str) -> tuple[bool, str, bool]:
         requested_cameras = self._requested_cameras(job)
         total_cameras = len(requested_cameras)
-        all_lines: list[str] = []
+        all_lines: deque[str] = deque(maxlen=80)
 
         for camera_index, camera_name in enumerate(requested_cameras):
             job = await self.store.mutate(
@@ -173,7 +174,7 @@ class RenderRunner:
                     current_device,
                 ),
             )
-            success, lines = await self._run_camera_attempt(
+            success, lines, retryable_gpu_error = await self._run_camera_attempt(
                 job,
                 device,
                 camera_name,
@@ -182,8 +183,8 @@ class RenderRunner:
             )
             all_lines.extend(lines)
             if not success:
-                return False, "\n".join(all_lines[-80:])
-        return True, "\n".join(all_lines[-80:])
+                return False, "\n".join(all_lines), retryable_gpu_error
+        return True, "\n".join(all_lines), False
 
     async def _run_camera_attempt(
         self,
@@ -192,7 +193,7 @@ class RenderRunner:
         camera_name: str | None,
         camera_index: int,
         total_cameras: int,
-    ) -> tuple[bool, list[str]]:
+    ) -> tuple[bool, list[str], bool]:
         tracker = ProgressTracker(total_frames=self._total_frames(job))
         command = self._build_command(job, device, camera_name, camera_index, total_cameras)
         process = await asyncio.create_subprocess_exec(
@@ -202,11 +203,13 @@ class RenderRunner:
             env=self._blender_env(camera_name),
         )
 
-        lines: list[str] = []
+        lines: deque[str] = deque(maxlen=80)
+        retryable_gpu_error = False
         assert process.stdout is not None
         async for raw_line in process.stdout:
             line = raw_line.decode("utf-8", errors="replace").rstrip()
             lines.append(line)
+            retryable_gpu_error = retryable_gpu_error or bool(GPU_ERROR_RE.search(line))
             await self.store.append_log(job.id, line)
             progress, message = self._parse_progress(job, tracker, line, camera_name)
             if progress is not None:
@@ -227,7 +230,7 @@ class RenderRunner:
                 )
 
         exit_code = await process.wait()
-        return exit_code == 0, lines[-80:]
+        return exit_code == 0, list(lines), retryable_gpu_error
 
     def _build_command(
         self,
@@ -391,8 +394,8 @@ class RenderRunner:
         camera_position = f" ({camera_index + 1}/{total_cameras})" if total_cameras > 1 else ""
         job.status_message = f"Rendering {self._camera_message_prefix(camera_name)}{camera_position} on {device}."
 
-    def _should_retry(self, device: str, output: str) -> bool:
-        return device != "CPU" and bool(GPU_ERROR_RE.search(output))
+    def _should_retry(self, device: str, retryable_gpu_error: bool) -> bool:
+        return device != "CPU" and retryable_gpu_error
 
     def _collect_outputs(self, output_dir: Path) -> list[Path]:
         return sorted(path for path in output_dir.glob("*") if path.is_file())

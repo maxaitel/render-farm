@@ -2,8 +2,9 @@
 
 Containerized Blender render queue. The stack exposes:
 
-- `web`: Next.js dashboard on host port `3100`
-- `api`: FastAPI render service on port `8000`
+- `caddy`: reverse proxy entrypoint on host port `3100`
+- `web`: internal Next.js dashboard service
+- `api`: internal FastAPI render service
 
 ## What It Does
 
@@ -29,6 +30,10 @@ Before doing that for a real deployment, copy [.env.example](/home/maxaitel/rend
 
 Then open `http://localhost:3100`.
 
+By default, Caddy serves `http://localhost` inside Docker and publishes that on
+`WEB_PORT`, so the stack stays self-contained and does not require host-level
+proxy or certificate setup.
+
 The first admin login uses the bootstrap credentials above. New sign-ups stay in
 the `pending` state until that admin approves them from the hidden admin route:
 
@@ -37,7 +42,7 @@ the `pending` state until that admin approves them from the hidden admin route:
 That route is also restricted to private/LAN client IPs.
 The API trusts forwarded client IP headers only from `TRUSTED_PROXIES`, which
 defaults to the local host and Docker bridge addresses used by the bundled
-`web -> api` proxy path.
+`caddy -> api` and `web -> api` proxy paths.
 
 ## Requirements
 
@@ -96,7 +101,7 @@ You can change that in [compose.yaml](/home/maxaitel/render-farm/compose.yaml) w
 - `BLENDER_CYCLES_DEVICE`
 - `BLENDER_GPU_ORDER`
 - `WEB_PORT`
-- `API_PORT`
+- `CADDY_SITE_ADDRESS`
 - `LOCAL_UID`
 - `LOCAL_GID`
 - `ADMIN_BOOTSTRAP_USERNAME`
@@ -113,6 +118,10 @@ old `jobs/*/job.json` payloads. Start from the current schema in
 
 ## Frontend Notes
 
+- Caddy runs inside the same Compose project, so the stack stays self-contained
+  and does not require installing or configuring a host-level reverse proxy.
+- Caddy sends `/backend/*` directly to the API service and everything else to
+  the Next.js frontend.
 - The frontend uses relative asset URLs so it can still load correctly through
   forwarded ports and path-prefixed proxies.
 - The web image copies `.next/static` into the standalone output so the Next.js

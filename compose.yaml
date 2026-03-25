@@ -1,7 +1,25 @@
 services:
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      CADDY_SITE_ADDRESS: ${CADDY_SITE_ADDRESS:-renders.maxaitel.org}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - api
+
   api:
     build:
       context: ./backend
+    runtime: nvidia
+    gpus: all
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     environment:
       RENDER_STORAGE_ROOT: /data
@@ -13,19 +31,11 @@ services:
       ADMIN_PANEL_PATH: ${ADMIN_PANEL_PATH:-control-tower}
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-auto}
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1,::1,172.16.0.0/12}
-    ports:
-      - "${API_PORT:-8000}:8000"
+    expose:
+      - "8000"
     volumes:
       - ./data:/data
       - ./backend/.blender-build_release_headless:/blender:ro
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities:
-                - gpu
 
   web:
     build:
@@ -37,7 +47,11 @@ services:
       BACKEND_ORIGIN: http://api:8000
       NODE_ENV: production
       NEXT_PUBLIC_ADMIN_PANEL_PATH: ${ADMIN_PANEL_PATH:-control-tower}
-    ports:
-      - "${WEB_PORT:-3100}:3000"
+    expose:
+      - "3000"
     depends_on:
       - api
+
+volumes:
+  caddy_data:
+  caddy_config:
