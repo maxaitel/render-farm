@@ -715,6 +715,7 @@ function PendingScreen({
 function UploadCard({
   onFileChange,
   onFolderChange,
+  onCancelUpload,
   onModeChange,
   onSubmit,
   selectedBlendFile,
@@ -726,6 +727,7 @@ function UploadCard({
 }: {
   onFileChange: (event: ChangeEvent<HTMLInputElement>) => void;
   onFolderChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onCancelUpload: () => void;
   onModeChange: (mode: UploadSourceMode) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   selectedBlendFile: File | null;
@@ -750,14 +752,24 @@ function UploadCard({
             value={uploadSourceMode}
           >
             <TabsList className="grid w-full max-w-[26rem] grid-cols-2">
-              <TabsTrigger value="file">Single blend</TabsTrigger>
-              <TabsTrigger value="folder">Project folder</TabsTrigger>
+              <TabsTrigger disabled={uploading} value="file">
+                Single blend
+              </TabsTrigger>
+              <TabsTrigger disabled={uploading} value="folder">
+                Project folder
+              </TabsTrigger>
             </TabsList>
             <TabsContent value="file" className="space-y-4">
-              <Input accept=".blend" onChange={onFileChange} type="file" />
+              <Input
+                accept=".blend"
+                disabled={uploading}
+                onChange={onFileChange}
+                type="file"
+              />
             </TabsContent>
             <TabsContent value="folder" className="space-y-4">
               <Input
+                disabled={uploading}
                 onChange={onFolderChange}
                 type="file"
                 {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
@@ -789,19 +801,31 @@ function UploadCard({
               </div>
             </div>
           ) : null}
-          <Button className="w-full" disabled={uploading || !selectedBlendFile}>
+          <div className="flex flex-wrap gap-2">
+            <Button className="flex-1" disabled={uploading || !selectedBlendFile}>
+              {uploading ? (
+                <>
+                  <LoaderCircle className="animate-spin" />
+                  Uploading
+                </>
+              ) : (
+                <>
+                  <Upload />
+                  Add to library
+                </>
+              )}
+            </Button>
             {uploading ? (
-              <>
-                <LoaderCircle className="animate-spin" />
-                Uploading
-              </>
-            ) : (
-              <>
-                <Upload />
-                Add to library
-              </>
-            )}
-          </Button>
+              <Button
+                onClick={onCancelUpload}
+                type="button"
+                variant="destructive"
+              >
+                <Ban />
+                Cancel
+              </Button>
+            ) : null}
+          </div>
         </form>
       </CardContent>
     </Card>
@@ -871,6 +895,7 @@ function LibraryView({
   loadingData,
   onFileChange,
   onFolderChange,
+  onCancelUpload,
   onModeChange,
   onUpload,
   selectedBlendFile,
@@ -884,6 +909,7 @@ function LibraryView({
   loadingData: boolean;
   onFileChange: (event: ChangeEvent<HTMLInputElement>) => void;
   onFolderChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onCancelUpload: () => void;
   onModeChange: (mode: UploadSourceMode) => void;
   onUpload: (event: FormEvent<HTMLFormElement>) => void;
   selectedBlendFile: File | null;
@@ -898,6 +924,7 @@ function LibraryView({
       <UploadCard
         onFileChange={onFileChange}
         onFolderChange={onFolderChange}
+        onCancelUpload={onCancelUpload}
         onModeChange={onModeChange}
         onSubmit={onUpload}
         selectedBlendFile={selectedBlendFile}
@@ -1694,34 +1721,37 @@ function FileDetailView({
                           : job.error || job.status_message}
                       </p>
                     </div>
-                    {job.archive_path || job.outputs.length ? (
-                      <Button asChild size="sm" variant="outline">
-                        <a href={`/backend/api/jobs/${job.id}/download`}>
-                          <Download />
-                          Download
-                        </a>
-                      </Button>
-                    ) : cancelablePhase(job) ? (
-                      <Button
-                        disabled={cancellingJobIds.includes(job.id)}
-                        onClick={() => onCancelJob(job)}
-                        size="sm"
-                        type="button"
-                        variant="destructive"
-                      >
-                        {cancellingJobIds.includes(job.id) ? (
-                          <>
-                            <LoaderCircle className="animate-spin" />
-                            Cancelling
-                          </>
-                        ) : (
-                          <>
-                            <Ban />
-                            Cancel
-                          </>
-                        )}
-                      </Button>
-                    ) : null}
+                    <div className="flex flex-wrap gap-2 md:justify-end">
+                      {job.archive_path || job.outputs.length ? (
+                        <Button asChild size="sm" variant="outline">
+                          <a href={`/backend/api/jobs/${job.id}/download`}>
+                            <Download />
+                            Download
+                          </a>
+                        </Button>
+                      ) : null}
+                      {cancelablePhase(job) ? (
+                        <Button
+                          disabled={cancellingJobIds.includes(job.id)}
+                          onClick={() => onCancelJob(job)}
+                          size="sm"
+                          type="button"
+                          variant="destructive"
+                        >
+                          {cancellingJobIds.includes(job.id) ? (
+                            <>
+                              <LoaderCircle className="animate-spin" />
+                              Cancelling
+                            </>
+                          ) : (
+                            <>
+                              <Ban />
+                              Cancel
+                            </>
+                          )}
+                        </Button>
+                      ) : null}
+                    </div>
                   </div>
                   <JobProgressPanel
                     cancelling={cancellingJobIds.includes(job.id)}
@@ -2091,6 +2121,7 @@ export function RenderDashboard({
   const [adminRuns, setAdminRuns] = useState<RenderJob[]>([]);
   const [adminFiles, setAdminFiles] = useState<UserFile[]>([]);
   const sourcesRef = useRef<Map<string, EventSource>>(new Map());
+  const uploadAbortControllerRef = useRef<AbortController | null>(null);
   const activeJobIds = Array.from(
     new Set(files.flatMap((file) => file.jobs).filter(activePhase).map((job) => job.id)),
   ).sort();
@@ -2252,6 +2283,7 @@ export function RenderDashboard({
 
   useEffect(() => {
     return () => {
+      uploadAbortControllerRef.current?.abort();
       sourcesRef.current.forEach((source) => source.close());
       sourcesRef.current.clear();
     };
@@ -2347,21 +2379,39 @@ export function RenderDashboard({
     setUploading(true);
     setUploadProgress(0);
     setUploadStats(null);
+    const abortController = new AbortController();
+    uploadAbortControllerRef.current = abortController;
     try {
       await uploadFileWithProgress(formData, (stats) => {
         setUploadProgress(stats.progress);
         setUploadStats(stats);
-      });
+      }, abortController.signal);
       setUploadBlendFile(null);
       setUploadProjectFiles([]);
       setSelectionMessage("Scene added to the library.");
       setError(null);
       void refreshCoreData();
     } catch (uploadError) {
-      setError(uploadError instanceof Error ? uploadError.message : "Upload failed.");
+      const wasCancelled =
+        uploadError instanceof Error && uploadError.message === "Upload cancelled.";
+      if (wasCancelled) {
+        setUploadProgress(0);
+        setUploadStats(null);
+        setSelectionMessage("Upload cancelled.");
+        setError(null);
+      } else {
+        setError(uploadError instanceof Error ? uploadError.message : "Upload failed.");
+      }
     } finally {
+      if (uploadAbortControllerRef.current === abortController) {
+        uploadAbortControllerRef.current = null;
+      }
       setUploading(false);
     }
+  }
+
+  function handleCancelUpload() {
+    uploadAbortControllerRef.current?.abort();
   }
 
   async function handleInspect() {
@@ -2647,6 +2697,7 @@ export function RenderDashboard({
             loadingData={loadingData}
             onFileChange={handleSingleFileChange}
             onFolderChange={handleFolderChange}
+            onCancelUpload={handleCancelUpload}
             onModeChange={setUploadSourceMode}
             onUpload={handleUpload}
             selectedBlendFile={uploadBlendFile}

@@ -358,6 +358,69 @@ def test_user_can_cancel_a_queued_run(tmp_path: Path) -> None:
         _restore_env(previous)
 
 
+def test_user_cannot_cancel_another_users_run(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with _client() as client:
+            owner_response = client.post(
+                "/api/auth/sign-up",
+                json={"username": "artist_owner_cancel", "password": "artist-password-333"},
+            )
+            assert owner_response.status_code == 200
+            owner_user_id = owner_response.json()["user"]["id"]
+
+            other_response = client.post(
+                "/api/auth/sign-up",
+                json={"username": "artist_other_cancel", "password": "artist-password-444"},
+            )
+            assert other_response.status_code == 200
+            other_user_id = other_response.json()["user"]["id"]
+
+            _sign_in(client, "admin", "admin-password-123")
+            for user_id in (owner_user_id, other_user_id):
+                approve_response = client.post(
+                    f"/api/admin/users/{user_id}/status",
+                    json={"status": "approved"},
+                    headers={"x-forwarded-for": "127.0.0.1"},
+                )
+                assert approve_response.status_code == 200
+
+        with _client() as owner_client:
+            _sign_in(owner_client, "artist_owner_cancel", "artist-password-333")
+
+            upload_response = owner_client.post(
+                "/api/files",
+                data={"blend_file_path": "Scene Owner Cancel.blend"},
+                files=[("blend_file", ("Scene Owner Cancel.blend", b"blend-bytes", "application/octet-stream"))],
+            )
+            assert upload_response.status_code == 200, upload_response.text
+            file_payload = upload_response.json()
+
+            run_response = owner_client.post(
+                f"/api/files/{file_payload['id']}/runs",
+                data={
+                    "render_mode": "still",
+                    "output_format": "PNG",
+                    "frame": "7",
+                },
+            )
+            assert run_response.status_code == 200, run_response.text
+            run_payload = run_response.json()
+
+        with _client() as other_client:
+            _sign_in(other_client, "artist_other_cancel", "artist-password-444")
+            cancel_response = other_client.post(f"/api/jobs/{run_payload['id']}/cancel")
+            assert cancel_response.status_code == 404
+
+        with _client() as owner_client:
+            _sign_in(owner_client, "artist_owner_cancel", "artist-password-333")
+            refetch_response = owner_client.get(f"/api/jobs/{run_payload['id']}")
+            assert refetch_response.status_code == 200
+            assert refetch_response.json()["phase"] == "queued"
+    finally:
+        _restore_env(previous)
+
+
 def test_non_admin_user_cannot_access_admin_routes(tmp_path: Path) -> None:
     previous = _set_test_env(tmp_path)
     try:

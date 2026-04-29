@@ -105,8 +105,9 @@ export async function fetchFiles(): Promise<UserFile[]> {
 export async function uploadFileWithProgress(
   formData: FormData,
   onProgress: (progress: UploadProgressStats) => void,
+  signal?: AbortSignal,
 ): Promise<UserFile> {
-  return submitWithProgress<UserFile>("/backend/api/files", formData, onProgress);
+  return submitWithProgress<UserFile>("/backend/api/files", formData, onProgress, signal);
 }
 
 export async function inspectStoredFile(
@@ -204,12 +205,26 @@ function submitWithProgress<T>(
   url: string,
   formData: FormData,
   onProgress: (progress: UploadProgressStats) => void,
+  signal?: AbortSignal,
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("Upload cancelled."));
+      return;
+    }
+
     const request = new XMLHttpRequest();
     const startedAt = performance.now();
+    const abortRequest = () => {
+      request.abort();
+    };
+    const cleanup = () => {
+      signal?.removeEventListener("abort", abortRequest);
+    };
+
     request.open("POST", url);
     request.responseType = "json";
+    signal?.addEventListener("abort", abortRequest, { once: true });
 
     request.upload.onprogress = (event) => {
       if (!event.lengthComputable || event.total === 0) {
@@ -230,6 +245,7 @@ function submitWithProgress<T>(
     };
 
     request.onload = () => {
+      cleanup();
       const payload = xhrJsonPayload<T>(request);
 
       if (request.status >= 200 && request.status < 300 && payload) {
@@ -241,10 +257,12 @@ function submitWithProgress<T>(
     };
 
     request.onerror = () => {
+      cleanup();
       reject(new Error("Upload failed."));
     };
 
     request.onabort = () => {
+      cleanup();
       reject(new Error("Upload cancelled."));
     };
 

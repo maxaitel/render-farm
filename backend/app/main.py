@@ -221,17 +221,21 @@ async def start_user_session(state: AppState, user: UserRecord, request: Request
     )
 
 
-async def save_upload(upload: UploadFile, destination: Path) -> int:
+async def save_upload(upload: UploadFile, destination: Path, request: Request) -> int:
     destination.parent.mkdir(parents=True, exist_ok=True)
     written = 0
-    async with aiofiles.open(destination, "wb") as out_file:
-        while True:
-            chunk = await upload.read(UPLOAD_CHUNK_SIZE)
-            if not chunk:
-                break
-            written += len(chunk)
-            await out_file.write(chunk)
-    await upload.close()
+    try:
+        async with aiofiles.open(destination, "wb") as out_file:
+            while True:
+                if await request.is_disconnected():
+                    raise asyncio.CancelledError()
+                chunk = await upload.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                written += len(chunk)
+                await out_file.write(chunk)
+    finally:
+        await upload.close()
     return written
 
 
@@ -664,7 +668,6 @@ async def create_file(
     project_paths: list[str] | None = Form(None),
     user: UserRecord = Depends(require_approved_user),
 ) -> dict:
-    del request
     state = runtime_state()
     relative_source_path = (
         sanitize_relative_path(blend_file_path)
@@ -687,13 +690,16 @@ async def create_file(
 
     total_size = 0
     try:
-        total_size += await save_upload(blend_file, source_path)
+        total_size += await save_upload(blend_file, source_path, request)
         for upload, path_value in zip(normalized_project_files, normalized_project_paths, strict=True):
             relative_project_path = sanitize_relative_path(path_value)
             if relative_project_path == relative_source_path:
                 await upload.close()
                 continue
-            total_size += await save_upload(upload, source_root / relative_project_path)
+            total_size += await save_upload(upload, source_root / relative_project_path, request)
+    except asyncio.CancelledError:
+        shutil.rmtree(file_root, ignore_errors=True)
+        raise
     except Exception:
         shutil.rmtree(file_root, ignore_errors=True)
         raise
