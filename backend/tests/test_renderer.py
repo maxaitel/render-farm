@@ -5,7 +5,17 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from app.config import Settings
-from app.models import JobPhase, JobRecord, OutputFormat, RenderDevice, RenderMode, UserFileRecord, UserStatus
+from app.models import (
+    FramePhase,
+    FrameRenderRecord,
+    JobPhase,
+    JobRecord,
+    OutputFormat,
+    RenderDevice,
+    RenderMode,
+    UserFileRecord,
+    UserStatus,
+)
 from app.renderer import ProgressTracker, RenderRunner
 from app.store import JobStore
 
@@ -376,6 +386,121 @@ def test_progress_parser_handles_blender_stat_spacing(tmp_path: Path) -> None:
     assert message == "Default camera sample 64/2048."
     assert progress is not None
     assert progress > 68.0
+
+
+def test_saved_output_snapshots_advance_progress_without_sample_lines(tmp_path: Path) -> None:
+    settings = Settings(
+        storage_root=tmp_path,
+        blender_binary="/bin/true",
+        default_device="AUTO",
+        gpu_order=["CPU"],
+        disable_worker=True,
+        session_cookie_name="renderfarm_session",
+        session_ttl_hours=24,
+        auth_cookie_secure="false",
+        admin_panel_path="control-tower",
+        admin_bootstrap_username=None,
+        admin_bootstrap_password=None,
+        allow_signups=True,
+        trusted_proxies=[],
+    )
+    store = JobStore(settings.database_path)
+    runner = RenderRunner(settings, store)
+
+    output_dir = settings.jobs_root / "saved-progress" / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_path = tmp_path / "scene.blend"
+    source_path.write_bytes(b"blend-data")
+    job = JobRecord(
+        id="saved-progress",
+        user_id=1,
+        file_id="file001",
+        source_filename="scene.blend",
+        source_path=str(source_path),
+        output_directory=str(output_dir),
+        render_mode=RenderMode.animation,
+        output_format=OutputFormat.png,
+        requested_device=RenderDevice.auto,
+        start_frame=1,
+        end_frame=10,
+        total_frames=10,
+        total_outputs_expected=10,
+        frame_statuses=[
+            FrameRenderRecord(camera_name=None, camera_index=1, frame=frame)
+            for frame in range(1, 11)
+        ],
+    )
+    job.phase = JobPhase.running
+    job.started_at = job.created_at
+    job.progress = 2.0
+
+    outputs = [
+        f"Default_Camera/scene_Default_Camera_{frame:05d}.png"
+        for frame in range(1, 5)
+    ]
+    runner._apply_output_snapshot(job, outputs, None, None, outputs[-1])
+
+    assert job.completed_frames == 4
+    assert job.progress == 40.0
+    assert job.current_frame == 4
+    assert job.current_output == "Default_Camera/scene_Default_Camera_00004.png"
+    assert job.status_message == "Rendered 4 / 10 outputs."
+    frame_four = next(frame for frame in job.frame_statuses if frame.frame == 4)
+    assert frame_four.status == FramePhase.complete
+    assert frame_four.output_path == "Default_Camera/scene_Default_Camera_00004.png"
+
+
+def test_saved_output_progress_waits_for_completion_before_showing_100(tmp_path: Path) -> None:
+    settings = Settings(
+        storage_root=tmp_path,
+        blender_binary="/bin/true",
+        default_device="AUTO",
+        gpu_order=["CPU"],
+        disable_worker=True,
+        session_cookie_name="renderfarm_session",
+        session_ttl_hours=24,
+        auth_cookie_secure="false",
+        admin_panel_path="control-tower",
+        admin_bootstrap_username=None,
+        admin_bootstrap_password=None,
+        allow_signups=True,
+        trusted_proxies=[],
+    )
+    store = JobStore(settings.database_path)
+    runner = RenderRunner(settings, store)
+
+    output_dir = settings.jobs_root / "saved-progress-complete" / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_path = tmp_path / "scene.blend"
+    source_path.write_bytes(b"blend-data")
+    output = "Default_Camera/scene_Default_Camera_00001.png"
+    job = JobRecord(
+        id="saved-progress-complete",
+        user_id=1,
+        file_id="file001",
+        source_filename="scene.blend",
+        source_path=str(source_path),
+        output_directory=str(output_dir),
+        render_mode=RenderMode.still,
+        output_format=OutputFormat.png,
+        requested_device=RenderDevice.auto,
+        frame=1,
+        total_frames=1,
+        total_outputs_expected=1,
+        frame_statuses=[FrameRenderRecord(camera_name=None, camera_index=1, frame=1)],
+    )
+    job.phase = JobPhase.running
+    job.started_at = job.created_at
+    job.progress = 2.0
+
+    runner._apply_output_snapshot(job, [output], None, None, output)
+
+    assert job.progress == 99.0
+    assert job.phase == JobPhase.running
+
+    runner._mark_completed(job, [output], None)
+
+    assert job.progress == 100.0
 
 
 def test_cancel_running_job_stops_process_and_preserves_cancelled_phase(

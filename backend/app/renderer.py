@@ -493,11 +493,13 @@ class RenderRunner:
                         lambda item,
                         output_names=known_outputs,
                         camera=current_camera_name,
-                        current_frame=tracker.current_frame: self._apply_output_snapshot(
+                        current_frame=tracker.current_frame,
+                        current_output=saved_output: self._apply_output_snapshot(
                             item,
                             output_names,
                             camera,
                             current_frame,
+                            current_output,
                         )
                     )
                 elif (
@@ -667,11 +669,13 @@ class RenderRunner:
                         lambda item,
                         output_names=known_outputs,
                         current_camera=camera_name,
-                        current_frame=tracker.current_frame: self._apply_output_snapshot(
+                        current_frame=tracker.current_frame,
+                        current_output=saved_output: self._apply_output_snapshot(
                             item,
                             output_names,
                             current_camera,
                             current_frame,
+                            current_output,
                         )
                     )
                 elif (
@@ -973,17 +977,27 @@ class RenderRunner:
         outputs: list[str],
         camera_name: str | None,
         frame: int | None,
+        current_output: str | None = None,
     ) -> None:
         if job.phase != JobPhase.running:
             return
+        current_frame = frame
+        if current_frame is None and current_output is not None:
+            current_frame = self._frame_from_output_path(current_output)
         job.outputs = outputs
         job.completed_frames = min(len(outputs), job.total_outputs_expected)
         job.failed_frames = len([frame for frame in job.frame_statuses if frame.status == FramePhase.failed])
-        job.current_output = outputs[-1] if outputs else job.current_output
-        if frame is not None:
-            self._mark_frame_status(job, camera_name, frame, FramePhase.complete)
+        job.current_output = current_output or (outputs[-1] if outputs else job.current_output)
+        if current_frame is not None:
+            job.current_frame = current_frame
+            self._mark_frame_status(job, camera_name, current_frame, FramePhase.complete)
+        job.progress = max(job.progress, self._progress_from_outputs(job))
         job.last_progress_at = utc_now()
         self._update_timing_metrics(job)
+        if job.completed_frames > 0:
+            job.status_message = (
+                f"Rendered {job.completed_frames} / {job.total_outputs_expected} outputs."
+            )
 
     def _mark_camera_completed(
         self,
@@ -1000,6 +1014,7 @@ class RenderRunner:
         job.current_camera_name = camera_name
         job.current_camera_index = camera_index
         job.current_output = outputs[-1] if outputs else None
+        job.progress = max(job.progress, self._progress_from_outputs(job))
         job.last_progress_at = utc_now()
         for frame_number in self._frame_numbers(job):
             self._mark_frame_status(job, camera_name, frame_number, FramePhase.complete)
@@ -1162,6 +1177,19 @@ class RenderRunner:
             return camera_progress
         scaled = ((camera_index + (camera_progress / 100.0)) / total_cameras) * 100.0
         return max(2.0, min(scaled, 99.0))
+
+    def _progress_from_outputs(self, job: JobRecord) -> float:
+        expected = max(1, job.total_outputs_expected)
+        completed = max(0, min(job.completed_frames, expected))
+        if completed == 0:
+            return job.progress
+        return max(2.0, min((completed / expected) * 100.0, 99.0))
+
+    def _frame_from_output_path(self, output_path: str) -> int | None:
+        match = re.search(r"_(\d+)\.[^.]+$", output_path)
+        if not match:
+            return None
+        return int(match.group(1))
 
     def _camera_message_prefix(self, camera_name: str | None) -> str:
         if not camera_name:

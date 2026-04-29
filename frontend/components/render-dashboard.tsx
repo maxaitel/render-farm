@@ -1294,7 +1294,7 @@ function FileDetailView({
                     </p>
                   </div>
                   <div>
-                    <p className="text-muted-foreground">Resolution</p>
+                    <p className="text-muted-foreground">Original resolution</p>
                     <p>
                       {cameraInspection.resolution.x}x{cameraInspection.resolution.y}
                     </p>
