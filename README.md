@@ -100,6 +100,7 @@ You can change that in [compose.yaml](/home/maxaitel/render-farm/compose.yaml) w
 
 - `BLENDER_CYCLES_DEVICE`
 - `BLENDER_GPU_ORDER`
+- `BLENDER_CYCLES_PRINT_STATS`
 - `WEB_PORT`
 - `CADDY_SITE_ADDRESS`
 - `LOCAL_UID`

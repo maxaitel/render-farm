@@ -10,6 +10,15 @@ import type {
   UserStatus,
 } from "@/lib/types";
 
+export type UploadProgressStats = {
+  progress: number;
+  loaded: number;
+  total: number;
+  elapsedSeconds: number;
+  bytesPerSecond: number;
+  estimatedSecondsRemaining: number | null;
+};
+
 export type ProjectUploadEntry = {
   file: File;
   path: string;
@@ -27,13 +36,28 @@ function responseDetail(payload: unknown): string | null {
     return null;
   }
   const { detail } = payload as { detail?: unknown };
-  return typeof detail === "string" ? detail : null;
+  if (typeof detail === "string") {
+    return detail;
+  }
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (!item || typeof item !== "object" || !("msg" in item)) {
+          return null;
+        }
+        const { msg } = item as { msg?: unknown };
+        return typeof msg === "string" ? msg : null;
+      })
+      .filter(Boolean);
+    return messages.length ? messages.join(" ") : null;
+  }
+  return null;
 }
 
 async function parseResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ detail: "Request failed." }));
-    throw new Error(payload.detail ?? "Request failed.");
+    throw new Error(responseDetail(payload) ?? "Request failed.");
   }
   return response.json() as Promise<T>;
 }
@@ -80,7 +104,7 @@ export async function fetchFiles(): Promise<UserFile[]> {
 
 export async function uploadFileWithProgress(
   formData: FormData,
-  onProgress: (progress: number) => void,
+  onProgress: (progress: UploadProgressStats) => void,
 ): Promise<UserFile> {
   return submitWithProgress<UserFile>("/backend/api/files", formData, onProgress);
 }
@@ -107,6 +131,34 @@ export async function createRun(
   const response = await fetch(`/backend/api/files/${fileId}/runs`, {
     method: "POST",
     body: formData,
+  });
+  return parseResponse<RenderJob>(response);
+}
+
+export async function cancelJob(jobId: string): Promise<RenderJob> {
+  const response = await fetch(`/backend/api/jobs/${jobId}/cancel`, {
+    method: "POST",
+  });
+  return parseResponse<RenderJob>(response);
+}
+
+export async function retryJob(jobId: string): Promise<RenderJob> {
+  const response = await fetch(`/backend/api/jobs/${jobId}/retry`, {
+    method: "POST",
+  });
+  return parseResponse<RenderJob>(response);
+}
+
+export async function adminCancelJob(jobId: string): Promise<RenderJob> {
+  const response = await fetch(`/backend/api/admin/runs/${jobId}/cancel`, {
+    method: "POST",
+  });
+  return parseResponse<RenderJob>(response);
+}
+
+export async function adminRetryJob(jobId: string): Promise<RenderJob> {
+  const response = await fetch(`/backend/api/admin/runs/${jobId}/retry`, {
+    method: "POST",
   });
   return parseResponse<RenderJob>(response);
 }
@@ -143,13 +195,19 @@ export async function fetchAdminRuns(): Promise<RenderJob[]> {
   return parseResponse<RenderJob[]>(response);
 }
 
+export async function fetchAdminFiles(): Promise<UserFile[]> {
+  const response = await fetch("/backend/api/admin/files", { cache: "no-store" });
+  return parseResponse<UserFile[]>(response);
+}
+
 function submitWithProgress<T>(
   url: string,
   formData: FormData,
-  onProgress: (progress: number) => void,
+  onProgress: (progress: UploadProgressStats) => void,
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const request = new XMLHttpRequest();
+    const startedAt = performance.now();
     request.open("POST", url);
     request.responseType = "json";
 
@@ -157,7 +215,18 @@ function submitWithProgress<T>(
       if (!event.lengthComputable || event.total === 0) {
         return;
       }
-      onProgress(Math.min(100, (event.loaded / event.total) * 100));
+      const elapsedSeconds = Math.max(0.001, (performance.now() - startedAt) / 1000);
+      const bytesPerSecond = event.loaded / elapsedSeconds;
+      const remainingBytes = Math.max(0, event.total - event.loaded);
+      onProgress({
+        progress: Math.min(100, (event.loaded / event.total) * 100),
+        loaded: event.loaded,
+        total: event.total,
+        elapsedSeconds,
+        bytesPerSecond,
+        estimatedSecondsRemaining:
+          bytesPerSecond > 0 ? remainingBytes / bytesPerSecond : null,
+      });
     };
 
     request.onload = () => {

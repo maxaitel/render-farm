@@ -4,17 +4,19 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 import tempfile
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from typing import Iterable
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 from .config import Settings
-from .models import JobPhase, JobRecord, RenderDevice, RenderMode, utc_now
+from .models import FramePhase, JobPhase, JobRecord, RenderDevice, RenderMode, utc_now
 from .store import JobStore
 
 FRAME_RE = re.compile(r"Fra:\s*(\d+)")
@@ -22,21 +24,21 @@ SAMPLE_RE = re.compile(r"Sample\s+(\d+)\s*/\s*(\d+)")
 PATH_SAMPLE_RE = re.compile(r"Path Tracing Sample\s+(\d+)\s*/\s*(\d+)")
 TILE_RE = re.compile(r"Rendered\s+(\d+)\s*/\s*(\d+)\s+Tiles")
 PATH_TILE_RE = re.compile(r"Path Tracing Tile\s+(\d+)\s*/\s*(\d+)")
+SAVED_PATH_RE = re.compile(r"Saved:\s+'([^']+)'")
 GPU_ERROR_RE = re.compile(
     r"(No compatible GPUs found|CUDA.+unavailable|OPTIX.+unavailable|is not a valid Cycles device|device type .* not available|Found no Cycles device of the specified type)",
     re.IGNORECASE,
 )
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+RENDER_FARM_EVENT_PREFIX = "RENDER_FARM_EVENT "
+LOG_FLUSH_INTERVAL_SECONDS = 0.5
+LOG_FLUSH_LINE_COUNT = 25
 
 
 @dataclass(slots=True)
 class ProgressTracker:
     current_frame: int | None = None
-    current_frame_started_at: datetime | None = None
     total_frames: int = 1
-    last_frame_duration_seconds: float | None = None
-    total_completed_frame_duration: float = 0.0
-    completed_frame_count: int = 0
     current_sample: int | None = None
     total_samples: int | None = None
     current_tile: int | None = None
@@ -47,96 +49,211 @@ class RenderRunner:
     def __init__(self, settings: Settings, store: JobStore) -> None:
         self.settings = settings
         self.store = store
+        self._active_processes: dict[str, asyncio.subprocess.Process] = {}
+        self._cancel_requested: set[str] = set()
+        self._process_lock = asyncio.Lock()
 
     async def run(self, job_id: str) -> None:
-        job = await self.store.get(job_id)
-        if not job:
-            return
+        job_started_at = monotonic()
+        try:
+            job = await self.store.get(job_id)
+            if not job or job.phase != JobPhase.queued or await self._is_cancel_requested(job_id):
+                return
 
-        await self.store.mutate(
-            job_id,
-            lambda item: self._mark_running(item),
-        )
-
-        attempts = self._device_attempts(job.requested_device)
-        collected_error = "Render failed."
-        for index, device in enumerate(attempts):
             job = await self.store.mutate(
                 job_id,
-                lambda item, current=device: self._prepare_attempt(item, current),
+                lambda item: self._mark_running(item),
             )
-            self._reset_output_dir(job.output_dir)
-            success, combined_output, retryable_gpu_error = await self._run_attempt(job, device)
-            if success:
-                outputs = self._collect_outputs(job.output_dir)
-                archive_path = await self._create_archive(job.id, outputs)
-                completed = await self.store.mutate(
+            if job.phase != JobPhase.running or await self._job_was_cancelled(job_id):
+                return
+            await self.store.append_log(job_id, self._perf_log("job.started", job_id=job_id))
+
+            attempts = self._device_attempts(job.requested_device)
+            collected_error = "Render failed."
+            for index, device in enumerate(attempts):
+                if await self._job_was_cancelled(job_id):
+                    return
+
+                job = await self.store.mutate(
                     job_id,
-                    lambda item, output_names=[path.name for path in outputs], archive=archive_path: self._mark_completed(
-                        item, output_names, archive
+                    lambda item, current=device: self._prepare_attempt(item, current),
+                )
+                if job.phase != JobPhase.running or await self._job_was_cancelled(job_id):
+                    return
+
+                reset_started_at = monotonic()
+                self._reset_output_dir(job.output_dir)
+                await self.store.append_log(
+                    job_id,
+                    self._perf_log(
+                        "outputs.reset",
+                        duration_seconds=monotonic() - reset_started_at,
+                        device=device,
                     ),
                 )
-                await self.store.create_activity(
-                    event_type="render.completed",
-                    description=f"Render {completed.id} completed.",
-                    actor_user_id=completed.user_id,
-                    subject_user_id=completed.user_id,
-                    file_id=completed.file_id,
-                    job_id=completed.id,
-                    metadata={"outputs": completed.outputs},
+                attempt_started_at = monotonic()
+                success, combined_output, retryable_gpu_error = await self._run_attempt(job, device)
+                await self.store.append_log(
+                    job_id,
+                    self._perf_log(
+                        "attempt.finished",
+                        duration_seconds=monotonic() - attempt_started_at,
+                        device=device,
+                        success=str(success).lower(),
+                    ),
                 )
+                if await self._job_was_cancelled(job_id):
+                    return
+
+                if success:
+                    output_scan_started_at = monotonic()
+                    outputs = self._collect_outputs(job.output_dir)
+                    await self.store.append_log(
+                        job_id,
+                        self._perf_log(
+                            "outputs.scanned",
+                            duration_seconds=monotonic() - output_scan_started_at,
+                            count=len(outputs),
+                        ),
+                    )
+                    packaging = await self.store.mutate(job_id, self._mark_packaging)
+                    if packaging.phase != JobPhase.packaging:
+                        return
+                    archive_started_at = monotonic()
+                    archive_path = await self._create_archive(packaging, outputs)
+                    await self.store.append_log(
+                        job_id,
+                        self._perf_log(
+                            "archive.created",
+                            duration_seconds=monotonic() - archive_started_at,
+                            count=len(outputs),
+                        ),
+                    )
+                    completed = await self.store.mutate(
+                        job_id,
+                        lambda item,
+                        output_names=[self._relative_output_path(job.output_dir, path) for path in outputs],
+                        archive=archive_path: self._mark_completed(
+                            item, output_names, archive
+                        ),
+                    )
+                    if completed.phase != JobPhase.completed:
+                        return
+                    await self.store.append_log(
+                        job_id,
+                        self._perf_log(
+                            "job.finished",
+                            duration_seconds=monotonic() - job_started_at,
+                            phase=completed.phase.value,
+                        ),
+                    )
+                    await self.store.create_activity(
+                        event_type="render.completed",
+                        description=f"Render {completed.id} completed.",
+                        actor_user_id=completed.user_id,
+                        subject_user_id=completed.user_id,
+                        file_id=completed.file_id,
+                        job_id=completed.id,
+                        metadata={"outputs": completed.outputs},
+                    )
+                    return
+
+                collected_error = combined_output.strip() or "Blender exited with an error."
+                if index == len(attempts) - 1 or not self._should_retry(device, retryable_gpu_error):
+                    break
+                await self.store.append_log(
+                    job_id,
+                    f"Retrying with the next device backend after {device} failed.",
+                )
+
+            failed = await self.store.mutate(
+                job_id,
+                lambda item, reason=collected_error: self._mark_failed(item, reason),
+            )
+            if failed.phase != JobPhase.failed:
                 return
-            collected_error = combined_output.strip() or "Blender exited with an error."
-            if index == len(attempts) - 1 or not self._should_retry(device, retryable_gpu_error):
-                break
             await self.store.append_log(
                 job_id,
-                f"Retrying with the next device backend after {device} failed.",
+                self._perf_log(
+                    "job.finished",
+                    duration_seconds=monotonic() - job_started_at,
+                    phase=failed.phase.value,
+                ),
             )
+            await self.store.create_activity(
+                event_type="render.failed",
+                description=f"Render {failed.id} failed.",
+                actor_user_id=failed.user_id,
+                subject_user_id=failed.user_id,
+                file_id=failed.file_id,
+                job_id=failed.id,
+                metadata={"error": failed.error},
+            )
+        finally:
+            await self._unregister_process(job_id)
+            await self._clear_cancel_request(job_id)
 
-        failed = await self.store.mutate(
-            job_id,
-            lambda item, reason=collected_error: self._mark_failed(item, reason),
-        )
-        await self.store.create_activity(
-            event_type="render.failed",
-            description=f"Render {failed.id} failed.",
-            actor_user_id=failed.user_id,
-            subject_user_id=failed.user_id,
-            file_id=failed.file_id,
-            job_id=failed.id,
-            metadata={"error": failed.error},
-        )
+    async def cancel(self, job_id: str) -> None:
+        process: asyncio.subprocess.Process | None = None
+        async with self._process_lock:
+            self._cancel_requested.add(job_id)
+            process = self._active_processes.get(job_id)
+        if process is not None:
+            await self._terminate_process(process)
 
     def _mark_running(self, job: JobRecord) -> None:
+        if job.phase != JobPhase.queued:
+            return
         job.phase = JobPhase.running
         job.started_at = job.started_at or utc_now()
+        job.last_progress_at = utc_now()
         job.progress = max(job.progress, 1.0)
         job.error = None
-        job.outputs = []
+        job.outputs = self._relative_output_paths(job.output_dir, self._collect_outputs(job.output_dir))
         job.archive_path = None
         job.current_camera_name = None
-        job.current_frame_started_at = None
-        job.current_frame_elapsed_seconds = None
-        job.last_frame_duration_seconds = None
-        job.average_frame_duration_seconds = None
+        job.current_camera_index = None
+        job.worker_assigned = job.worker_assigned or "local-worker"
+        job.total_cameras = max(1, len(self._requested_cameras(job)))
+        job.total_frames = self._total_frames(job)
+        job.total_outputs_expected = max(1, job.total_cameras * job.total_frames)
+        job.completed_frames = min(len(job.outputs), job.total_outputs_expected)
+        job.failed_frames = len([frame for frame in job.frame_statuses if frame.status == FramePhase.failed])
         job.status_message = "Starting Blender render process."
 
     def _prepare_attempt(self, job: JobRecord, device: str) -> None:
+        if job.phase != JobPhase.running:
+            return
         job.resolved_device = device
         job.progress = max(job.progress, 2.0)
         job.status_message = f"Rendering on {device}."
         job.current_camera_name = None
+        job.current_camera_index = None
         job.current_frame = None
-        job.current_frame_started_at = None
-        job.current_frame_elapsed_seconds = None
-        job.last_frame_duration_seconds = None
-        job.average_frame_duration_seconds = None
         job.current_sample = None
         job.total_samples = None
-        job.logs_tail = []
+        job.current_output = None
+        job.last_progress_at = utc_now()
+        job.environment_info = {
+            "device": device,
+            "blender_binary": self.settings.blender_binary,
+            "gpu_order": self.settings.gpu_order,
+        }
+
+    def _mark_packaging(self, job: JobRecord) -> None:
+        if job.phase != JobPhase.running:
+            return
+        job.phase = JobPhase.packaging
+        job.progress = max(job.progress, 99.0)
+        job.status_message = "Packaging render outputs."
+        job.current_camera_name = None
+        job.current_camera_index = None
+        job.current_output = None
+        job.last_progress_at = utc_now()
 
     def _mark_completed(self, job: JobRecord, outputs: list[str], archive_path: str | None) -> None:
+        if job.phase not in {JobPhase.running, JobPhase.packaging}:
+            return
         job.phase = JobPhase.completed
         job.progress = 100.0
         job.finished_at = utc_now()
@@ -145,20 +262,30 @@ class RenderRunner:
         job.status_message = "Render complete."
         job.error = None
         job.current_camera_name = None
-        job.current_frame_started_at = None
-        job.current_frame_elapsed_seconds = None
+        job.current_camera_index = None
+        job.current_output = outputs[-1] if outputs else None
+        job.completed_frames = min(len(outputs), job.total_outputs_expected)
+        job.failed_frames = len([frame for frame in job.frame_statuses if frame.status == FramePhase.failed])
+        job.last_progress_at = utc_now()
+        self._update_timing_metrics(job)
         if job.render_mode == RenderMode.still and job.frame is not None:
             job.current_frame = job.frame
         elif job.end_frame is not None:
             job.current_frame = job.end_frame
 
     def _mark_failed(self, job: JobRecord, reason: str) -> None:
+        if job.phase not in {JobPhase.running, JobPhase.packaging}:
+            return
         job.phase = JobPhase.failed
         job.finished_at = utc_now()
         job.status_message = "Render failed."
-        job.current_frame_started_at = None
-        job.current_frame_elapsed_seconds = None
         job.error = reason
+        job.failed_frames = max(
+            len([frame for frame in job.frame_statuses if frame.status == FramePhase.failed]),
+            1 if not job.outputs else 0,
+        )
+        job.last_progress_at = utc_now()
+        self._update_timing_metrics(job)
 
     def _device_attempts(self, requested: RenderDevice) -> list[str]:
         if requested == RenderDevice.auto:
@@ -174,34 +301,251 @@ class RenderRunner:
     async def _run_attempt(self, job: JobRecord, device: str) -> tuple[bool, str, bool]:
         requested_cameras = self._requested_cameras(job)
         total_cameras = len(requested_cameras)
-        all_lines: deque[str] = deque(maxlen=80)
+        await self.store.append_log(
+            job.id,
+            self._perf_log("attempt.started", device=device, cameras=total_cameras),
+        )
+        return await self._run_batch_attempt(job, device, requested_cameras)
 
-        for camera_index, camera_name in enumerate(requested_cameras):
-            job = await self.store.mutate(
+    async def _run_batch_attempt(
+        self,
+        job: JobRecord,
+        device: str,
+        requested_cameras: list[str | None],
+    ) -> tuple[bool, str, bool]:
+        total_cameras = len(requested_cameras)
+        tracker = ProgressTracker(total_frames=self._total_frames(job))
+        current_camera_name = requested_cameras[0] if requested_cameras else None
+        current_camera_index = 0
+        plan_path = self._write_render_plan(job, device, requested_cameras)
+        command = self._build_batch_command(job, device, plan_path)
+        quoted_command = " ".join(shlex.quote(part) for part in command)
+        await self.store.append_log(job.id, f"Command: {quoted_command}")
+        await self.store.mutate(
+            job.id,
+            lambda item, command_snapshot=command: self._record_command(item, command_snapshot),
+        )
+        process_started_at = monotonic()
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=self._blender_env(job=job),
+        )
+        await self._register_process(job.id, process)
+        await self.store.append_log(
+            job.id,
+            self._perf_log(
+                "blender.process_spawned",
+                duration_seconds=monotonic() - process_started_at,
+                camera="batch",
+                device=device,
+            ),
+        )
+
+        lines: deque[str] = deque(maxlen=80)
+        pending_log_lines: list[str] = []
+        known_outputs = list(job.outputs)
+        last_log_flush_at = monotonic()
+        first_stdout_logged = False
+        first_progress_logged = False
+        retryable_gpu_error = False
+        assert process.stdout is not None
+
+        async def flush_logs() -> None:
+            nonlocal pending_log_lines, last_log_flush_at
+            if not pending_log_lines:
+                return
+            lines_to_flush = pending_log_lines
+            pending_log_lines = []
+            last_log_flush_at = monotonic()
+            await self.store.append_logs(job.id, lines_to_flush)
+
+        async def flush_logs_with_mutation(mutator) -> JobRecord:
+            nonlocal pending_log_lines, last_log_flush_at
+            lines_to_flush = pending_log_lines
+            pending_log_lines = []
+            last_log_flush_at = monotonic()
+            return await self.store.mutate_with_logs(job.id, mutator, lines_to_flush)
+
+        try:
+            async for raw_line in process.stdout:
+                now = monotonic()
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                lines.append(line)
+                if not first_stdout_logged:
+                    pending_log_lines.append(
+                        self._perf_log(
+                            "blender.first_output",
+                            duration_seconds=now - process_started_at,
+                            camera="batch",
+                            device=device,
+                        )
+                    )
+                    first_stdout_logged = True
+                pending_log_lines.append(line)
+                retryable_gpu_error = retryable_gpu_error or bool(GPU_ERROR_RE.search(line))
+
+                event = self._parse_render_farm_event(line)
+                if event:
+                    event_name = event.get("event")
+                    if event_name == "batch_started":
+                        pending_log_lines.append(
+                            self._perf_log(
+                                "blender.batch_started",
+                                duration_seconds=now - process_started_at,
+                                device=device,
+                                cameras=event.get("cameras", total_cameras),
+                            )
+                        )
+                    elif event_name == "batch_completed":
+                        pending_log_lines.append(
+                            self._perf_log(
+                                "blender.batch_completed",
+                                duration_seconds=now - process_started_at,
+                                device=device,
+                                cameras=event.get("cameras", total_cameras),
+                            )
+                        )
+                    elif event_name == "camera_started":
+                        tracker = ProgressTracker(total_frames=self._total_frames(job))
+                        current_camera_index = max(0, int(event.get("camera_index", 1)) - 1)
+                        current_camera_name = requested_cameras[current_camera_index]
+                        await flush_logs_with_mutation(
+                            lambda item,
+                            camera=current_camera_name,
+                            index=current_camera_index,
+                            total=total_cameras,
+                            current_device=device: self._mark_camera_started(
+                                item,
+                                camera,
+                                index,
+                                total,
+                                current_device,
+                            )
+                        )
+                    elif event_name == "camera_completed":
+                        output_scan_started_at = monotonic()
+                        outputs = self._collect_outputs(job.output_dir)
+                        known_outputs = self._relative_output_paths(job.output_dir, outputs)
+                        pending_log_lines.append(
+                            self._perf_log(
+                                "outputs.scanned",
+                                duration_seconds=monotonic() - output_scan_started_at,
+                                count=len(outputs),
+                                trigger="camera_complete",
+                            )
+                        )
+                        await flush_logs_with_mutation(
+                            lambda item,
+                            camera=current_camera_name,
+                            index=current_camera_index + 1,
+                            output_names=known_outputs: self._mark_camera_completed(
+                                item,
+                                camera,
+                                index,
+                                output_names,
+                            )
+                        )
+                    continue
+
+                progress, message = self._parse_progress(job, tracker, line, current_camera_name)
+                if progress is not None:
+                    if not first_progress_logged:
+                        pending_log_lines.append(
+                            self._perf_log(
+                                "blender.first_progress",
+                                duration_seconds=now - process_started_at,
+                                camera="batch",
+                                device=device,
+                            )
+                        )
+                        first_progress_logged = True
+                    overall_progress = self._overall_progress(current_camera_index, total_cameras, progress)
+                    await flush_logs_with_mutation(
+                        lambda item,
+                        pct=overall_progress,
+                        tracker_state=tracker,
+                        status=message,
+                        camera=current_camera_name,
+                        index=current_camera_index + 1,
+                        output_names=known_outputs: self._apply_progress(
+                            item,
+                            pct,
+                            tracker_state,
+                            status,
+                            camera,
+                            index,
+                            output_names,
+                        ),
+                    )
+                elif saved_output := self._saved_output_relative(job, line):
+                    if saved_output not in known_outputs:
+                        known_outputs = sorted([*known_outputs, saved_output])
+                    pending_log_lines.append(
+                        self._perf_log(
+                            "outputs.noted",
+                            count=len(known_outputs),
+                            trigger="saved",
+                        )
+                    )
+                    await flush_logs_with_mutation(
+                        lambda item,
+                        output_names=known_outputs,
+                        camera=current_camera_name,
+                        current_frame=tracker.current_frame: self._apply_output_snapshot(
+                            item,
+                            output_names,
+                            camera,
+                            current_frame,
+                        )
+                    )
+                elif (
+                    len(pending_log_lines) >= LOG_FLUSH_LINE_COUNT
+                    or now - last_log_flush_at >= LOG_FLUSH_INTERVAL_SECONDS
+                ):
+                    await flush_logs()
+
+            await flush_logs()
+            exit_code = await process.wait()
+            await self.store.append_log(
                 job.id,
-                lambda item,
-                current_camera=camera_name,
-                current_index=camera_index,
-                current_device=device,
-                current_total=total_cameras: self._mark_camera_started(
-                    item,
-                    current_camera,
-                    current_index,
-                    current_total,
-                    current_device,
+                self._perf_log(
+                    "blender.process_finished",
+                    duration_seconds=monotonic() - process_started_at,
+                    camera="batch",
+                    device=device,
+                    exit_code=exit_code,
                 ),
             )
-            success, lines, retryable_gpu_error = await self._run_camera_attempt(
-                job,
-                device,
-                camera_name,
-                camera_index,
-                total_cameras,
+            if exit_code == 0:
+                output_scan_started_at = monotonic()
+                outputs = self._collect_outputs(job.output_dir)
+                await self.store.append_log(
+                    job.id,
+                    self._perf_log(
+                        "outputs.scanned",
+                        duration_seconds=monotonic() - output_scan_started_at,
+                        count=len(outputs),
+                        trigger="batch_complete",
+                    ),
+                )
+                return True, "\n".join(lines), retryable_gpu_error
+
+            await self.store.mutate(
+                job.id,
+                lambda item,
+                camera=current_camera_name,
+                reason="\n".join(list(lines)[-12:]) or f"Blender exited with code {exit_code}.": self._mark_camera_failed(
+                    item,
+                    camera,
+                    reason,
+                ),
             )
-            all_lines.extend(lines)
-            if not success:
-                return False, "\n".join(all_lines), retryable_gpu_error
-        return True, "\n".join(all_lines), False
+            return False, "\n".join(lines), retryable_gpu_error
+        finally:
+            await flush_logs()
+            await self._unregister_process(job.id, process)
 
     async def _run_camera_attempt(
         self,
@@ -213,53 +557,186 @@ class RenderRunner:
     ) -> tuple[bool, list[str], bool]:
         tracker = ProgressTracker(total_frames=self._total_frames(job))
         command = self._build_command(job, device, camera_name, camera_index, total_cameras)
+        quoted_command = " ".join(shlex.quote(part) for part in command)
+        await self.store.append_log(job.id, f"Command: {quoted_command}")
+        await self.store.mutate(
+            job.id,
+            lambda item, command_snapshot=command: self._record_command(item, command_snapshot),
+        )
+        process_started_at = monotonic()
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env=self._blender_env(camera_name),
+            env=self._blender_env(camera_name, job),
+        )
+        await self._register_process(job.id, process)
+        await self.store.append_log(
+            job.id,
+            self._perf_log(
+                "blender.process_spawned",
+                duration_seconds=monotonic() - process_started_at,
+                camera=self._camera_log_value(camera_name),
+                device=device,
+            ),
         )
 
         lines: deque[str] = deque(maxlen=80)
+        pending_log_lines: list[str] = []
+        known_outputs = list(job.outputs)
+        last_log_flush_at = monotonic()
+        first_stdout_logged = False
+        first_progress_logged = False
         retryable_gpu_error = False
         assert process.stdout is not None
-        async for raw_line in process.stdout:
-            line = raw_line.decode("utf-8", errors="replace").rstrip()
-            lines.append(line)
-            retryable_gpu_error = retryable_gpu_error or bool(GPU_ERROR_RE.search(line))
-            await self.store.append_log(job.id, line)
-            progress, message = self._parse_progress(job, tracker, line, camera_name)
-            if progress is not None:
-                overall_progress = self._overall_progress(camera_index, total_cameras, progress)
+
+        async def flush_logs() -> None:
+            nonlocal pending_log_lines, last_log_flush_at
+            if not pending_log_lines:
+                return
+            lines_to_flush = pending_log_lines
+            pending_log_lines = []
+            last_log_flush_at = monotonic()
+            await self.store.append_logs(job.id, lines_to_flush)
+
+        async def flush_logs_with_mutation(mutator) -> JobRecord:
+            nonlocal pending_log_lines, last_log_flush_at
+            lines_to_flush = pending_log_lines
+            pending_log_lines = []
+            last_log_flush_at = monotonic()
+            return await self.store.mutate_with_logs(job.id, mutator, lines_to_flush)
+
+        try:
+            async for raw_line in process.stdout:
+                now = monotonic()
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                lines.append(line)
+                if not first_stdout_logged:
+                    pending_log_lines.append(
+                        self._perf_log(
+                            "blender.first_output",
+                            duration_seconds=now - process_started_at,
+                            camera=self._camera_log_value(camera_name),
+                            device=device,
+                        )
+                    )
+                    first_stdout_logged = True
+                pending_log_lines.append(line)
+                retryable_gpu_error = retryable_gpu_error or bool(GPU_ERROR_RE.search(line))
+                progress, message = self._parse_progress(job, tracker, line, camera_name)
+                if progress is not None:
+                    if not first_progress_logged:
+                        pending_log_lines.append(
+                            self._perf_log(
+                                "blender.first_progress",
+                                duration_seconds=now - process_started_at,
+                                camera=self._camera_log_value(camera_name),
+                                device=device,
+                            )
+                        )
+                        first_progress_logged = True
+                    overall_progress = self._overall_progress(camera_index, total_cameras, progress)
+                    await flush_logs_with_mutation(
+                        lambda item,
+                        pct=overall_progress,
+                        tracker_state=tracker,
+                        status=message,
+                        current_camera=camera_name,
+                        current_camera_index=camera_index + 1,
+                        output_names=known_outputs: self._apply_progress(
+                            item,
+                            pct,
+                            tracker_state,
+                            status,
+                            current_camera,
+                            current_camera_index,
+                            output_names,
+                        ),
+                    )
+                elif saved_output := self._saved_output_relative(job, line):
+                    if saved_output not in known_outputs:
+                        known_outputs = sorted([*known_outputs, saved_output])
+                    pending_log_lines.append(
+                        self._perf_log(
+                            "outputs.noted",
+                            count=len(known_outputs),
+                            trigger="saved",
+                        )
+                    )
+                    await flush_logs_with_mutation(
+                        lambda item,
+                        output_names=known_outputs,
+                        current_camera=camera_name,
+                        current_frame=tracker.current_frame: self._apply_output_snapshot(
+                            item,
+                            output_names,
+                            current_camera,
+                            current_frame,
+                        )
+                    )
+                elif (
+                    len(pending_log_lines) >= LOG_FLUSH_LINE_COUNT
+                    or now - last_log_flush_at >= LOG_FLUSH_INTERVAL_SECONDS
+                ):
+                    await flush_logs()
+
+            await flush_logs()
+            exit_code = await process.wait()
+            await self.store.append_log(
+                job.id,
+                self._perf_log(
+                    "blender.process_finished",
+                    duration_seconds=monotonic() - process_started_at,
+                    camera=self._camera_log_value(camera_name),
+                    device=device,
+                    exit_code=exit_code,
+                ),
+            )
+            if exit_code == 0:
+                output_scan_started_at = monotonic()
+                outputs = self._collect_outputs(job.output_dir)
+                await self.store.append_log(
+                    job.id,
+                    self._perf_log(
+                        "outputs.scanned",
+                        duration_seconds=monotonic() - output_scan_started_at,
+                        count=len(outputs),
+                        trigger="camera_complete",
+                    ),
+                )
                 await self.store.mutate(
                     job.id,
                     lambda item,
-                    pct=overall_progress,
-                    tracker_state=tracker,
-                    status=message,
-                    current_camera=camera_name: self._apply_progress(
+                    current_camera=camera_name,
+                    current_camera_index=camera_index + 1,
+                    output_names=self._relative_output_paths(job.output_dir, outputs): self._mark_camera_completed(
                         item,
-                        pct,
-                        tracker_state,
-                        status,
                         current_camera,
+                        current_camera_index,
+                        output_names,
                     ),
                 )
+                return True, list(lines), retryable_gpu_error
 
-        exit_code = await process.wait()
-        if exit_code == 0:
-            self._complete_active_frame(tracker)
             await self.store.mutate(
                 job.id,
-                lambda item, tracker_state=tracker, current_camera=camera_name: self._apply_progress(
+                lambda item,
+                current_camera=camera_name,
+                reason="\n".join(list(lines)[-12:]) or f"Blender exited with code {exit_code}.": self._mark_camera_failed(
                     item,
-                    item.progress,
-                    tracker_state,
-                    item.status_message,
                     current_camera,
+                    reason,
                 ),
             )
-        return exit_code == 0, list(lines), retryable_gpu_error
+            return False, list(lines), retryable_gpu_error
+        finally:
+            await flush_logs()
+            await self._unregister_process(job.id, process)
+
+    def _record_command(self, job: JobRecord, command: list[str]) -> None:
+        if job.phase != JobPhase.running:
+            return
+        job.command = list(command)
 
     def _build_command(
         self,
@@ -277,8 +754,6 @@ class RenderRunner:
             "-noaudio",
             "-P",
             str(self._script_path("prepare_render.py")),
-            "-E",
-            "CYCLES",
             "-o",
             output_pattern,
             "-F",
@@ -286,23 +761,94 @@ class RenderRunner:
             "-x",
             "1",
         ]
+        if job.render_settings.render_engine:
+            command.extend(["-E", job.render_settings.render_engine])
         if job.render_mode == RenderMode.still:
             frame = 1 if job.frame is None else job.frame
             command.extend(["-f", str(frame)])
         else:
-            start_frame = 0 if job.start_frame is None else job.start_frame
+            start_frame = 1 if job.start_frame is None else job.start_frame
             end_frame = start_frame if job.end_frame is None else job.end_frame
-            command.extend(
-                [
-                    "-s",
-                    str(start_frame),
-                    "-e",
-                    str(end_frame),
-                    "-a",
-                ]
-            )
-        command.extend(["--", "--cycles-print-stats", "--cycles-device", device])
+            command.extend(["-s", str(start_frame), "-e", str(end_frame)])
+            if job.render_settings.frame_step and job.render_settings.frame_step > 1:
+                command.extend(["-j", str(job.render_settings.frame_step)])
+            command.append("-a")
+        if self.settings.cycles_print_stats:
+            command.append("--cycles-print-stats")
+        command.extend(["--cycles-device", device])
+        command.append("--")
         return command
+
+    def _build_batch_command(self, job: JobRecord, device: str, plan_path: Path) -> list[str]:
+        command = [
+            self.settings.blender_binary,
+            "-b",
+            str(job.source_file),
+            "-noaudio",
+            "-F",
+            job.output_format.value,
+            "-x",
+            "1",
+        ]
+        if self.settings.cycles_print_stats:
+            command.append("--cycles-print-stats")
+        command.extend(
+            [
+                "-P",
+                str(self._script_path("prepare_render.py")),
+                "-P",
+                str(self._script_path("render_batch.py")),
+                "--",
+                "--render-plan",
+                str(plan_path),
+            ]
+        )
+        return command
+
+    def _write_render_plan(
+        self,
+        job: JobRecord,
+        device: str,
+        requested_cameras: list[str | None],
+    ) -> Path:
+        plan_path = job.output_dir.parent / "render-plan.json"
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan = {
+            "device": device,
+            "render_mode": job.render_mode.value,
+            "output_format": job.output_format.value,
+            "frame": 1 if job.frame is None else job.frame,
+            "start_frame": 1 if job.start_frame is None else job.start_frame,
+            "end_frame": job.end_frame,
+            "frame_step": max(1, job.render_settings.frame_step or 1),
+            "total_cameras": max(1, len(requested_cameras)),
+            "cameras": [
+                {
+                    "camera_name": camera_name,
+                    "camera_index": camera_index + 1,
+                    "output_pattern": self._output_pattern(
+                        job,
+                        camera_name,
+                        camera_index,
+                        len(requested_cameras),
+                    ),
+                }
+                for camera_index, camera_name in enumerate(requested_cameras)
+            ],
+        }
+        if job.render_mode == RenderMode.animation and plan["end_frame"] is None:
+            plan["end_frame"] = plan["start_frame"]
+        plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True), encoding="utf-8")
+        return plan_path
+
+    def _parse_render_farm_event(self, line: str) -> dict | None:
+        if not line.startswith(RENDER_FARM_EVENT_PREFIX):
+            return None
+        try:
+            event = json.loads(line.removeprefix(RENDER_FARM_EVENT_PREFIX))
+        except json.JSONDecodeError:
+            return None
+        return event if isinstance(event, dict) else None
 
     async def inspect_blend(self, source_file: Path, scan_frame: int | None = None) -> dict:
         with tempfile.TemporaryDirectory(dir=self.settings.temp_root) as temp_dir:
@@ -348,7 +894,7 @@ class RenderRunner:
         camera_prefix = self._camera_message_prefix(camera_name)
         frame_match = FRAME_RE.search(line)
         if frame_match:
-            self._track_frame_change(tracker, int(frame_match.group(1)))
+            tracker.current_frame = int(frame_match.group(1))
             message = f"{camera_prefix} rendering frame {tracker.current_frame}."
 
         sample_match = SAMPLE_RE.search(line) or PATH_SAMPLE_RE.search(line)
@@ -363,20 +909,13 @@ class RenderRunner:
             tracker.total_tiles = int(tile_match.group(2))
             message = f"{camera_prefix} tile {tracker.current_tile}/{tracker.total_tiles}."
 
-        if message and tracker.current_frame_started_at is None:
-            tracker.current_frame_started_at = utc_now()
-            if tracker.current_frame is None:
-                if job.render_mode == RenderMode.still and job.frame is not None:
-                    tracker.current_frame = job.frame
-                elif job.start_frame is not None:
-                    tracker.current_frame = job.start_frame
-
         if tracker.total_frames <= 0:
             tracker.total_frames = 1
 
         frame_index = 1
         if job.render_mode == RenderMode.animation and tracker.current_frame is not None and job.start_frame is not None:
-            frame_index = max(1, tracker.current_frame - job.start_frame + 1)
+            frame_step = max(1, job.render_settings.frame_step or 1)
+            frame_index = max(1, ((tracker.current_frame - job.start_frame) // frame_step) + 1)
         elif job.render_mode == RenderMode.still:
             frame_index = 1
 
@@ -406,19 +945,78 @@ class RenderRunner:
         tracker: ProgressTracker,
         message: str | None,
         camera_name: str | None,
+        camera_index: int,
+        outputs: list[str],
     ) -> None:
+        if job.phase != JobPhase.running:
+            return
         job.progress = progress
         job.current_camera_name = camera_name
+        job.current_camera_index = camera_index
         job.current_frame = tracker.current_frame
-        job.current_frame_started_at = tracker.current_frame_started_at
-        job.current_frame_elapsed_seconds = self._current_frame_elapsed_seconds(tracker)
         job.total_frames = tracker.total_frames
-        job.last_frame_duration_seconds = tracker.last_frame_duration_seconds
-        job.average_frame_duration_seconds = self._average_frame_duration(tracker)
         job.current_sample = tracker.current_sample
         job.total_samples = tracker.total_samples
+        job.outputs = outputs
+        job.completed_frames = min(len(outputs), job.total_outputs_expected)
+        job.failed_frames = len([frame for frame in job.frame_statuses if frame.status == FramePhase.failed])
+        job.current_output = self._expected_output_relative(job, camera_name, tracker.current_frame)
+        job.last_progress_at = utc_now()
+        self._mark_frame_status(job, camera_name, tracker.current_frame, FramePhase.rendering)
+        self._update_timing_metrics(job)
         if message:
             job.status_message = message
+
+    def _apply_output_snapshot(
+        self,
+        job: JobRecord,
+        outputs: list[str],
+        camera_name: str | None,
+        frame: int | None,
+    ) -> None:
+        if job.phase != JobPhase.running:
+            return
+        job.outputs = outputs
+        job.completed_frames = min(len(outputs), job.total_outputs_expected)
+        job.failed_frames = len([frame for frame in job.frame_statuses if frame.status == FramePhase.failed])
+        job.current_output = outputs[-1] if outputs else job.current_output
+        if frame is not None:
+            self._mark_frame_status(job, camera_name, frame, FramePhase.complete)
+        job.last_progress_at = utc_now()
+        self._update_timing_metrics(job)
+
+    def _mark_camera_completed(
+        self,
+        job: JobRecord,
+        camera_name: str | None,
+        camera_index: int,
+        outputs: list[str],
+    ) -> None:
+        if job.phase != JobPhase.running:
+            return
+        job.outputs = outputs
+        job.completed_frames = min(len(outputs), job.total_outputs_expected)
+        job.failed_frames = len([frame for frame in job.frame_statuses if frame.status == FramePhase.failed])
+        job.current_camera_name = camera_name
+        job.current_camera_index = camera_index
+        job.current_output = outputs[-1] if outputs else None
+        job.last_progress_at = utc_now()
+        for frame_number in self._frame_numbers(job):
+            self._mark_frame_status(job, camera_name, frame_number, FramePhase.complete)
+        self._update_timing_metrics(job)
+
+    def _mark_camera_failed(
+        self,
+        job: JobRecord,
+        camera_name: str | None,
+        reason: str,
+    ) -> None:
+        if job.phase != JobPhase.running:
+            return
+        for frame_number in self._frame_numbers(job):
+            self._mark_frame_status(job, camera_name, frame_number, FramePhase.failed, reason=reason)
+        job.failed_frames = len([frame for frame in job.frame_statuses if frame.status == FramePhase.failed])
+        job.last_progress_at = utc_now()
 
     def _mark_camera_started(
         self,
@@ -428,79 +1026,129 @@ class RenderRunner:
         total_cameras: int,
         device: str,
     ) -> None:
+        if job.phase != JobPhase.running:
+            return
         job.current_camera_name = camera_name
-        if job.render_mode == RenderMode.still and job.frame is not None:
-            job.current_frame = job.frame
-        elif job.start_frame is not None:
-            job.current_frame = job.start_frame
-        else:
-            job.current_frame = None
-        job.current_frame_started_at = None
-        job.current_frame_elapsed_seconds = None
-        job.last_frame_duration_seconds = None
-        job.average_frame_duration_seconds = None
+        job.current_camera_index = camera_index + 1
+        job.current_frame = None
         job.current_sample = None
         job.total_samples = None
         job.total_frames = self._total_frames(job)
+        job.total_cameras = max(1, total_cameras)
+        job.total_outputs_expected = max(1, job.total_frames * job.total_cameras)
         job.progress = self._overall_progress(camera_index, total_cameras, 2.0)
         camera_position = f" ({camera_index + 1}/{total_cameras})" if total_cameras > 1 else ""
+        first_frame = self._frame_numbers(job)[0]
+        job.current_frame = first_frame
+        job.current_output = self._expected_output_relative(job, camera_name, first_frame)
+        job.last_progress_at = utc_now()
+        self._mark_frame_status(job, camera_name, first_frame, FramePhase.rendering)
+        self._update_timing_metrics(job)
         job.status_message = f"Rendering {self._camera_message_prefix(camera_name)}{camera_position} on {device}."
 
-    def _track_frame_change(self, tracker: ProgressTracker, frame_number: int) -> None:
-        if tracker.current_frame == frame_number:
-            if tracker.current_frame_started_at is None:
-                tracker.current_frame_started_at = utc_now()
+    def _mark_frame_status(
+        self,
+        job: JobRecord,
+        camera_name: str | None,
+        frame_number: int | None,
+        status: FramePhase,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        if frame_number is None:
             return
+        now = utc_now()
+        for frame_status in job.frame_statuses:
+            if frame_status.camera_name == camera_name and frame_status.frame == frame_number:
+                if status == FramePhase.rendering and frame_status.status != FramePhase.rendering:
+                    frame_status.started_at = frame_status.started_at or now
+                    frame_status.attempts += 1
+                if status in {FramePhase.complete, FramePhase.failed, FramePhase.skipped}:
+                    frame_status.finished_at = now
+                    if frame_status.started_at:
+                        frame_status.seconds = max(0.0, (now - frame_status.started_at).total_seconds())
+                frame_status.status = status
+                frame_status.error = reason
+                frame_status.output_path = self._expected_output_relative(job, camera_name, frame_number)
+                return
 
-        self._complete_active_frame(tracker)
-        tracker.current_frame = frame_number
-        tracker.current_frame_started_at = utc_now()
-
-    def _complete_active_frame(self, tracker: ProgressTracker) -> None:
-        if tracker.current_frame is None or tracker.current_frame_started_at is None:
+    def _update_timing_metrics(self, job: JobRecord) -> None:
+        if not job.started_at:
             return
-
-        duration = max(0.0, (utc_now() - tracker.current_frame_started_at).total_seconds())
-        tracker.last_frame_duration_seconds = duration
-        tracker.total_completed_frame_duration += duration
-        tracker.completed_frame_count += 1
-        tracker.current_frame_started_at = None
-
-    def _average_frame_duration(self, tracker: ProgressTracker) -> float | None:
-        if tracker.completed_frame_count <= 0:
-            return None
-        return tracker.total_completed_frame_duration / tracker.completed_frame_count
-
-    def _current_frame_elapsed_seconds(self, tracker: ProgressTracker) -> float | None:
-        if tracker.current_frame_started_at is None:
-            return None
-        return max(0.0, (utc_now() - tracker.current_frame_started_at).total_seconds())
+        now = job.finished_at or utc_now()
+        elapsed = max(0.0, (now - job.started_at).total_seconds())
+        job.elapsed_seconds = elapsed
+        completed_frames = max(
+            job.completed_frames,
+            len([frame for frame in job.frame_statuses if frame.status == FramePhase.complete]),
+        )
+        job.completed_frames = min(completed_frames, job.total_outputs_expected)
+        if job.completed_frames > 0:
+            average = elapsed / job.completed_frames
+            job.average_seconds_per_frame = average
+            remaining = max(0, job.total_outputs_expected - job.completed_frames)
+            job.estimated_seconds_remaining = remaining * average if job.phase == JobPhase.running else 0.0
+        elif job.progress > 2.0:
+            projected = elapsed / max(job.progress / 100.0, 0.01)
+            job.estimated_seconds_remaining = max(0.0, projected - elapsed)
 
     def _should_retry(self, device: str, retryable_gpu_error: bool) -> bool:
         return device != "CPU" and retryable_gpu_error
 
     def _collect_outputs(self, output_dir: Path) -> list[Path]:
-        return sorted(path for path in output_dir.glob("*") if path.is_file())
+        return sorted(
+            path
+            for path in output_dir.rglob("*")
+            if path.is_file() and path.name not in {"metadata.json", "render-settings.json"}
+        )
 
-    async def _create_archive(self, job_id: str, outputs: Iterable[Path]) -> str | None:
+    async def _create_archive(self, job: JobRecord, outputs: Iterable[Path]) -> str | None:
         files = list(outputs)
         if not files:
             return None
-        archive_path = self.settings.jobs_root / job_id / "outputs.zip"
-        await asyncio.to_thread(self._write_archive, archive_path, files)
+        archive_path = self.settings.jobs_root / job.id / "outputs.zip"
+        await asyncio.to_thread(self._write_archive, archive_path, job, files)
         return str(archive_path)
 
-    def _write_archive(self, archive_path: Path, outputs: list[Path]) -> None:
-        with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as zip_file:
+    def _write_archive(self, archive_path: Path, job: JobRecord, outputs: list[Path]) -> None:
+        root_name = self._archive_root_name(job)
+        with ZipFile(archive_path, "w", compression=self._archive_compression(job)) as zip_file:
             for output in outputs:
-                zip_file.write(output, arcname=output.name)
+                relative_path = self._relative_output_path(job.output_dir, output)
+                zip_file.write(output, arcname=f"{root_name}/{relative_path}")
+            zip_file.writestr(
+                f"{root_name}/metadata.json",
+                json.dumps(self._archive_metadata(job), indent=2, sort_keys=True, default=str),
+            )
+            zip_file.writestr(
+                f"{root_name}/render-settings.json",
+                json.dumps(job.render_settings.model_dump(mode="json"), indent=2, sort_keys=True),
+            )
+
+    def _archive_compression(self, job: JobRecord) -> int:
+        if job.output_format.value in {"PNG", "JPEG"}:
+            return ZIP_STORED
+        return ZIP_DEFLATED
+
+    async def create_archive_for_job(self, job: JobRecord) -> str | None:
+        outputs = self._collect_outputs(job.output_dir)
+        return await self._create_archive(job, outputs)
 
     def _total_frames(self, job: JobRecord) -> int:
         if job.render_mode == RenderMode.still:
             return 1
-        start = 0 if job.start_frame is None else job.start_frame
+        start = 1 if job.start_frame is None else job.start_frame
         end = start if job.end_frame is None else job.end_frame
-        return max(1, end - start + 1)
+        step = max(1, job.render_settings.frame_step or 1)
+        return max(1, len(range(start, end + 1, step)))
+
+    def _frame_numbers(self, job: JobRecord) -> list[int]:
+        if job.render_mode == RenderMode.still:
+            return [1 if job.frame is None else job.frame]
+        start = 1 if job.start_frame is None else job.start_frame
+        end = start if job.end_frame is None else job.end_frame
+        step = max(1, job.render_settings.frame_step or 1)
+        return list(range(start, end + 1, step)) or [start]
 
     def _requested_cameras(self, job: JobRecord) -> list[str | None]:
         if job.camera_names:
@@ -527,18 +1175,93 @@ class RenderRunner:
         camera_index: int,
         total_cameras: int,
     ) -> str:
-        if not camera_name:
-            stem = "frame_#####"
-        else:
-            safe_camera = self._safe_output_name(camera_name, "camera")
-            if total_cameras > 1:
-                safe_camera = f"{camera_index + 1:02d}_{safe_camera}"
-            stem = f"{safe_camera}_frame_#####"
-        return str(job.output_dir / stem)
+        del camera_index, total_cameras
+        safe_camera = self._safe_output_name(camera_name or "Default Camera", "Default_Camera")
+        safe_job = self._safe_output_name(Path(job.source_filename).stem, "render")
+        camera_dir = job.output_dir / safe_camera
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        return str(camera_dir / f"{safe_job}_{safe_camera}_#####")
+
+    def _expected_output_relative(
+        self,
+        job: JobRecord,
+        camera_name: str | None,
+        frame: int | None,
+    ) -> str | None:
+        if frame is None:
+            return None
+        safe_camera = self._safe_output_name(camera_name or "Default Camera", "Default_Camera")
+        safe_job = self._safe_output_name(Path(job.source_filename).stem, "render")
+        extension = {
+            "PNG": "png",
+            "JPEG": "jpg",
+            "OPEN_EXR": "exr",
+        }.get(job.output_format.value, job.output_format.value.lower())
+        return f"{safe_camera}/{safe_job}_{safe_camera}_{frame:05d}.{extension}"
+
+    def _relative_output_paths(self, output_dir: Path, outputs: list[Path]) -> list[str]:
+        return [self._relative_output_path(output_dir, path) for path in outputs]
+
+    def _relative_output_path(self, output_dir: Path, output: Path) -> str:
+        try:
+            return output.relative_to(output_dir).as_posix()
+        except ValueError:
+            return output.name
+
+    def _saved_output_relative(self, job: JobRecord, line: str) -> str | None:
+        match = SAVED_PATH_RE.search(line)
+        if not match:
+            return None
+        return self._relative_output_path(job.output_dir, Path(match.group(1)))
+
+    def _archive_root_name(self, job: JobRecord) -> str:
+        return self._safe_output_name(Path(job.source_filename).stem, "render")
+
+    def _archive_metadata(self, job: JobRecord) -> dict:
+        return {
+            "job_id": job.id,
+            "file_id": job.file_id,
+            "source_filename": job.source_filename,
+            "created_at": job.created_at.isoformat(),
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+            "render_mode": job.render_mode.value,
+            "output_format": job.output_format.value,
+            "camera_names": job.camera_names,
+            "frame": job.frame,
+            "start_frame": job.start_frame,
+            "end_frame": job.end_frame,
+            "frame_step": job.render_settings.frame_step,
+            "total_cameras": job.total_cameras,
+            "total_frames": job.total_frames,
+            "total_outputs_expected": job.total_outputs_expected,
+            "outputs": job.outputs,
+        }
 
     def _safe_output_name(self, value: str, fallback: str) -> str:
         cleaned = SAFE_NAME_RE.sub("_", value).strip("._-")
         return cleaned or fallback
+
+    def _camera_log_value(self, camera_name: str | None) -> str:
+        return self._safe_output_name(camera_name or "Default Camera", "Default_Camera")
+
+    def _perf_log(
+        self,
+        event: str,
+        *,
+        duration_seconds: float | None = None,
+        **fields: object,
+    ) -> str:
+        parts = [f"event={event}"]
+        if duration_seconds is not None:
+            parts.append(f"duration={duration_seconds:.3f}s")
+        for key, value in fields.items():
+            parts.append(f"{key}={self._perf_value(value)}")
+        return "perf | " + " ".join(parts)
+
+    def _perf_value(self, value: object) -> str:
+        text = str(value)
+        return SAFE_NAME_RE.sub("_", text).strip("._-") or "none"
 
     def _reset_output_dir(self, output_dir: Path) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -547,6 +1270,54 @@ class RenderRunner:
                 shutil.rmtree(path)
             else:
                 path.unlink()
+
+    async def _register_process(self, job_id: str, process: asyncio.subprocess.Process) -> None:
+        should_cancel = False
+        async with self._process_lock:
+            self._active_processes[job_id] = process
+            should_cancel = job_id in self._cancel_requested
+        if should_cancel:
+            await self._terminate_process(process)
+
+    async def _unregister_process(
+        self,
+        job_id: str,
+        process: asyncio.subprocess.Process | None = None,
+    ) -> None:
+        async with self._process_lock:
+            current = self._active_processes.get(job_id)
+            if current is None:
+                return
+            if process is not None and current is not process:
+                return
+            self._active_processes.pop(job_id, None)
+
+    async def _clear_cancel_request(self, job_id: str) -> None:
+        async with self._process_lock:
+            self._cancel_requested.discard(job_id)
+
+    async def _is_cancel_requested(self, job_id: str) -> bool:
+        async with self._process_lock:
+            return job_id in self._cancel_requested
+
+    async def _job_was_cancelled(self, job_id: str) -> bool:
+        if await self._is_cancel_requested(job_id):
+            return True
+        snapshot = await self.store.get(job_id)
+        return snapshot is not None and snapshot.phase == JobPhase.cancelled
+
+    async def _terminate_process(self, process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        with suppress(ProcessLookupError):
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            with suppress(ProcessLookupError):
+                process.kill()
+            with suppress(asyncio.TimeoutError, ProcessLookupError):
+                await asyncio.wait_for(process.wait(), timeout=5)
 
     async def system_status(self) -> dict:
         blender_version = await self._run_command([self.settings.blender_binary, "--version"])
@@ -590,11 +1361,14 @@ class RenderRunner:
                 continue
         return {"available_types": [], "cuda": [], "optix": [], "hip": [], "cpu": []}
 
-    def _blender_env(self, camera_name: str | None = None) -> dict[str, str]:
+    def _blender_env(self, camera_name: str | None = None, job: JobRecord | None = None) -> dict[str, str]:
         env = os.environ.copy()
         env.pop("RENDER_CAMERA_NAME", None)
+        env.pop("RENDER_SETTINGS_JSON", None)
         if camera_name:
             env["RENDER_CAMERA_NAME"] = camera_name
+        if job is not None:
+            env["RENDER_SETTINGS_JSON"] = job.render_settings.model_dump_json(exclude_none=True)
         return env
 
     async def _run_command(

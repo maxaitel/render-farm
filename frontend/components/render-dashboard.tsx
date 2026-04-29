@@ -6,6 +6,7 @@ import type { ChangeEvent, FormEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
+  Ban,
   ChevronRight,
   Cpu,
   Download,
@@ -13,13 +14,18 @@ import {
   LoaderCircle,
   LogOut,
   Radar,
+  RefreshCcw,
   Shield,
   Upload,
 } from "lucide-react";
 
 import {
+  adminCancelJob,
+  adminRetryJob,
+  cancelJob,
   createRun,
   fetchAdminActivity,
+  fetchAdminFiles,
   fetchAdminOverview,
   fetchAdminRuns,
   fetchAdminUsers,
@@ -27,10 +33,12 @@ import {
   fetchSession,
   fetchSystemStatus,
   inspectStoredFile,
+  retryJob,
   signIn,
   signOut,
   signUp,
   updateAdminUserStatus,
+  type UploadProgressStats,
   uploadFileWithProgress,
 } from "@/lib/api";
 import type {
@@ -40,6 +48,7 @@ import type {
   BlendInspection,
   RenderJob,
   RenderMode,
+  RenderSettings,
   SystemStatus,
   UserAccount,
   UserFile,
@@ -74,14 +83,54 @@ type JobFormState = {
   startFrame: number;
   endFrame: number;
   outputFormat: "PNG" | "JPEG" | "OPEN_EXR";
+  renderEngine: string;
+  samples: number;
+  useDenoising: boolean;
+  resolutionX: number;
+  resolutionY: number;
+  resolutionPercentage: number;
+  frameStep: number;
+  filmTransparent: boolean;
+  viewTransform: string;
+  look: string;
+  exposure: number;
+  gamma: number;
+  imageQuality: number;
+  compression: number;
+  useMotionBlur: boolean;
+  useSimplify: boolean;
+  simplifySubdivision: number;
+  simplifyChildParticles: number;
+  simplifyVolumes: number;
+  seed: number;
 };
 
 const INITIAL_FORM: JobFormState = {
   renderMode: "still",
   frame: 1,
-  startFrame: 0,
+  startFrame: 1,
   endFrame: 24,
   outputFormat: "PNG",
+  renderEngine: "CYCLES",
+  samples: 128,
+  useDenoising: false,
+  resolutionX: 1920,
+  resolutionY: 1080,
+  resolutionPercentage: 100,
+  frameStep: 1,
+  filmTransparent: false,
+  viewTransform: "Filmic",
+  look: "Medium High Contrast",
+  exposure: 0,
+  gamma: 1,
+  imageQuality: 90,
+  compression: 15,
+  useMotionBlur: false,
+  useSimplify: false,
+  simplifySubdivision: 6,
+  simplifyChildParticles: 1,
+  simplifyVolumes: 1,
+  seed: 0,
 };
 
 const SCENE_DIRECTORY_NAMES = new Set([
@@ -123,6 +172,131 @@ function formatBytes(bytes: number) {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function formatDuration(seconds: number | null | undefined) {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) {
+    return "Pending";
+  }
+  if (seconds < 60) {
+    return `${Math.max(1, Math.round(seconds))}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remaining = Math.round(seconds % 60);
+  if (minutes < 60) {
+    return `${minutes}m ${remaining}s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+function formatRate(bytesPerSecond: number | null | undefined) {
+  if (!bytesPerSecond || !Number.isFinite(bytesPerSecond)) {
+    return "Pending";
+  }
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function outputUrl(job: RenderJob, outputPath: string) {
+  return `/backend/api/jobs/${job.id}/outputs/${outputPath
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/")}`;
+}
+
+function isPreviewableOutput(outputPath: string) {
+  return /\.(png|jpe?g|webp)$/i.test(outputPath);
+}
+
+function outputCameraName(outputPath: string) {
+  return outputPath.split("/")[0] || "Default camera";
+}
+
+function outputCounts(job: RenderJob) {
+  const completed = Math.max(job.completed_frames, job.outputs.length);
+  return {
+    completed,
+    expected: Math.max(job.total_outputs_expected, completed),
+  };
+}
+
+function outputProgressLabel(job: RenderJob) {
+  const { completed, expected } = outputCounts(job);
+  if (job.phase === "completed") {
+    return `${completed} output${completed === 1 ? "" : "s"}`;
+  }
+  return `${completed} / ${expected} outputs`;
+}
+
+function frameProgressLabel(job: RenderJob) {
+  if (job.phase === "completed") {
+    return `${job.total_frames} frame${job.total_frames === 1 ? "" : "s"} complete`;
+  }
+  if (job.current_frame !== null) {
+    return `${job.current_frame} / ${job.total_frames}`;
+  }
+  return `0 / ${job.total_frames}`;
+}
+
+function timingSecondaryLabel(job: RenderJob) {
+  if (job.phase === "completed") {
+    return "Complete";
+  }
+  if (job.phase === "failed" || job.phase === "cancelled") {
+    return job.phase;
+  }
+  return `ETA ${formatDuration(job.estimated_seconds_remaining)}`;
+}
+
+function averageFrameLabel(job: RenderJob) {
+  if (job.average_seconds_per_frame === null) {
+    return "Avg unavailable";
+  }
+  return `Avg ${formatDuration(job.average_seconds_per_frame)} / frame`;
+}
+
+function hasRenderSettingValues(settings: RenderSettings) {
+  return Object.values(settings).some(
+    (value) => value !== null && value !== undefined && value !== "",
+  );
+}
+
+function mergeRenderSettingsIntoForm(
+  current: JobFormState,
+  settings: RenderSettings,
+): JobFormState {
+  return {
+    ...current,
+    outputFormat:
+      settings.output_format === "JPEG" || settings.output_format === "OPEN_EXR"
+        ? settings.output_format
+        : settings.output_format === "PNG"
+          ? "PNG"
+          : current.outputFormat,
+    renderEngine: settings.render_engine || current.renderEngine,
+    samples: settings.samples ?? current.samples,
+    useDenoising: settings.use_denoising ?? current.useDenoising,
+    resolutionX: settings.resolution_x ?? current.resolutionX,
+    resolutionY: settings.resolution_y ?? current.resolutionY,
+    resolutionPercentage:
+      settings.resolution_percentage ?? current.resolutionPercentage,
+    frameStep: settings.frame_step ?? current.frameStep,
+    filmTransparent: settings.film_transparent ?? current.filmTransparent,
+    viewTransform: settings.view_transform || current.viewTransform,
+    look: settings.look || current.look,
+    exposure: settings.exposure ?? current.exposure,
+    gamma: settings.gamma ?? current.gamma,
+    imageQuality: settings.image_quality ?? current.imageQuality,
+    compression: settings.compression ?? current.compression,
+    useMotionBlur: settings.use_motion_blur ?? current.useMotionBlur,
+    useSimplify: settings.use_simplify ?? current.useSimplify,
+    simplifySubdivision:
+      settings.simplify_subdivision ?? current.simplifySubdivision,
+    simplifyChildParticles:
+      settings.simplify_child_particles ?? current.simplifyChildParticles,
+    simplifyVolumes: settings.simplify_volumes ?? current.simplifyVolumes,
+    seed: settings.seed ?? current.seed,
+  };
 }
 
 function fileLabel(file: File) {
@@ -208,7 +382,16 @@ function folderRenderTargets(projectFiles: File[]) {
 }
 
 function activePhase(job: RenderJob) {
-  return job.phase === "queued" || job.phase === "running";
+  return (
+    job.phase === "queued" ||
+    job.phase === "running" ||
+    job.phase === "packaging" ||
+    job.phase === "stalled"
+  );
+}
+
+function cancelablePhase(job: RenderJob) {
+  return job.phase === "queued" || job.phase === "running" || job.phase === "stalled";
 }
 
 function frameLabel(job: RenderJob) {
@@ -216,63 +399,6 @@ function frameLabel(job: RenderJob) {
     return `Frame ${job.frame ?? 1}`;
   }
   return `Frames ${job.start_frame ?? 1}-${job.end_frame ?? job.start_frame ?? 1}`;
-}
-
-function formatDuration(seconds: number) {
-  const totalSeconds = Math.max(1, Math.round(seconds));
-  if (totalSeconds < 60) {
-    return `${totalSeconds}s`;
-  }
-
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const remainingSeconds = totalSeconds % 60;
-
-  if (hours > 0) {
-    return `${hours}h ${String(minutes).padStart(2, "0")}m`;
-  }
-  return `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s`;
-}
-
-function currentFrameValue(job: RenderJob) {
-  if (job.current_frame !== null) {
-    return job.current_frame;
-  }
-  if (job.phase !== "running") {
-    return null;
-  }
-  if (job.render_mode === "still") {
-    return job.frame;
-  }
-  return job.start_frame;
-}
-
-function currentFrameText(job: RenderJob) {
-  const frame = currentFrameValue(job);
-  if (frame === null) {
-    return null;
-  }
-  if (job.render_mode === "still") {
-    return `Current frame ${frame}`;
-  }
-  const start = job.start_frame ?? frame;
-  const end = job.end_frame ?? start;
-  return `Current frame ${frame} of ${start}-${end}`;
-}
-
-function timePerFrameText(job: RenderJob) {
-  const current =
-    job.phase === "running" ? job.current_frame_elapsed_seconds : null;
-  if (current !== null) {
-    return `Time / frame ${formatDuration(current)} so far`;
-  }
-  if (job.average_frame_duration_seconds !== null) {
-    return `Time / frame ${formatDuration(job.average_frame_duration_seconds)} avg`;
-  }
-  if (job.last_frame_duration_seconds !== null) {
-    return `Time / frame ${formatDuration(job.last_frame_duration_seconds)}`;
-  }
-  return null;
 }
 
 function cameraLabel(job: RenderJob) {
@@ -290,15 +416,19 @@ function cameraLabel(job: RenderJob) {
 
 function liveDetail(job: RenderJob) {
   const cameraPrefix = job.current_camera_name
-    ? `${job.current_camera_name} • `
+    ? `${job.current_camera_name}${job.current_camera_index ? ` ${job.current_camera_index}/${job.total_cameras}` : ""} • `
     : "";
-  if (job.render_mode === "animation" && job.current_frame !== null) {
-    const start = job.start_frame ?? job.current_frame;
-    const end = job.end_frame ?? start;
-    return `${cameraPrefix}Frame ${job.current_frame} of ${start}-${end}`;
+  if (job.current_frame !== null) {
+    return `${cameraPrefix}Frame ${job.current_frame} of ${job.total_frames}`;
   }
   if (job.current_sample !== null && job.total_samples) {
     return `${cameraPrefix}Sample ${job.current_sample} of ${job.total_samples}`;
+  }
+  if (job.phase === "queued" && job.queue_position) {
+    return `Queued at position ${job.queue_position}`;
+  }
+  if (job.phase === "packaging") {
+    return "Packaging outputs";
   }
   return job.resolved_device
     ? `${cameraPrefix}${job.resolved_device}`
@@ -332,7 +462,7 @@ function runBadgeVariant(job: RenderJob): "secondary" | "success" | "destructive
   if (job.phase === "completed") {
     return "success";
   }
-  if (job.phase === "failed") {
+  if (job.phase === "failed" || job.phase === "cancelled" || job.phase === "stalled") {
     return "destructive";
   }
   return "secondary";
@@ -361,6 +491,7 @@ function upsertRun(files: UserFile[], nextRun: RenderJob) {
       );
       return {
         ...file,
+        render_settings: nextRun.render_settings,
         jobs,
         latest_job: jobs[0] ?? null,
         updated_at: nextRun.created_at,
@@ -370,13 +501,6 @@ function upsertRun(files: UserFile[], nextRun: RenderJob) {
       (left, right) =>
         new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
     );
-}
-
-function upsertAdminRun(jobs: RenderJob[], nextRun: RenderJob) {
-  return [nextRun, ...jobs.filter((job) => job.id !== nextRun.id)].sort(
-    (left, right) =>
-      new Date(right.created_at).getTime() - new Date(left.created_at).getTime(),
-  );
 }
 
 function TopBar({
@@ -503,6 +627,7 @@ function AuthScreen({
                   type="password"
                   value={authPassword}
                   onChange={(event) => setAuthPassword(event.target.value)}
+                  minLength={authMode === "sign-up" ? 12 : undefined}
                   autoComplete={
                     authMode === "sign-in" ? "current-password" : "new-password"
                   }
@@ -595,6 +720,7 @@ function UploadCard({
   selectedBlendFile,
   selectionMessage,
   uploadProgress,
+  uploadStats,
   uploadSourceMode,
   uploading,
 }: {
@@ -605,6 +731,7 @@ function UploadCard({
   selectedBlendFile: File | null;
   selectionMessage: string | null;
   uploadProgress: number;
+  uploadStats: UploadProgressStats | null;
   uploadSourceMode: UploadSourceMode;
   uploading: boolean;
 }) {
@@ -645,7 +772,23 @@ function UploadCard({
           {selectionMessage && selectedBlendFile ? (
             <p className="text-sm text-muted-foreground">{selectionMessage}</p>
           ) : null}
-          {uploading ? <Progress value={uploadProgress} /> : null}
+          {uploading ? (
+            <div className="space-y-2">
+              <Progress value={uploadProgress} />
+              <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-4">
+                <span>{uploadStats ? `${uploadProgress.toFixed(0)}%` : "Starting"}</span>
+                <span>
+                  {uploadStats
+                    ? `${formatBytes(uploadStats.loaded)} / ${formatBytes(uploadStats.total)}`
+                    : "Measuring size"}
+                </span>
+                <span>{formatRate(uploadStats?.bytesPerSecond)}</span>
+                <span>
+                  ETA {formatDuration(uploadStats?.estimatedSecondsRemaining)}
+                </span>
+              </div>
+            </div>
+          ) : null}
           <Button className="w-full" disabled={uploading || !selectedBlendFile}>
             {uploading ? (
               <>
@@ -710,29 +853,6 @@ function FileGrid({ files }: { files: UserFile[] }) {
               <span>{formatBytes(file.original_size_bytes)}</span>
               <span>{file.jobs.length} run{file.jobs.length === 1 ? "" : "s"}</span>
             </div>
-            {file.latest_job ? (
-              <div className="space-y-2 rounded-lg border bg-muted/20 p-3 text-sm">
-                <p className="text-muted-foreground">
-                  {cameraLabel(file.latest_job)} • {frameLabel(file.latest_job)}
-                </p>
-                <p className="text-foreground/80">
-                  {activePhase(file.latest_job)
-                    ? liveDetail(file.latest_job)
-                    : file.latest_job.error || file.latest_job.status_message}
-                </p>
-                {currentFrameText(file.latest_job) || timePerFrameText(file.latest_job) ? (
-                  <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                    {currentFrameText(file.latest_job) ? (
-                      <span>{currentFrameText(file.latest_job)}</span>
-                    ) : null}
-                    {timePerFrameText(file.latest_job) ? (
-                      <span>{timePerFrameText(file.latest_job)}</span>
-                    ) : null}
-                  </div>
-                ) : null}
-                {activePhase(file.latest_job) ? <Progress value={file.latest_job.progress} /> : null}
-              </div>
-            ) : null}
             <Button asChild className="w-full" variant="outline">
               <Link href={`/files/${file.id}`}>
                 Open scene
@@ -756,6 +876,7 @@ function LibraryView({
   selectedBlendFile,
   selectionMessage,
   uploadProgress,
+  uploadStats,
   uploadSourceMode,
   uploading,
 }: {
@@ -768,6 +889,7 @@ function LibraryView({
   selectedBlendFile: File | null;
   selectionMessage: string | null;
   uploadProgress: number;
+  uploadStats: UploadProgressStats | null;
   uploadSourceMode: UploadSourceMode;
   uploading: boolean;
 }) {
@@ -781,6 +903,7 @@ function LibraryView({
         selectedBlendFile={selectedBlendFile}
         selectionMessage={selectionMessage}
         uploadProgress={uploadProgress}
+        uploadStats={uploadStats}
         uploadSourceMode={uploadSourceMode}
         uploading={uploading}
       />
@@ -802,24 +925,296 @@ function LibraryView({
   );
 }
 
+function JobProgressPanel({
+  job,
+  onCancelJob,
+  onRetryJob,
+  cancelling,
+  retrying,
+}: {
+  job: RenderJob;
+  onCancelJob: (job: RenderJob) => void;
+  onRetryJob: (job: RenderJob) => void;
+  cancelling: boolean;
+  retrying: boolean;
+}) {
+  const visibleOutputs = job.outputs.filter(isPreviewableOutput);
+  const latestOutput = visibleOutputs[visibleOutputs.length - 1] ?? null;
+  const cameraPosition =
+    job.current_camera_index && job.total_cameras
+      ? `${job.current_camera_index} / ${job.total_cameras}`
+      : `${job.total_cameras}`;
+  const framePosition = frameProgressLabel(job);
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <div className="rounded-lg border bg-background p-3">
+          <p className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
+            Camera
+          </p>
+          <p className="mt-1 truncate text-sm font-medium">
+            {job.current_camera_name || cameraLabel(job)}
+          </p>
+          <p className="text-xs text-muted-foreground">{cameraPosition}</p>
+        </div>
+        <div className="rounded-lg border bg-background p-3">
+          <p className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
+            Frame
+          </p>
+          <p className="mt-1 text-sm font-medium">{framePosition}</p>
+          <p className="text-xs text-muted-foreground">
+            {outputProgressLabel(job)}
+          </p>
+        </div>
+        <div className="rounded-lg border bg-background p-3">
+          <p className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
+            Timing
+          </p>
+          <p className="mt-1 text-sm font-medium">
+            {formatDuration(job.elapsed_seconds)}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            {timingSecondaryLabel(job)}
+          </p>
+        </div>
+        <div className="rounded-lg border bg-background p-3">
+          <p className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
+            Worker
+          </p>
+          <p className="mt-1 truncate text-sm font-medium">
+            {job.worker_assigned || "Unassigned"}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            {averageFrameLabel(job)}
+          </p>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+          <span>{job.status_message}</span>
+          <span className="text-muted-foreground">
+            {job.progress.toFixed(0)}%
+          </span>
+        </div>
+        <Progress value={job.progress} />
+        <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
+          {job.current_output ? <span>Current output: {job.current_output}</span> : null}
+          {job.queue_position ? <span>Queue position: {job.queue_position}</span> : null}
+          {job.last_progress_at ? (
+            <span>Last progress: {formatTimestamp(job.last_progress_at)}</span>
+          ) : null}
+        </div>
+      </div>
+
+      {latestOutput ? (
+        <div className="grid gap-3 md:grid-cols-[180px_minmax(0,1fr)]">
+          <div className="overflow-hidden rounded-lg border bg-muted">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              alt={latestOutput}
+              className="aspect-video h-full w-full object-cover"
+              src={outputUrl(job, latestOutput)}
+            />
+          </div>
+          <div className="grid grid-cols-4 gap-2 sm:grid-cols-6 lg:grid-cols-8">
+            {visibleOutputs.slice(-16).map((output) => (
+              <a
+                className="group overflow-hidden rounded-md border bg-muted"
+                href={outputUrl(job, output)}
+                key={output}
+                target="_blank"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  alt={output}
+                  className="aspect-video w-full object-cover transition-transform group-hover:scale-105"
+                  src={outputUrl(job, output)}
+                />
+              </a>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      <div className="flex flex-wrap gap-2">
+        {job.archive_path || job.outputs.length ? (
+          <Button asChild size="sm" variant="outline">
+            <a href={`/backend/api/jobs/${job.id}/download`}>
+              <Download />
+              Download {job.phase === "completed" ? "zip" : "partial zip"}
+            </a>
+          </Button>
+        ) : null}
+        {cancelablePhase(job) ? (
+          <Button
+            disabled={cancelling}
+            onClick={() => onCancelJob(job)}
+            size="sm"
+            type="button"
+            variant="destructive"
+          >
+            {cancelling ? (
+              <>
+                <LoaderCircle className="animate-spin" />
+                Cancelling
+              </>
+            ) : (
+              <>
+                <Ban />
+                Cancel
+              </>
+            )}
+          </Button>
+        ) : null}
+        {!activePhase(job) && job.phase !== "completed" ? (
+          <Button
+            disabled={retrying}
+            onClick={() => onRetryJob(job)}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            {retrying ? (
+              <>
+                <LoaderCircle className="animate-spin" />
+                Retrying
+              </>
+            ) : (
+              <>
+                <RefreshCcw />
+                Retry
+              </>
+            )}
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function AdminJobInspector({
+  job,
+  ownerName,
+}: {
+  job: RenderJob;
+  ownerName: string;
+}) {
+  const failedFrames = job.frame_statuses.filter((frame) => frame.status === "failed");
+  const recentFrames = job.frame_statuses
+    .filter((frame) => frame.status !== "pending")
+    .slice(-12);
+
+  return (
+    <details className="rounded-lg border bg-muted/20 p-3">
+      <summary className="cursor-pointer text-sm font-medium">
+        Inspect job details
+      </summary>
+      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+        <div className="space-y-3 text-sm">
+          <div className="grid grid-cols-2 gap-3">
+            {[
+              ["Job", job.id],
+              ["Owner", ownerName],
+              ["Phase", job.phase],
+              ["Worker", job.worker_assigned || "Unassigned"],
+              ["Device", job.resolved_device || job.requested_device],
+              ["Priority", String(job.priority)],
+              ["Started", formatTimestamp(job.started_at)],
+              ["Last progress", formatTimestamp(job.last_progress_at)],
+              ["Expected", `${outputCounts(job).expected} outputs`],
+              ["Completed", `${outputCounts(job).completed} outputs`],
+            ].map(([label, value]) => (
+              <div className="rounded-md border bg-background p-3" key={label}>
+                <p className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
+                  {label}
+                </p>
+                <p className="mt-1 break-words">{value}</p>
+              </div>
+            ))}
+          </div>
+          {job.current_output ? (
+            <p className="rounded-md border bg-background p-3 text-muted-foreground">
+              Current output: <span className="text-foreground">{job.current_output}</span>
+            </p>
+          ) : null}
+          {failedFrames.length ? (
+            <div className="rounded-md border border-rose-200 bg-rose-50 p-3 text-rose-800">
+              <p className="font-medium">{failedFrames.length} failed frame records</p>
+              {failedFrames.slice(0, 4).map((frame) => (
+                <p className="mt-1 text-xs" key={`${frame.camera_name}-${frame.frame}`}>
+                  {frame.camera_name || "Default camera"} frame {frame.frame}:{" "}
+                  {frame.error || "failed"}
+                </p>
+              ))}
+            </div>
+          ) : null}
+        </div>
+
+        <div className="space-y-3">
+          <details className="rounded-md border bg-background p-3" open>
+            <summary className="cursor-pointer text-sm font-medium">Render settings</summary>
+            <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap text-xs text-muted-foreground">
+              {JSON.stringify(job.render_settings, null, 2)}
+            </pre>
+          </details>
+          <details className="rounded-md border bg-background p-3">
+            <summary className="cursor-pointer text-sm font-medium">Command and environment</summary>
+            <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap text-xs text-muted-foreground">
+              {[
+                job.command.length ? job.command.join(" ") : "Command not recorded.",
+                "",
+                JSON.stringify(job.environment_info, null, 2),
+              ].join("\n")}
+            </pre>
+          </details>
+          <details className="rounded-md border bg-background p-3">
+            <summary className="cursor-pointer text-sm font-medium">Recent frame records</summary>
+            <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap text-xs text-muted-foreground">
+              {JSON.stringify(recentFrames, null, 2)}
+            </pre>
+          </details>
+          {job.logs_tail.length ? (
+            <details className="rounded-md border bg-background p-3">
+              <summary className="cursor-pointer text-sm font-medium">Log tail</summary>
+              <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap text-xs text-muted-foreground">
+                {job.logs_tail.join("\n")}
+              </pre>
+            </details>
+          ) : null}
+        </div>
+      </div>
+    </details>
+  );
+}
+
 function FileDetailView({
+  cancellingJobIds,
   cameraInspection,
   file,
   form,
   inspecting,
+  onCancelJob,
   onInspect,
+  onRetryJob,
   onRun,
+  retryingJobIds,
   running,
   selectedCameraNames,
   setForm,
   setSelectedCameraNames,
 }: {
+  cancellingJobIds: string[];
   cameraInspection: BlendInspection | null;
   file: UserFile;
   form: JobFormState;
   inspecting: boolean;
+  onCancelJob: (job: RenderJob) => void;
   onInspect: () => void;
+  onRetryJob: (job: RenderJob) => void;
   onRun: (event: FormEvent<HTMLFormElement>) => void;
+  retryingJobIds: string[];
   running: boolean;
   selectedCameraNames: string[];
   setForm: (updater: (current: JobFormState) => JobFormState) => void;
@@ -857,6 +1252,40 @@ function FileDetailView({
               <span className="text-muted-foreground">Runs</span>
               <span>{file.jobs.length}</span>
             </div>
+            {cameraInspection ? (
+              <>
+                <Separator />
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <p className="text-muted-foreground">Cameras</p>
+                    <p>{cameraInspection.cameras.length}</p>
+                  </div>
+                  <div>
+                    <p className="text-muted-foreground">Frames</p>
+                    <p>
+                      {cameraInspection.frame_start}-{cameraInspection.frame_end}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-muted-foreground">Resolution</p>
+                    <p>
+                      {cameraInspection.resolution.x}x{cameraInspection.resolution.y}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-muted-foreground">Engine</p>
+                    <p>{cameraInspection.render_engine}</p>
+                  </div>
+                </div>
+                {cameraInspection.asset_warnings.length ? (
+                  <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-amber-800">
+                    {cameraInspection.asset_warnings.slice(0, 3).map((warning) => (
+                      <p key={warning}>{warning}</p>
+                    ))}
+                  </div>
+                ) : null}
+              </>
+            ) : null}
           </CardContent>
         </Card>
 
@@ -929,7 +1358,7 @@ function FileDetailView({
                         onChange={(event) =>
                           setForm((current) => ({
                             ...current,
-                            startFrame: Number(event.target.value || 0),
+                            startFrame: Number(event.target.value || 1),
                           }))
                         }
                       />
@@ -1005,6 +1434,215 @@ function FileDetailView({
                 ) : null}
               </div>
 
+              <Separator />
+
+              <div className="space-y-3">
+                <div>
+                  <p className="text-sm font-medium">Render settings</p>
+                  <p className="text-sm text-muted-foreground">
+                    The first scan seeds these from the blend. Your changes are saved as this scene's defaults after each run.
+                  </p>
+                </div>
+                <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Engine</span>
+                    <select
+                      className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                      value={form.renderEngine}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          renderEngine: event.target.value,
+                        }))
+                      }
+                    >
+                      <option value="CYCLES">Cycles</option>
+                      <option value="BLENDER_EEVEE_NEXT">Eevee</option>
+                      <option value="BLENDER_WORKBENCH">Workbench</option>
+                    </select>
+                  </label>
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Samples</span>
+                    <Input
+                      min={1}
+                      type="number"
+                      value={form.samples}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          samples: Number(event.target.value || 1),
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Resolution X</span>
+                    <Input
+                      min={1}
+                      type="number"
+                      value={form.resolutionX}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          resolutionX: Number(event.target.value || 1),
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Resolution Y</span>
+                    <Input
+                      min={1}
+                      type="number"
+                      value={form.resolutionY}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          resolutionY: Number(event.target.value || 1),
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Scale %</span>
+                    <Input
+                      max={100}
+                      min={1}
+                      type="number"
+                      value={form.resolutionPercentage}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          resolutionPercentage: Number(event.target.value || 100),
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Frame step</span>
+                    <Input
+                      min={1}
+                      type="number"
+                      value={form.frameStep}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          frameStep: Number(event.target.value || 1),
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Image quality</span>
+                    <Input
+                      max={100}
+                      min={1}
+                      type="number"
+                      value={form.imageQuality}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          imageQuality: Number(event.target.value || 90),
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Compression</span>
+                    <Input
+                      max={100}
+                      min={0}
+                      type="number"
+                      value={form.compression}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          compression: Number(event.target.value || 0),
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>View transform</span>
+                    <Input
+                      value={form.viewTransform}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          viewTransform: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Look</span>
+                    <Input
+                      value={form.look}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          look: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Exposure</span>
+                    <Input
+                      step="0.1"
+                      type="number"
+                      value={form.exposure}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          exposure: Number(event.target.value || 0),
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="space-y-2 text-sm font-medium">
+                    <span>Gamma</span>
+                    <Input
+                      min={0.01}
+                      step="0.01"
+                      type="number"
+                      value={form.gamma}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          gamma: Number(event.target.value || 1),
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                  {[
+                    ["Denoising", "useDenoising"],
+                    ["Transparent", "filmTransparent"],
+                    ["Motion blur", "useMotionBlur"],
+                    ["Simplify", "useSimplify"],
+                  ].map(([label, key]) => (
+                    <label
+                      className="flex items-center gap-2 rounded-md border bg-background px-3 py-2 text-sm"
+                      key={key}
+                    >
+                      <input
+                        checked={Boolean(form[key as keyof JobFormState])}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            [key]: event.target.checked,
+                          }))
+                        }
+                        type="checkbox"
+                      />
+                      <span>{label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
               <div className="space-y-2">
                 <Button disabled={running}>
                   {running ? (
@@ -1055,23 +1693,43 @@ function FileDetailView({
                           ? liveDetail(job)
                           : job.error || job.status_message}
                       </p>
-                      {currentFrameText(job) || timePerFrameText(job) ? (
-                        <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground">
-                          {currentFrameText(job) ? <span>{currentFrameText(job)}</span> : null}
-                          {timePerFrameText(job) ? <span>{timePerFrameText(job)}</span> : null}
-                        </div>
-                      ) : null}
                     </div>
-                    {job.archive_path ? (
+                    {job.archive_path || job.outputs.length ? (
                       <Button asChild size="sm" variant="outline">
                         <a href={`/backend/api/jobs/${job.id}/download`}>
                           <Download />
                           Download
                         </a>
                       </Button>
+                    ) : cancelablePhase(job) ? (
+                      <Button
+                        disabled={cancellingJobIds.includes(job.id)}
+                        onClick={() => onCancelJob(job)}
+                        size="sm"
+                        type="button"
+                        variant="destructive"
+                      >
+                        {cancellingJobIds.includes(job.id) ? (
+                          <>
+                            <LoaderCircle className="animate-spin" />
+                            Cancelling
+                          </>
+                        ) : (
+                          <>
+                            <Ban />
+                            Cancel
+                          </>
+                        )}
+                      </Button>
                     ) : null}
                   </div>
-                  {activePhase(job) ? <Progress value={job.progress} /> : null}
+                  <JobProgressPanel
+                    cancelling={cancellingJobIds.includes(job.id)}
+                    job={job}
+                    onCancelJob={onCancelJob}
+                    onRetryJob={onRetryJob}
+                    retrying={retryingJobIds.includes(job.id)}
+                  />
                   {job.logs_tail.length ? (
                     <details className="rounded-md border bg-muted/30 p-3">
                       <summary className="cursor-pointer text-sm font-medium">
@@ -1098,33 +1756,60 @@ function FileDetailView({
 
 function AdminView({
   adminActivity,
+  adminFiles,
   adminOverview,
   adminRuns,
   adminUsers,
+  onCancelJob,
+  onRetryJob,
   onStatusChange,
 }: {
   adminActivity: ActivityRecord[];
+  adminFiles: UserFile[];
   adminOverview: AdminOverview | null;
   adminRuns: RenderJob[];
   adminUsers: UserAccount[];
+  onCancelJob: (job: RenderJob) => void;
+  onRetryJob: (job: RenderJob) => void;
   onStatusChange: (userId: number, status: UserStatus) => void;
 }) {
-  const runningRuns = adminRuns
-    .filter((job) => job.phase === "running")
-    .sort(
-      (left, right) =>
-        new Date(left.started_at ?? left.created_at).getTime() -
-        new Date(right.started_at ?? right.created_at).getTime(),
-    );
-  const queuedRuns = adminRuns
-    .filter((job) => job.phase === "queued")
-    .sort(
-      (left, right) =>
-        new Date(left.created_at).getTime() - new Date(right.created_at).getTime(),
-    );
-  const recentFinishedRuns = adminRuns.filter(
-    (job) => job.phase === "completed" || job.phase === "failed",
+  const [jobSearch, setJobSearch] = useState("");
+  const [userSearch, setUserSearch] = useState("");
+  const normalizedJobSearch = jobSearch.trim().toLowerCase();
+  const normalizedUserSearch = userSearch.trim().toLowerCase();
+  const userNameById = new Map(
+    adminUsers.map((user) => [user.id, user.username] as const),
   );
+  const ownerLabel = (userId: number) => userNameById.get(userId) || `User ${userId}`;
+  const visibleUsers = adminUsers.filter((user) =>
+    user.username.toLowerCase().includes(normalizedUserSearch),
+  );
+  const visibleRuns = adminRuns.filter((job) => {
+    if (!normalizedJobSearch) {
+      return true;
+    }
+    return [
+      job.source_filename,
+      job.phase,
+      job.id,
+      job.camera_names.join(" "),
+      String(job.user_id),
+      ownerLabel(job.user_id),
+    ]
+      .join(" ")
+      .toLowerCase()
+      .includes(normalizedJobSearch);
+  });
+  const visibleFiles = adminFiles.filter((file) => {
+    if (!normalizedJobSearch) {
+      return true;
+    }
+    return [file.source_filename, file.id, String(file.user_id), ownerLabel(file.user_id)]
+      .join(" ")
+      .toLowerCase()
+      .includes(normalizedJobSearch);
+  });
+  const currentJobs = adminRuns.filter(activePhase);
 
   return (
     <div className="space-y-6">
@@ -1148,119 +1833,46 @@ function AdminView({
         ))}
       </div>
 
-      <div className="grid gap-6 xl:grid-cols-2">
-        <Card className="subtle-panel rounded-2xl shadow-none">
-          <CardHeader>
-            <CardTitle className="text-lg font-semibold">Running jobs</CardTitle>
-            <CardDescription>
-              Live renders with progress, frame state, and log tails.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {runningRuns.length ? (
-              runningRuns.map((job) => (
-                <Card className="rounded-xl shadow-none" key={job.id}>
-                  <CardContent className="space-y-4 p-4">
-                    <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-                      <div className="space-y-2">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Badge variant={runBadgeVariant(job)}>{job.phase}</Badge>
-                          <span className="text-sm font-medium">{job.source_filename}</span>
-                        </div>
-                        <p className="text-sm text-muted-foreground">
-                          User {job.user_id} • {cameraLabel(job)} • {frameLabel(job)}
-                        </p>
-                        <p className="text-sm text-muted-foreground">
-                          Queued {formatTimestamp(job.created_at)}
-                        </p>
-                        <p className="text-sm text-foreground/80">{liveDetail(job)}</p>
-                        {currentFrameText(job) || timePerFrameText(job) ? (
-                          <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground">
-                            {currentFrameText(job) ? <span>{currentFrameText(job)}</span> : null}
-                            {timePerFrameText(job) ? <span>{timePerFrameText(job)}</span> : null}
-                          </div>
-                        ) : null}
-                      </div>
-                      {job.archive_path ? (
-                        <Button asChild size="sm" variant="outline">
-                          <a href={`/backend/api/jobs/${job.id}/download`}>
-                            <Download />
-                            Download
-                          </a>
-                        </Button>
-                      ) : null}
+      <Card className="subtle-panel rounded-2xl shadow-none">
+        <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <CardTitle className="text-lg font-semibold">Current jobs</CardTitle>
+            <CardDescription>Queued, rendering, packaging, and stalled jobs.</CardDescription>
+          </div>
+          <Badge variant="outline">{currentJobs.length} active</Badge>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {currentJobs.length ? (
+            currentJobs.map((job) => (
+              <div className="space-y-4 rounded-lg border p-4" key={job.id}>
+                <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="truncate text-sm font-medium">{job.source_filename}</p>
+                      <Badge variant={runBadgeVariant(job)}>{job.phase}</Badge>
                     </div>
-                    <Progress value={job.progress} />
-                    {job.logs_tail.length ? (
-                      <details className="rounded-md border bg-muted/30 p-3">
-                        <summary className="cursor-pointer text-sm font-medium">
-                          Log tail
-                        </summary>
-                        <pre className="mt-3 overflow-x-auto whitespace-pre-wrap text-xs text-muted-foreground">
-                          {job.logs_tail.join("\n")}
-                        </pre>
-                      </details>
-                    ) : null}
-                  </CardContent>
-                </Card>
-              ))
-            ) : (
-              <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
-                No renders are running right now.
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {ownerLabel(job.user_id)} • {cameraLabel(job)} • {frameLabel(job)}
+                    </p>
+                  </div>
+                </div>
+                <JobProgressPanel
+                  cancelling={false}
+                  job={job}
+                  onCancelJob={onCancelJob}
+                  onRetryJob={onRetryJob}
+                  retrying={false}
+                />
+                <AdminJobInspector job={job} ownerName={ownerLabel(job.user_id)} />
               </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card className="subtle-panel rounded-2xl shadow-none">
-          <CardHeader>
-            <CardTitle className="text-lg font-semibold">Queue</CardTitle>
-            <CardDescription>
-              Jobs waiting for a worker slot.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {queuedRuns.length ? (
-              queuedRuns.map((job) => (
-                <Card className="rounded-xl shadow-none" key={job.id}>
-                  <CardContent className="space-y-4 p-4">
-                    <div className="space-y-2">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <Badge variant={runBadgeVariant(job)}>{job.phase}</Badge>
-                        <span className="text-sm font-medium">{job.source_filename}</span>
-                      </div>
-                      <p className="text-sm text-muted-foreground">
-                        User {job.user_id} • {cameraLabel(job)} • {frameLabel(job)}
-                      </p>
-                      <p className="text-sm text-muted-foreground">
-                        Queued {formatTimestamp(job.created_at)}
-                      </p>
-                      <p className="text-sm text-foreground/80">
-                        {job.error || job.status_message}
-                      </p>
-                    </div>
-                    <Progress value={job.progress} />
-                    {job.logs_tail.length ? (
-                      <details className="rounded-md border bg-muted/30 p-3">
-                        <summary className="cursor-pointer text-sm font-medium">
-                          Log tail
-                        </summary>
-                        <pre className="mt-3 overflow-x-auto whitespace-pre-wrap text-xs text-muted-foreground">
-                          {job.logs_tail.join("\n")}
-                        </pre>
-                      </details>
-                    ) : null}
-                  </CardContent>
-                </Card>
-              ))
-            ) : (
-              <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
-                The queue is empty.
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
+            ))
+          ) : (
+            <div className="rounded-lg border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">
+              No active jobs right now.
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
         <Card className="subtle-panel rounded-2xl shadow-none">
@@ -1269,7 +1881,12 @@ function AdminView({
             <CardDescription>Approve or suspend access.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
-            {adminUsers.map((user) => (
+            <Input
+              placeholder="Search users"
+              value={userSearch}
+              onChange={(event) => setUserSearch(event.target.value)}
+            />
+            {visibleUsers.map((user) => (
               <div
                 className="flex flex-col gap-4 rounded-lg border p-4 md:flex-row md:items-center md:justify-between"
                 key={user.id}
@@ -1315,37 +1932,125 @@ function AdminView({
           </Card>
           <Card className="subtle-panel rounded-2xl shadow-none">
             <CardHeader>
-              <CardTitle className="text-lg font-semibold">Recent finished runs</CardTitle>
+              <CardTitle className="text-lg font-semibold">Recent runs</CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
-              {recentFinishedRuns.slice(0, 8).map((job) => (
+              <Input
+                placeholder="Search jobs, files, status, user id"
+                value={jobSearch}
+                onChange={(event) => setJobSearch(event.target.value)}
+              />
+              {visibleRuns.slice(0, 8).map((job) => (
                 <div className="rounded-lg border p-4" key={job.id}>
                   <div className="flex items-center justify-between gap-3">
                     <p className="truncate text-sm font-medium">{job.source_filename}</p>
                     <Badge variant={runBadgeVariant(job)}>{job.phase}</Badge>
                   </div>
                   <p className="mt-2 text-xs text-muted-foreground">
-                    User {job.user_id} • {cameraLabel(job)} • {frameLabel(job)}
+                    {ownerLabel(job.user_id)} • {cameraLabel(job)} • {frameLabel(job)}
                   </p>
                   <p className="mt-2 text-xs text-muted-foreground">
-                    {job.error || job.status_message}
+                    {outputProgressLabel(job)} • Last progress{" "}
+                    {formatTimestamp(job.last_progress_at)}
                   </p>
-                  {timePerFrameText(job) ? (
-                    <p className="mt-2 text-xs text-muted-foreground">
-                      {timePerFrameText(job)}
-                    </p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {job.archive_path || job.outputs.length ? (
+                      <Button asChild size="sm" variant="outline">
+                        <a href={`/backend/api/jobs/${job.id}/download`}>
+                          <Download />
+                          Outputs
+                        </a>
+                      </Button>
+                    ) : null}
+                    {job.log_path ? (
+                      <Button asChild size="sm" variant="outline">
+                        <a href={`/backend/api/jobs/${job.id}/logs`}>
+                          <RefreshCcw />
+                          Logs
+                        </a>
+                      </Button>
+                    ) : null}
+                    {cancelablePhase(job) ? (
+                      <Button
+                        onClick={() => onCancelJob(job)}
+                        size="sm"
+                        type="button"
+                        variant="destructive"
+                      >
+                        <Ban />
+                        Cancel
+                      </Button>
+                    ) : null}
+                    {!activePhase(job) && job.phase !== "completed" ? (
+                      <Button
+                        onClick={() => onRetryJob(job)}
+                        size="sm"
+                        type="button"
+                        variant="outline"
+                      >
+                        <RefreshCcw />
+                        Retry
+                      </Button>
+                    ) : null}
+                  </div>
+                  {job.outputs.filter(isPreviewableOutput).length ? (
+                    <div className="mt-3 grid grid-cols-4 gap-2">
+                      {job.outputs.filter(isPreviewableOutput).slice(-4).map((output) => (
+                        <a
+                          className="overflow-hidden rounded-md border bg-muted"
+                          href={outputUrl(job, output)}
+                          key={output}
+                          target="_blank"
+                        >
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            alt={output}
+                            className="aspect-video w-full object-cover"
+                            src={outputUrl(job, output)}
+                          />
+                        </a>
+                      ))}
+                    </div>
                   ) : null}
+                  <div className="mt-3">
+                    <AdminJobInspector job={job} ownerName={ownerLabel(job.user_id)} />
+                  </div>
                 </div>
               ))}
-              {!recentFinishedRuns.length ? (
-                <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
-                  No completed or failed jobs yet.
-                </div>
-              ) : null}
             </CardContent>
           </Card>
         </div>
       </div>
+
+      <Card className="subtle-panel rounded-2xl shadow-none">
+        <CardHeader>
+          <CardTitle className="text-lg font-semibold">Uploaded files</CardTitle>
+          <CardDescription>Inspect original blend files and user ownership.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {visibleFiles.slice(0, 12).map((file) => (
+            <div className="rounded-lg border p-4" key={file.id}>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium">{file.source_filename}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {ownerLabel(file.user_id)} • {formatBytes(file.original_size_bytes)}
+                  </p>
+                </div>
+                <Badge variant="outline">{file.jobs.length} jobs</Badge>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button asChild size="sm" variant="outline">
+                  <a href={`/backend/api/admin/files/${file.id}/download`}>
+                    <Download />
+                    Original
+                  </a>
+                </Button>
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -1371,8 +2076,11 @@ export function RenderDashboard({
   const [authBusy, setAuthBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadStats, setUploadStats] = useState<UploadProgressStats | null>(null);
   const [running, setRunning] = useState(false);
   const [inspecting, setInspecting] = useState(false);
+  const [cancellingJobIds, setCancellingJobIds] = useState<string[]>([]);
+  const [retryingJobIds, setRetryingJobIds] = useState<string[]>([]);
   const [booting, setBooting] = useState(true);
   const [loadingData, setLoadingData] = useState(false);
   const [selectionMessage, setSelectionMessage] = useState<string | null>(null);
@@ -1381,13 +2089,10 @@ export function RenderDashboard({
   const [adminUsers, setAdminUsers] = useState<UserAccount[]>([]);
   const [adminActivity, setAdminActivity] = useState<ActivityRecord[]>([]);
   const [adminRuns, setAdminRuns] = useState<RenderJob[]>([]);
+  const [adminFiles, setAdminFiles] = useState<UserFile[]>([]);
   const sourcesRef = useRef<Map<string, EventSource>>(new Map());
   const activeJobIds = Array.from(
-    new Set(
-      (view === "admin" ? adminRuns : files.flatMap((file) => file.jobs))
-        .filter(activePhase)
-        .map((job) => job.id),
-    ),
+    new Set(files.flatMap((file) => file.jobs).filter(activePhase).map((job) => job.id)),
   ).sort();
   const activeJobIdsKey = JSON.stringify(activeJobIds);
   const activeJobSessionKey =
@@ -1461,17 +2166,19 @@ export function RenderDashboard({
       return;
     }
     try {
-      const [overviewPayload, usersPayload, activityPayload, runsPayload] =
+      const [overviewPayload, usersPayload, activityPayload, runsPayload, filesPayload] =
         await Promise.all([
           fetchAdminOverview(),
           fetchAdminUsers(),
           fetchAdminActivity(),
           fetchAdminRuns(),
+          fetchAdminFiles(),
         ]);
       setAdminOverview(overviewPayload);
       setAdminUsers(usersPayload);
       setAdminActivity(activityPayload);
       setAdminRuns(runsPayload);
+      setAdminFiles(filesPayload);
     } catch (loadError) {
       setError(
         loadError instanceof Error ? loadError.message : "Failed to load admin panel.",
@@ -1534,9 +2241,6 @@ export function RenderDashboard({
       source.onmessage = (event) => {
         const payload = JSON.parse(event.data) as RenderJob;
         setFiles((current) => upsertRun(current, payload));
-        if (view === "admin") {
-          setAdminRuns((current) => upsertAdminRun(current, payload));
-        }
       };
       source.onerror = () => {
         source.close();
@@ -1544,7 +2248,7 @@ export function RenderDashboard({
       };
       sourcesRef.current.set(jobId, source);
     });
-  }, [activeJobIdsKey, activeJobSessionKey, view]);
+  }, [activeJobIdsKey, activeJobSessionKey]);
 
   useEffect(() => {
     return () => {
@@ -1552,6 +2256,15 @@ export function RenderDashboard({
       sourcesRef.current.clear();
     };
   }, []);
+
+  useEffect(() => {
+    if (!selectedFile || !hasRenderSettingValues(selectedFile.render_settings)) {
+      return;
+    }
+    setForm((current) =>
+      mergeRenderSettingsIntoForm(current, selectedFile.render_settings),
+    );
+  }, [selectedFile?.id]);
 
   async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1586,6 +2299,7 @@ export function RenderDashboard({
     setAdminUsers([]);
     setAdminActivity([]);
     setAdminRuns([]);
+    setAdminFiles([]);
   }
 
   function handleSingleFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -1632,8 +2346,12 @@ export function RenderDashboard({
 
     setUploading(true);
     setUploadProgress(0);
+    setUploadStats(null);
     try {
-      await uploadFileWithProgress(formData, setUploadProgress);
+      await uploadFileWithProgress(formData, (stats) => {
+        setUploadProgress(stats.progress);
+        setUploadStats(stats);
+      });
       setUploadBlendFile(null);
       setUploadProjectFiles([]);
       setSelectionMessage("Scene added to the library.");
@@ -1662,6 +2380,22 @@ export function RenderDashboard({
             ? [payload.cameras[0].name]
             : [];
       setSelectedCameraNames(defaultSelection);
+      setForm((current) =>
+        mergeRenderSettingsIntoForm(
+          {
+            ...current,
+            startFrame: payload.frame_start,
+            endFrame: payload.frame_end,
+            resolutionX: payload.resolution.x,
+            resolutionY: payload.resolution.y,
+            resolutionPercentage: payload.resolution.percentage,
+            frameStep: payload.frame_step,
+            imageQuality: payload.image_settings.quality ?? current.imageQuality,
+            compression: payload.image_settings.compression ?? current.compression,
+          },
+          payload.render_settings,
+        ),
+      );
       setError(null);
     } catch (inspectError) {
       setError(
@@ -1687,6 +2421,26 @@ export function RenderDashboard({
       formData.set("start_frame", String(form.startFrame));
       formData.set("end_frame", String(form.endFrame));
     }
+    formData.set("render_engine", form.renderEngine);
+    formData.set("samples", String(form.samples));
+    formData.set("use_denoising", String(form.useDenoising));
+    formData.set("resolution_x", String(form.resolutionX));
+    formData.set("resolution_y", String(form.resolutionY));
+    formData.set("resolution_percentage", String(form.resolutionPercentage));
+    formData.set("frame_step", String(form.frameStep));
+    formData.set("film_transparent", String(form.filmTransparent));
+    formData.set("view_transform", form.viewTransform);
+    formData.set("look", form.look);
+    formData.set("exposure", String(form.exposure));
+    formData.set("gamma", String(form.gamma));
+    formData.set("image_quality", String(form.imageQuality));
+    formData.set("compression", String(form.compression));
+    formData.set("use_motion_blur", String(form.useMotionBlur));
+    formData.set("use_simplify", String(form.useSimplify));
+    formData.set("simplify_subdivision", String(form.simplifySubdivision));
+    formData.set("simplify_child_particles", String(form.simplifyChildParticles));
+    formData.set("simplify_volumes", String(form.simplifyVolumes));
+    formData.set("seed", String(form.seed));
     selectedCameraNames.forEach((cameraName) => {
       formData.append("camera_names", cameraName);
     });
@@ -1704,6 +2458,44 @@ export function RenderDashboard({
     }
   }
 
+  async function handleCancelJob(job: RenderJob) {
+    if (!window.confirm(`Cancel render ${job.id}? This stops the job immediately.`)) {
+      return;
+    }
+
+    setCancellingJobIds((current) =>
+      current.includes(job.id) ? current : [...current, job.id],
+    );
+    try {
+      const snapshot = await cancelJob(job.id);
+      setFiles((current) => upsertRun(current, snapshot));
+      setError(null);
+      void refreshCoreData();
+    } catch (cancelError) {
+      setError(
+        cancelError instanceof Error ? cancelError.message : "Failed to cancel render.",
+      );
+    } finally {
+      setCancellingJobIds((current) => current.filter((item) => item !== job.id));
+    }
+  }
+
+  async function handleRetryJob(job: RenderJob) {
+    setRetryingJobIds((current) =>
+      current.includes(job.id) ? current : [...current, job.id],
+    );
+    try {
+      const snapshot = await retryJob(job.id);
+      setFiles((current) => upsertRun(current, snapshot));
+      setError(null);
+      void refreshCoreData();
+    } catch (retryError) {
+      setError(retryError instanceof Error ? retryError.message : "Failed to retry render.");
+    } finally {
+      setRetryingJobIds((current) => current.filter((item) => item !== job.id));
+    }
+  }
+
   async function handleAdminStatus(userId: number, status: UserStatus) {
     try {
       const updated = await updateAdminUserStatus(userId, status);
@@ -1714,6 +2506,37 @@ export function RenderDashboard({
     } catch (adminError) {
       setError(
         adminError instanceof Error ? adminError.message : "Failed to update user.",
+      );
+    }
+  }
+
+  async function handleAdminCancelJob(job: RenderJob) {
+    if (!window.confirm(`Cancel render ${job.id}?`)) {
+      return;
+    }
+    try {
+      const snapshot = await adminCancelJob(job.id);
+      setAdminRuns((current) =>
+        current.map((item) => (item.id === snapshot.id ? snapshot : item)),
+      );
+      void refreshAdminData();
+      void refreshCoreData();
+    } catch (adminError) {
+      setError(
+        adminError instanceof Error ? adminError.message : "Failed to cancel render.",
+      );
+    }
+  }
+
+  async function handleAdminRetryJob(job: RenderJob) {
+    try {
+      const snapshot = await adminRetryJob(job.id);
+      setAdminRuns((current) => [snapshot, ...current]);
+      void refreshAdminData();
+      void refreshCoreData();
+    } catch (adminError) {
+      setError(
+        adminError instanceof Error ? adminError.message : "Failed to retry render.",
       );
     }
   }
@@ -1774,20 +2597,27 @@ export function RenderDashboard({
         {view === "admin" ? (
           <AdminView
             adminActivity={adminActivity}
+            adminFiles={adminFiles}
             adminOverview={adminOverview}
             adminRuns={adminRuns}
             adminUsers={adminUsers}
+            onCancelJob={(job) => void handleAdminCancelJob(job)}
+            onRetryJob={(job) => void handleAdminRetryJob(job)}
             onStatusChange={(userId, status) => void handleAdminStatus(userId, status)}
           />
         ) : view === "detail" ? (
           selectedFile ? (
             <FileDetailView
+              cancellingJobIds={cancellingJobIds}
               cameraInspection={cameraInspection}
               file={selectedFile}
               form={form}
               inspecting={inspecting}
+              onCancelJob={(job) => void handleCancelJob(job)}
               onInspect={() => void handleInspect()}
+              onRetryJob={(job) => void handleRetryJob(job)}
               onRun={handleCreateRun}
+              retryingJobIds={retryingJobIds}
               running={running}
               selectedCameraNames={selectedCameraNames}
               setForm={(updater) => setForm((current) => updater(current))}
@@ -1822,6 +2652,7 @@ export function RenderDashboard({
             selectedBlendFile={uploadBlendFile}
             selectionMessage={selectionMessage}
             uploadProgress={uploadProgress}
+            uploadStats={uploadStats}
             uploadSourceMode={uploadSourceMode}
             uploading={uploading}
           />

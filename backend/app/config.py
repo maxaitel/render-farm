@@ -26,6 +26,7 @@ class Settings:
     admin_bootstrap_password: str | None
     allow_signups: bool
     trusted_proxies: list[str]
+    cycles_print_stats: bool = False
 
     @property
     def database_path(self) -> Path:
@@ -68,4 +69,5 @@ def load_settings() -> Settings:
         admin_bootstrap_password=os.getenv("ADMIN_BOOTSTRAP_PASSWORD", "").strip() or None,
         allow_signups=_parse_bool(os.getenv("ALLOW_SIGNUPS"), default=True),
         trusted_proxies=trusted_proxies,
+        cycles_print_stats=_parse_bool(os.getenv("BLENDER_CYCLES_PRINT_STATS")),
     )

@@ -1,7 +1,58 @@
-export type JobPhase = "queued" | "running" | "completed" | "failed";
+export type JobPhase =
+  | "queued"
+  | "running"
+  | "packaging"
+  | "completed"
+  | "failed"
+  | "stalled"
+  | "cancelled";
 export type RenderMode = "still" | "animation";
 export type UserRole = "user" | "admin";
 export type UserStatus = "pending" | "approved" | "suspended";
+export type FramePhase =
+  | "pending"
+  | "rendering"
+  | "complete"
+  | "failed"
+  | "retrying"
+  | "skipped";
+
+export interface RenderSettings {
+  render_engine: string | null;
+  output_format: string | null;
+  samples: number | null;
+  use_denoising: boolean | null;
+  resolution_x: number | null;
+  resolution_y: number | null;
+  resolution_percentage: number | null;
+  frame_step: number | null;
+  film_transparent: boolean | null;
+  view_transform: string | null;
+  look: string | null;
+  exposure: number | null;
+  gamma: number | null;
+  image_quality: number | null;
+  compression: number | null;
+  use_motion_blur: boolean | null;
+  use_simplify: boolean | null;
+  simplify_subdivision: number | null;
+  simplify_child_particles: number | null;
+  simplify_volumes: number | null;
+  seed: number | null;
+}
+
+export interface FrameRenderRecord {
+  camera_name: string | null;
+  camera_index: number;
+  frame: number;
+  status: FramePhase;
+  output_path: string | null;
+  attempts: number;
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  seconds: number | null;
+}
 
 export interface RenderJob {
   id: string;
@@ -19,24 +70,38 @@ export interface RenderJob {
   archive_path: string | null;
   render_mode: RenderMode;
   output_format: string;
+  render_settings: RenderSettings;
   requested_device: string;
   resolved_device: string | null;
+  worker_assigned: string | null;
+  queue_position: number | null;
+  priority: number;
   camera_name: string | null;
   camera_names: string[];
   current_camera_name: string | null;
+  current_camera_index: number | null;
+  total_cameras: number;
   frame: number | null;
   start_frame: number | null;
   end_frame: number | null;
   current_frame: number | null;
-  current_frame_started_at: string | null;
-  current_frame_elapsed_seconds: number | null;
   total_frames: number;
-  last_frame_duration_seconds: number | null;
-  average_frame_duration_seconds: number | null;
+  total_outputs_expected: number;
+  completed_frames: number;
+  failed_frames: number;
+  current_output: string | null;
+  elapsed_seconds: number | null;
+  estimated_seconds_remaining: number | null;
+  average_seconds_per_frame: number | null;
+  last_progress_at: string | null;
   current_sample: number | null;
   total_samples: number | null;
   outputs: string[];
+  frame_statuses: FrameRenderRecord[];
   logs_tail: string[];
+  log_path: string | null;
+  command: string[];
+  environment_info: Record<string, unknown>;
   error: string | null;
 }
 
@@ -49,6 +114,7 @@ export interface UserFile {
   source_path: string;
   source_root: string;
   original_size_bytes: number;
+  render_settings: RenderSettings;
   latest_job: RenderJob | null;
   jobs: RenderJob[];
 }
@@ -97,7 +163,32 @@ export interface BlendCameraOption {
 export interface BlendInspection {
   default_camera: string | null;
   frame: number;
+  frame_start: number;
+  frame_end: number;
+  frame_step: number;
   cameras: BlendCameraOption[];
+  resolution: {
+    x: number;
+    y: number;
+    percentage: number;
+  };
+  render_engine: string;
+  samples: number | null;
+  output_format: string;
+  image_settings: {
+    file_format: string;
+    quality: number | null;
+    compression: number | null;
+  };
+  render_settings: RenderSettings;
+  blend_render_settings?: RenderSettings;
+  render_settings_source: "blend" | "saved";
+  estimated_output_files: number;
+  scene_collections: string[];
+  asset_warnings: string[];
+  file_size_bytes: number;
+  source_filename: string;
+  processing_status: string;
 }
 
 export interface AdminOverview {

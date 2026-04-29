@@ -7,7 +7,7 @@ import uuid
 from collections import defaultdict
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .models import (
     ActivityRecord,
@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS user_files (
     source_filename TEXT NOT NULL,
     source_path TEXT NOT NULL,
     source_root TEXT NOT NULL,
-    original_size_bytes INTEGER NOT NULL DEFAULT 0
+    original_size_bytes INTEGER NOT NULL DEFAULT 0,
+    render_settings TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -115,6 +116,7 @@ class JobStore:
         self._conn = sqlite3.connect(self.database_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA_SQL)
+        self._ensure_schema_migrations_sync()
         self._conn.executescript(INDEX_SQL)
 
         self._jobs = {}
@@ -128,13 +130,74 @@ class JobStore:
                 job.phase = JobPhase.failed
                 job.error = "Server restarted while the render was in progress."
                 job.status_message = "Interrupted by server restart."
+            self._hydrate_legacy_job(job)
             self._jobs[job.id] = job
             await self._persist(job)
+
+    def _ensure_schema_migrations_sync(self) -> None:
+        if self._conn is None:
+            raise RuntimeError("JobStore database is not initialized.")
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(user_files)").fetchall()
+        }
+        with self._conn:
+            if "render_settings" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE user_files ADD COLUMN render_settings TEXT NOT NULL DEFAULT '{}'"
+                )
 
     async def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def _hydrate_legacy_job(self, job: JobRecord) -> None:
+        camera_count = max(1, len(job.camera_names) or (1 if job.camera_name else 0))
+        frame_count = self._job_frame_count(job)
+        expected_outputs = max(1, camera_count * frame_count)
+        disk_outputs = self._job_output_paths(job)
+
+        job.total_cameras = max(job.total_cameras, camera_count)
+        job.total_frames = max(job.total_frames, frame_count)
+        job.total_outputs_expected = max(job.total_outputs_expected, expected_outputs, len(disk_outputs))
+
+        if disk_outputs and len(disk_outputs) > len(job.outputs):
+            job.outputs = disk_outputs
+
+        if job.phase == JobPhase.completed:
+            job.completed_frames = max(job.completed_frames, len(job.outputs))
+            job.total_outputs_expected = max(job.total_outputs_expected, job.completed_frames)
+            job.progress = 100.0
+            job.estimated_seconds_remaining = 0.0
+
+        if job.last_progress_at is None:
+            job.last_progress_at = job.finished_at or job.started_at
+
+    def _job_frame_count(self, job: JobRecord) -> int:
+        if job.render_mode.value == "still":
+            return 1
+        start = 1 if job.start_frame is None else job.start_frame
+        end = start if job.end_frame is None else job.end_frame
+        step = max(1, job.render_settings.frame_step or 1)
+        return max(1, len(range(start, end + 1, step)))
+
+    def _job_output_paths(self, job: JobRecord) -> list[str]:
+        output_dir = Path(job.output_directory)
+        if not output_dir.exists():
+            return []
+        outputs = sorted(
+            path
+            for path in output_dir.rglob("*")
+            if path.is_file() and path.name not in {"metadata.json", "render-settings.json"}
+        )
+        relative_paths: list[str] = []
+        for path in outputs:
+            try:
+                relative_paths.append(path.relative_to(output_dir).as_posix())
+            except ValueError:
+                relative_paths.append(path.name)
+        return relative_paths
 
     async def ensure_bootstrap_admin(self, username: str | None, password: str | None) -> None:
         if self._conn is None or not username or not password:
@@ -547,9 +610,10 @@ class JobStore:
                     source_filename,
                     source_path,
                     source_root,
-                    original_size_bytes
+                    original_size_bytes,
+                    render_settings
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["id"],
@@ -560,7 +624,44 @@ class JobStore:
                     payload["source_path"],
                     payload["source_root"],
                     payload["original_size_bytes"],
+                    json.dumps(payload["render_settings"], indent=2, sort_keys=True),
                 ),
+            )
+
+    async def update_user_file_render_settings(
+        self,
+        *,
+        file_id: str,
+        render_settings: dict[str, Any],
+    ) -> None:
+        if self._conn is None:
+            raise RuntimeError("JobStore database is not initialized.")
+        serialized = json.dumps(render_settings, indent=2, sort_keys=True)
+        updated_at = utc_now().isoformat()
+        async with self._db_lock:
+            await asyncio.to_thread(
+                self._update_user_file_render_settings_sync,
+                file_id,
+                serialized,
+                updated_at,
+            )
+
+    def _update_user_file_render_settings_sync(
+        self,
+        file_id: str,
+        render_settings: str,
+        updated_at: str,
+    ) -> None:
+        if self._conn is None:
+            raise RuntimeError("JobStore database is not initialized.")
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE user_files
+                SET render_settings = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (render_settings, updated_at, file_id),
             )
 
     async def get_user_file(self, user_id: int, file_id: str) -> UserFileRecord | None:
@@ -570,31 +671,53 @@ class JobStore:
                 return item
         return None
 
+    async def get_file_by_id(self, file_id: str) -> UserFileRecord | None:
+        files = await self.list_files()
+        for item in files:
+            if item.id == file_id:
+                return item
+        return None
+
     async def list_user_files(self, user_id: int) -> list[UserFileRecord]:
+        return await self.list_files(user_id)
+
+    async def list_files(self, user_id: int | None = None) -> list[UserFileRecord]:
         if self._conn is None:
             raise RuntimeError("JobStore database is not initialized.")
+
+        file_query = """
+            SELECT *
+            FROM user_files
+            {where_clause}
+            ORDER BY updated_at DESC, created_at DESC
+        """
+        job_query = """
+            SELECT payload
+            FROM jobs
+            {where_clause}
+            ORDER BY created_at DESC
+        """
+        file_params: tuple[int, ...] = ()
+        job_params: tuple[int, ...] = ()
+        file_where = ""
+        job_where = ""
+        if user_id is not None:
+            file_where = "WHERE user_id = ?"
+            job_where = "WHERE user_id = ?"
+            file_params = (user_id,)
+            job_params = (user_id,)
 
         async with self._db_lock:
             files_rows = await asyncio.to_thread(
                 lambda: self._conn.execute(
-                    """
-                    SELECT *
-                    FROM user_files
-                    WHERE user_id = ?
-                    ORDER BY updated_at DESC, created_at DESC
-                    """,
-                    (user_id,),
+                    file_query.format(where_clause=file_where),
+                    file_params,
                 ).fetchall()
             )
             job_rows = await asyncio.to_thread(
                 lambda: self._conn.execute(
-                    """
-                    SELECT payload
-                    FROM jobs
-                    WHERE user_id = ?
-                    ORDER BY created_at DESC
-                    """,
-                    (user_id,),
+                    job_query.format(where_clause=job_where),
+                    job_params,
                 ).fetchall()
             )
 
@@ -614,6 +737,16 @@ class JobStore:
     async def list_jobs(self, user_id: int | None = None) -> list[JobRecord]:
         async with self._lock:
             jobs = [job.model_copy(deep=True) for job in self._jobs.values()]
+        queued_ids = [
+            job.id
+            for job in sorted(
+                [job for job in jobs if job.phase == JobPhase.queued],
+                key=lambda item: (-item.priority, item.created_at),
+            )
+        ]
+        queue_positions = {job_id: index for index, job_id in enumerate(queued_ids, start=1)}
+        for job in jobs:
+            job.queue_position = queue_positions.get(job.id)
         if user_id is not None:
             jobs = [job for job in jobs if job.user_id == user_id]
         return sorted(jobs, key=lambda item: item.created_at, reverse=True)
@@ -621,7 +754,17 @@ class JobStore:
     async def get(self, job_id: str) -> JobRecord | None:
         async with self._lock:
             job = self._jobs.get(job_id)
-            return job.model_copy(deep=True) if job else None
+            snapshot = job.model_copy(deep=True) if job else None
+            if snapshot and snapshot.phase == JobPhase.queued:
+                queued_ids = [
+                    item.id
+                    for item in sorted(
+                        [item for item in self._jobs.values() if item.phase == JobPhase.queued],
+                        key=lambda item: (-item.priority, item.created_at),
+                    )
+                ]
+                snapshot.queue_position = queued_ids.index(snapshot.id) + 1 if snapshot.id in queued_ids else None
+            return snapshot
 
     async def create(self, job: JobRecord) -> JobRecord:
         return (await self.create_many([job]))[0]
@@ -646,15 +789,50 @@ class JobStore:
         return snapshot
 
     async def append_log(self, job_id: str, line: str) -> JobRecord:
-        def update(job: JobRecord) -> None:
-            cleaned = line.strip()
-            if not cleaned:
-                return
-            job.logs_tail.append(cleaned)
-            if len(job.logs_tail) > 40:
-                job.logs_tail = job.logs_tail[-40:]
+        return await self.append_logs(job_id, [line])
 
-        return await self.mutate(job_id, update)
+    async def append_logs(self, job_id: str, lines: Iterable[str]) -> JobRecord:
+        return await self.mutate_with_logs(job_id, lambda item: None, lines)
+
+    async def mutate_with_logs(
+        self,
+        job_id: str,
+        mutator: Mutator,
+        lines: Iterable[str],
+        *,
+        touch_file: bool = False,
+    ) -> JobRecord:
+        cleaned_lines = [line.strip() for line in lines if line.strip()]
+        async with self._lock:
+            job = self._jobs[job_id]
+            log_path = job.log_path
+
+        if cleaned_lines and log_path:
+            await asyncio.to_thread(self._append_log_lines_file_sync, Path(log_path), cleaned_lines)
+
+        async with self._lock:
+            job = self._jobs[job_id]
+            if cleaned_lines:
+                self._append_log_lines_to_job(job, cleaned_lines)
+            mutator(job)
+            snapshot = job.model_copy(deep=True)
+        await self._persist(snapshot, touch_file=touch_file)
+        await self._broadcast(snapshot)
+        return snapshot
+
+    def _append_log_lines_to_job(self, job: JobRecord, lines: list[str]) -> None:
+        job.logs_tail.extend(lines)
+        if len(job.logs_tail) > 40:
+            job.logs_tail = job.logs_tail[-40:]
+
+    def _append_log_file_sync(self, path: Path, line: str) -> None:
+        self._append_log_lines_file_sync(path, [line])
+
+    def _append_log_lines_file_sync(self, path: Path, lines: list[str]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as log_file:
+            for line in lines:
+                log_file.write(f"{utc_now().isoformat()} {line}\n")
 
     async def subscribe(self, job_id: str) -> asyncio.Queue[dict]:
         queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=50)
@@ -679,7 +857,7 @@ class JobStore:
         async with self._lock:
             return [
                 job.id
-                for job in sorted(self._jobs.values(), key=lambda item: item.created_at)
+                for job in sorted(self._jobs.values(), key=lambda item: (-item.priority, item.created_at))
                 if job.phase == JobPhase.queued
             ]
 
@@ -817,12 +995,12 @@ class JobStore:
             except asyncio.QueueFull:
                 continue
 
-    async def _persist(self, snapshot: JobRecord) -> None:
+    async def _persist(self, snapshot: JobRecord, *, touch_file: bool = True) -> None:
         if self._conn is None:
             raise RuntimeError("JobStore database is not initialized.")
 
         async with self._db_lock:
-            await asyncio.to_thread(self._persist_sync, snapshot)
+            await asyncio.to_thread(self._persist_sync, snapshot, touch_file)
 
     async def _persist_many(self, snapshots: list[JobRecord]) -> None:
         if self._conn is None:
@@ -831,12 +1009,12 @@ class JobStore:
         async with self._db_lock:
             await asyncio.to_thread(self._persist_many_sync, snapshots)
 
-    def _persist_sync(self, snapshot: JobRecord) -> None:
+    def _persist_sync(self, snapshot: JobRecord, touch_file: bool = True) -> None:
         if self._conn is None:
             raise RuntimeError("JobStore database is not initialized.")
 
         with self._conn:
-            self._write_job_sync(snapshot)
+            self._write_job_sync(snapshot, touch_file=touch_file)
 
     def _persist_many_sync(self, snapshots: list[JobRecord]) -> None:
         if self._conn is None:
@@ -846,7 +1024,7 @@ class JobStore:
             for snapshot in snapshots:
                 self._write_job_sync(snapshot)
 
-    def _write_job_sync(self, snapshot: JobRecord) -> None:
+    def _write_job_sync(self, snapshot: JobRecord, *, touch_file: bool = True) -> None:
         if self._conn is None:
             raise RuntimeError("JobStore database is not initialized.")
 
@@ -873,10 +1051,11 @@ class JobStore:
                 json.dumps(payload, indent=2),
             ),
         )
-        self._conn.execute(
-            "UPDATE user_files SET updated_at = ? WHERE id = ?",
-            (utc_now().isoformat(), snapshot.file_id),
-        )
+        if touch_file:
+            self._conn.execute(
+                "UPDATE user_files SET updated_at = ? WHERE id = ?",
+                (utc_now().isoformat(), snapshot.file_id),
+            )
 
     def _user_from_row(self, row: sqlite3.Row) -> UserRecord:
         return UserRecord.model_validate(
@@ -898,7 +1077,16 @@ class JobStore:
         return UserSessionRecord.model_validate(dict(row))
 
     def _file_from_row(self, row: sqlite3.Row) -> UserFileRecord:
-        return UserFileRecord.model_validate(dict(row))
+        payload = dict(row)
+        raw_settings = payload.get("render_settings")
+        if isinstance(raw_settings, str):
+            try:
+                payload["render_settings"] = json.loads(raw_settings or "{}")
+            except json.JSONDecodeError:
+                payload["render_settings"] = {}
+        elif raw_settings is None:
+            payload["render_settings"] = {}
+        return UserFileRecord.model_validate(payload)
 
     def _activity_from_row(self, row: sqlite3.Row) -> ActivityRecord:
         metadata = {}

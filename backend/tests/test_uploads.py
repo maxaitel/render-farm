@@ -106,10 +106,10 @@ def test_admin_can_approve_user_upload_scene_and_queue_run(tmp_path: Path) -> No
 
             upload_response = user_client.post(
                 "/api/files",
-                data=[
-                    ("blend_file_path", "Project Files/scenes/Scene 1.blend"),
-                    ("project_paths", "Project Files/textures/Wood Floor.png"),
-                ],
+                data={
+                    "blend_file_path": "Project Files/scenes/Scene 1.blend",
+                    "project_paths": "Project Files/textures/Wood Floor.png",
+                },
                 files=[
                     ("blend_file", ("Scene 1.blend", b"blend-bytes", "application/octet-stream")),
                     ("project_files", ("Wood Floor.png", b"png-bytes", "application/octet-stream")),
@@ -136,6 +136,13 @@ def test_admin_can_approve_user_upload_scene_and_queue_run(tmp_path: Path) -> No
                     "device_preference": "AUTO",
                     "frame": "12",
                     "camera_names": ["Cam_A", "Cam_B"],
+                    "samples": "64",
+                    "resolution_x": "1280",
+                    "resolution_y": "720",
+                    "resolution_percentage": "50",
+                    "use_denoising": "true",
+                    "film_transparent": "true",
+                    "frame_step": "2",
                 },
             )
             assert run_response.status_code == 200, run_response.text
@@ -143,12 +150,40 @@ def test_admin_can_approve_user_upload_scene_and_queue_run(tmp_path: Path) -> No
             assert run_payload["phase"] == "queued"
             assert run_payload["file_id"] == file_payload["id"]
             assert run_payload["camera_names"] == ["Cam_A", "Cam_B"]
+            assert run_payload["render_settings"]["samples"] == 64
+            assert run_payload["render_settings"]["resolution_x"] == 1280
+            assert run_payload["render_settings"]["resolution_y"] == 720
+            assert run_payload["render_settings"]["resolution_percentage"] == 50
+            assert run_payload["render_settings"]["use_denoising"] is True
+            assert run_payload["render_settings"]["film_transparent"] is True
+            assert run_payload["total_cameras"] == 2
+            assert run_payload["total_outputs_expected"] == 2
 
             files_response = user_client.get("/api/files")
             assert files_response.status_code == 200
             listed_files = files_response.json()
             assert len(listed_files) == 1
             assert listed_files[0]["jobs"][0]["id"] == run_payload["id"]
+            assert listed_files[0]["render_settings"]["samples"] == 64
+            assert listed_files[0]["render_settings"]["output_format"] == "PNG"
+
+        with _client() as admin_client:
+            _sign_in(admin_client, "admin", "admin-password-123")
+            admin_files_response = admin_client.get(
+                "/api/admin/files",
+                headers={"x-forwarded-for": "127.0.0.1"},
+            )
+            assert admin_files_response.status_code == 200
+            admin_files = admin_files_response.json()
+            assert admin_files[0]["id"] == file_payload["id"]
+            assert admin_files[0]["jobs"][0]["id"] == run_payload["id"]
+
+            source_download_response = admin_client.get(
+                f"/api/admin/files/{file_payload['id']}/download",
+                headers={"x-forwarded-for": "127.0.0.1"},
+            )
+            assert source_download_response.status_code == 200
+            assert source_download_response.content == b"blend-bytes"
 
             conn = sqlite3.connect(tmp_path / "renderfarm.sqlite3")
             row = conn.execute(
@@ -185,7 +220,7 @@ def test_animation_run_can_start_at_frame_zero(tmp_path: Path) -> None:
 
             upload_response = user_client.post(
                 "/api/files",
-                data=[("blend_file_path", "Scene 0.blend")],
+                data={"blend_file_path": "Scene 0.blend"},
                 files=[("blend_file", ("Scene 0.blend", b"blend-bytes", "application/octet-stream"))],
             )
             assert upload_response.status_code == 200, upload_response.text
@@ -206,6 +241,119 @@ def test_animation_run_can_start_at_frame_zero(tmp_path: Path) -> None:
             assert run_payload["start_frame"] == 0
             assert run_payload["end_frame"] == 24
             assert run_payload["total_frames"] == 25
+    finally:
+        _restore_env(previous)
+
+
+def test_animation_run_defaults_to_frame_one_when_start_is_omitted(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with _client() as client:
+            create_user_response = client.post(
+                "/api/auth/sign-up",
+                json={"username": "artist_default_frame", "password": "artist-password-222"},
+            )
+            assert create_user_response.status_code == 200
+            pending_user_id = create_user_response.json()["user"]["id"]
+
+            _sign_in(client, "admin", "admin-password-123")
+            approve_response = client.post(
+                f"/api/admin/users/{pending_user_id}/status",
+                json={"status": "approved"},
+                headers={"x-forwarded-for": "127.0.0.1"},
+            )
+            assert approve_response.status_code == 200
+
+        with _client() as user_client:
+            _sign_in(user_client, "artist_default_frame", "artist-password-222")
+
+            upload_response = user_client.post(
+                "/api/files",
+                data={"blend_file_path": "Scene Default Frame.blend"},
+                files=[("blend_file", ("Scene Default Frame.blend", b"blend-bytes", "application/octet-stream"))],
+            )
+            assert upload_response.status_code == 200, upload_response.text
+            file_payload = upload_response.json()
+
+            run_response = user_client.post(
+                f"/api/files/{file_payload['id']}/runs",
+                data={
+                    "render_mode": "animation",
+                    "output_format": "PNG",
+                    "end_frame": "60",
+                },
+            )
+            assert run_response.status_code == 200, run_response.text
+            run_payload = run_response.json()
+            assert run_payload["start_frame"] == 1
+            assert run_payload["end_frame"] == 60
+            assert run_payload["total_frames"] == 60
+    finally:
+        _restore_env(previous)
+
+
+def test_user_can_cancel_a_queued_run(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with _client() as client:
+            create_user_response = client.post(
+                "/api/auth/sign-up",
+                json={"username": "artist_cancel", "password": "artist-password-111"},
+            )
+            assert create_user_response.status_code == 200
+            pending_user_id = create_user_response.json()["user"]["id"]
+
+            _sign_in(client, "admin", "admin-password-123")
+            approve_response = client.post(
+                f"/api/admin/users/{pending_user_id}/status",
+                json={"status": "approved"},
+                headers={"x-forwarded-for": "127.0.0.1"},
+            )
+            assert approve_response.status_code == 200
+
+        with _client() as user_client:
+            _sign_in(user_client, "artist_cancel", "artist-password-111")
+
+            upload_response = user_client.post(
+                "/api/files",
+                data={"blend_file_path": "Scene Cancel.blend"},
+                files=[("blend_file", ("Scene Cancel.blend", b"blend-bytes", "application/octet-stream"))],
+            )
+            assert upload_response.status_code == 200, upload_response.text
+            file_payload = upload_response.json()
+
+            run_response = user_client.post(
+                f"/api/files/{file_payload['id']}/runs",
+                data={
+                    "render_mode": "still",
+                    "output_format": "PNG",
+                    "frame": "3",
+                },
+            )
+            assert run_response.status_code == 200, run_response.text
+            run_payload = run_response.json()
+            assert run_payload["phase"] == "queued"
+
+            cancel_response = user_client.post(f"/api/jobs/{run_payload['id']}/cancel")
+            assert cancel_response.status_code == 200, cancel_response.text
+            cancel_payload = cancel_response.json()
+            assert cancel_payload["phase"] == "cancelled"
+            assert cancel_payload["status_message"] == "Render cancelled."
+
+            refetch_response = user_client.get(f"/api/jobs/{run_payload['id']}")
+            assert refetch_response.status_code == 200
+            assert refetch_response.json()["phase"] == "cancelled"
+
+            second_cancel_response = user_client.post(f"/api/jobs/{run_payload['id']}/cancel")
+            assert second_cancel_response.status_code == 409
+
+            retry_response = user_client.post(f"/api/jobs/{run_payload['id']}/retry")
+            assert retry_response.status_code == 200, retry_response.text
+            retry_payload = retry_response.json()
+            assert retry_payload["phase"] == "queued"
+            assert retry_payload["file_id"] == file_payload["id"]
+            assert retry_payload["frame"] == run_payload["frame"]
+            assert retry_payload["id"] != run_payload["id"]
     finally:
         _restore_env(previous)
 

@@ -14,8 +14,11 @@ def utc_now() -> datetime:
 class JobPhase(str, Enum):
     queued = "queued"
     running = "running"
+    packaging = "packaging"
     completed = "completed"
     failed = "failed"
+    stalled = "stalled"
+    cancelled = "cancelled"
 
 
 class RenderMode(str, Enum):
@@ -47,6 +50,52 @@ class UserStatus(str, Enum):
     suspended = "suspended"
 
 
+class FramePhase(str, Enum):
+    pending = "pending"
+    rendering = "rendering"
+    complete = "complete"
+    failed = "failed"
+    retrying = "retrying"
+    skipped = "skipped"
+
+
+class RenderSettings(BaseModel):
+    render_engine: str | None = None
+    output_format: OutputFormat | None = None
+    samples: int | None = None
+    use_denoising: bool | None = None
+    resolution_x: int | None = None
+    resolution_y: int | None = None
+    resolution_percentage: int | None = None
+    frame_step: int | None = None
+    film_transparent: bool | None = None
+    view_transform: str | None = None
+    look: str | None = None
+    exposure: float | None = None
+    gamma: float | None = None
+    image_quality: int | None = None
+    compression: int | None = None
+    use_motion_blur: bool | None = None
+    use_simplify: bool | None = None
+    simplify_subdivision: int | None = None
+    simplify_child_particles: float | None = None
+    simplify_volumes: float | None = None
+    seed: int | None = None
+
+
+class FrameRenderRecord(BaseModel):
+    camera_name: str | None = None
+    camera_index: int = 1
+    frame: int = 1
+    status: FramePhase = FramePhase.pending
+    output_path: str | None = None
+    attempts: int = 0
+    error: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    seconds: float | None = None
+
+
 class JobRecord(BaseModel):
     id: str
     user_id: int
@@ -63,24 +112,38 @@ class JobRecord(BaseModel):
     archive_path: str | None = None
     render_mode: RenderMode
     output_format: OutputFormat
+    render_settings: RenderSettings = Field(default_factory=RenderSettings)
     requested_device: RenderDevice = RenderDevice.auto
     resolved_device: str | None = None
+    worker_assigned: str | None = None
+    queue_position: int | None = None
+    priority: int = 0
     camera_name: str | None = None
     camera_names: list[str] = Field(default_factory=list)
     current_camera_name: str | None = None
+    current_camera_index: int | None = None
+    total_cameras: int = 1
     frame: int | None = None
     start_frame: int | None = None
     end_frame: int | None = None
     current_frame: int | None = None
-    current_frame_started_at: datetime | None = None
-    current_frame_elapsed_seconds: float | None = None
     total_frames: int = 1
-    last_frame_duration_seconds: float | None = None
-    average_frame_duration_seconds: float | None = None
+    total_outputs_expected: int = 1
+    completed_frames: int = 0
+    failed_frames: int = 0
+    current_output: str | None = None
+    elapsed_seconds: float | None = None
+    estimated_seconds_remaining: float | None = None
+    average_seconds_per_frame: float | None = None
+    last_progress_at: datetime | None = None
     current_sample: int | None = None
     total_samples: int | None = None
     outputs: list[str] = Field(default_factory=list)
+    frame_statuses: list[FrameRenderRecord] = Field(default_factory=list)
     logs_tail: list[str] = Field(default_factory=list)
+    log_path: str | None = None
+    command: list[str] = Field(default_factory=list)
+    environment_info: dict = Field(default_factory=dict)
     error: str | None = None
 
     @property
@@ -124,6 +187,7 @@ class UserFileRecord(BaseModel):
     source_path: str
     source_root: str
     original_size_bytes: int
+    render_settings: RenderSettings = Field(default_factory=RenderSettings)
     latest_job: JobRecord | None = None
     jobs: list[JobRecord] = Field(default_factory=list)
 

@@ -97,7 +97,13 @@ def is_private_ip(value: str | None) -> bool:
         parsed = ip_address(candidate)
     except ValueError:
         return False
-    return parsed.is_private or parsed.is_loopback or parsed.is_link_local
+    private_networks = [
+        ip_network("10.0.0.0/8"),
+        ip_network("172.16.0.0/12"),
+        ip_network("192.168.0.0/16"),
+        ip_network("fc00::/7"),
+    ]
+    return parsed.is_loopback or parsed.is_link_local or any(parsed in network for network in private_networks)
 
 
 def is_trusted_proxy(value: str | None, trusted_proxies: list[str]) -> bool:
