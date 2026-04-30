@@ -988,12 +988,14 @@ function JobProgressPanel({
   onRetryJob,
   cancelling,
   retrying,
+  showActions = true,
 }: {
   job: RenderJob;
   onCancelJob: (job: RenderJob) => void;
   onRetryJob: (job: RenderJob) => void;
   cancelling: boolean;
   retrying: boolean;
+  showActions?: boolean;
 }) {
   const visibleOutputs = job.outputs.filter(isPreviewableOutput);
   const latestOutput = visibleOutputs[visibleOutputs.length - 1] ?? null;
@@ -1095,66 +1097,68 @@ function JobProgressPanel({
         </div>
       ) : null}
 
-      <div className="flex flex-wrap gap-2">
-        {canDownloadOutputs(job) ? (
-          <Button asChild size="sm" variant="outline">
-            <a href={outputArchiveUrl(job)}>
-              <Download />
-              {job.phase === "completed" ? "Full zip" : "Partial zip"}
-            </a>
-          </Button>
-        ) : null}
-        {canDownloadVideos(job) ? (
-          <Button asChild size="sm" variant="outline">
-            <a href={videoArchiveUrl(job)}>
-              <Download />
-              Videos zip
-            </a>
-          </Button>
-        ) : null}
-        {cancelablePhase(job) ? (
-          <Button
-            disabled={cancelling}
-            onClick={() => onCancelJob(job)}
-            size="sm"
-            type="button"
-            variant="destructive"
-          >
-            {cancelling ? (
-              <>
-                <LoaderCircle className="animate-spin" />
-                Cancelling
-              </>
-            ) : (
-              <>
-                <Ban />
-                Cancel
-              </>
-            )}
-          </Button>
-        ) : null}
-        {!activePhase(job) && job.phase !== "completed" ? (
-          <Button
-            disabled={retrying}
-            onClick={() => onRetryJob(job)}
-            size="sm"
-            type="button"
-            variant="outline"
-          >
-            {retrying ? (
-              <>
-                <LoaderCircle className="animate-spin" />
-                Retrying
-              </>
-            ) : (
-              <>
-                <RefreshCcw />
-                Retry
-              </>
-            )}
-          </Button>
-        ) : null}
-      </div>
+      {showActions ? (
+        <div className="flex flex-wrap gap-2">
+          {canDownloadOutputs(job) ? (
+            <Button asChild size="sm" variant="outline">
+              <a href={outputArchiveUrl(job)}>
+                <Download />
+                {job.phase === "completed" ? "Full zip" : "Partial zip"}
+              </a>
+            </Button>
+          ) : null}
+          {canDownloadVideos(job) ? (
+            <Button asChild size="sm" variant="outline">
+              <a href={videoArchiveUrl(job)}>
+                <Download />
+                Videos zip
+              </a>
+            </Button>
+          ) : null}
+          {cancelablePhase(job) ? (
+            <Button
+              disabled={cancelling}
+              onClick={() => onCancelJob(job)}
+              size="sm"
+              type="button"
+              variant="destructive"
+            >
+              {cancelling ? (
+                <>
+                  <LoaderCircle className="animate-spin" />
+                  Cancelling
+                </>
+              ) : (
+                <>
+                  <Ban />
+                  Cancel
+                </>
+              )}
+            </Button>
+          ) : null}
+          {!activePhase(job) && job.phase !== "completed" ? (
+            <Button
+              disabled={retrying}
+              onClick={() => onRetryJob(job)}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              {retrying ? (
+                <>
+                  <LoaderCircle className="animate-spin" />
+                  Retrying
+                </>
+              ) : (
+                <>
+                  <RefreshCcw />
+                  Retry
+                </>
+              )}
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1797,6 +1801,27 @@ function FileDetailView({
                           )}
                         </Button>
                       ) : null}
+                      {!activePhase(job) && job.phase !== "completed" ? (
+                        <Button
+                          disabled={retryingJobIds.includes(job.id)}
+                          onClick={() => onRetryJob(job)}
+                          size="sm"
+                          type="button"
+                          variant="outline"
+                        >
+                          {retryingJobIds.includes(job.id) ? (
+                            <>
+                              <LoaderCircle className="animate-spin" />
+                              Retrying
+                            </>
+                          ) : (
+                            <>
+                              <RefreshCcw />
+                              Retry
+                            </>
+                          )}
+                        </Button>
+                      ) : null}
                     </div>
                   </div>
                   <JobProgressPanel
@@ -1805,6 +1830,7 @@ function FileDetailView({
                     onCancelJob={onCancelJob}
                     onRetryJob={onRetryJob}
                     retrying={retryingJobIds.includes(job.id)}
+                    showActions={false}
                   />
                   {job.logs_tail.length ? (
                     <details className="rounded-md border bg-muted/30 p-3">
