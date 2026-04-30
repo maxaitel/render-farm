@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -13,6 +14,7 @@ from app.models import (
     OutputFormat,
     RenderDevice,
     RenderMode,
+    RenderSettings,
     UserFileRecord,
     UserStatus,
 )
@@ -143,6 +145,252 @@ def test_multi_camera_render_creates_single_archive_with_camera_named_outputs(
             await store.close()
 
     asyncio.run(scenario())
+
+
+def test_animation_archive_adds_per_camera_videos_without_counting_them_as_frames(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        settings = Settings(
+            storage_root=tmp_path,
+            blender_binary="/bin/true",
+            default_device="AUTO",
+            gpu_order=["CPU"],
+            disable_worker=True,
+            session_cookie_name="renderfarm_session",
+            session_ttl_hours=24,
+            auth_cookie_secure="false",
+            admin_panel_path="control-tower",
+            admin_bootstrap_username=None,
+            admin_bootstrap_password=None,
+            allow_signups=True,
+            trusted_proxies=[],
+        )
+        store = JobStore(settings.database_path)
+        await store.load()
+        try:
+            user = await store.create_user(
+                username="artist_video",
+                password="artist-video-pass",
+                status=UserStatus.approved,
+            )
+            file_id = "file-video"
+            file_root = settings.files_root / file_id / "source"
+            file_root.mkdir(parents=True, exist_ok=True)
+            source_path = file_root / "scene.blend"
+            source_path.write_bytes(b"blend-data")
+            await store.create_user_file(
+                UserFileRecord(
+                    id=file_id,
+                    user_id=user.id,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    updated_at="2026-01-01T00:00:00+00:00",
+                    source_filename="scene.blend",
+                    source_path=str(source_path),
+                    source_root=str(file_root),
+                    original_size_bytes=len(b"blend-data"),
+                )
+            )
+
+            job_id = "video001"
+            job_root = settings.jobs_root / job_id
+            output_dir = job_root / "outputs"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            job = JobRecord(
+                id=job_id,
+                user_id=user.id,
+                file_id=file_id,
+                source_filename="scene.blend",
+                source_path=str(source_path),
+                output_directory=str(output_dir),
+                render_mode=RenderMode.animation,
+                output_format=OutputFormat.png,
+                render_settings=RenderSettings(frame_step=1),
+                requested_device=RenderDevice.auto,
+                camera_names=["Cam A", "Cam/B"],
+                start_frame=1,
+                end_frame=3,
+                total_frames=3,
+                total_cameras=2,
+                total_outputs_expected=6,
+                frame_statuses=[
+                    FrameRenderRecord(camera_name=camera_name, camera_index=camera_index, frame=frame)
+                    for camera_index, camera_name in enumerate(["Cam A", "Cam/B"], start=1)
+                    for frame in range(1, 4)
+                ],
+            )
+            await store.create(job)
+            runner = RenderRunner(settings, store)
+
+            async def fake_run_batch_attempt(
+                current_job: JobRecord,
+                device: str,
+                requested_cameras: list[str | None],
+            ) -> tuple[bool, str, bool]:
+                assert device == "CPU"
+                runner._scene_info_path(current_job).write_text(
+                    json.dumps({"fps": 30, "fps_base": 1.0, "frame_rate": 30.0}),
+                    encoding="utf-8",
+                )
+                for camera_index, camera_name in enumerate(requested_cameras):
+                    output_pattern = runner._output_pattern(
+                        current_job,
+                        camera_name,
+                        camera_index,
+                        len(requested_cameras),
+                    )
+                    for frame in range(1, 4):
+                        output_path = Path(output_pattern.replace("#####", f"{frame:05d}") + ".png")
+                        output_path.write_bytes(f"{camera_name}-{frame}".encode("utf-8"))
+                return True, "Rendered animation", False
+
+            created_videos: list[tuple[str, list[int], float]] = []
+
+            async def fake_create_camera_video(
+                output_path: Path,
+                frames: list[tuple[int, Path]],
+                frame_rate: float,
+                current_job: JobRecord,
+            ) -> None:
+                del current_job
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"fake-mp4")
+                created_videos.append((output_path.as_posix(), [frame for frame, _ in frames], frame_rate))
+
+            monkeypatch.setattr(runner, "_run_batch_attempt", fake_run_batch_attempt)
+            monkeypatch.setattr(runner, "_create_camera_video", fake_create_camera_video)
+
+            await runner.run(job_id)
+
+            snapshot = await store.get(job_id)
+            assert snapshot is not None
+            assert snapshot.phase == JobPhase.completed
+            assert snapshot.outputs == [
+                "Cam_A/scene_Cam_A_00001.png",
+                "Cam_A/scene_Cam_A_00002.png",
+                "Cam_A/scene_Cam_A_00003.png",
+                "Cam_B/scene_Cam_B_00001.png",
+                "Cam_B/scene_Cam_B_00002.png",
+                "Cam_B/scene_Cam_B_00003.png",
+            ]
+            assert snapshot.completed_frames == 6
+            assert [frames for _, frames, _ in created_videos] == [[1, 2, 3], [1, 2, 3]]
+            assert [frame_rate for _, _, frame_rate in created_videos] == [30.0, 30.0]
+
+            assert snapshot.archive_path is not None
+            with ZipFile(Path(snapshot.archive_path)) as archive:
+                assert sorted(archive.namelist()) == [
+                    "scene/Cam_A/scene_Cam_A_00001.png",
+                    "scene/Cam_A/scene_Cam_A_00002.png",
+                    "scene/Cam_A/scene_Cam_A_00003.png",
+                    "scene/Cam_B/scene_Cam_B_00001.png",
+                    "scene/Cam_B/scene_Cam_B_00002.png",
+                    "scene/Cam_B/scene_Cam_B_00003.png",
+                    "scene/metadata.json",
+                    "scene/render-settings.json",
+                    "scene/videos/Cam_A/scene_Cam_A.mp4",
+                    "scene/videos/Cam_B/scene_Cam_B.mp4",
+                ]
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_video_frame_durations_keep_stepped_animation_realtime(tmp_path: Path) -> None:
+    settings = Settings(
+        storage_root=tmp_path,
+        blender_binary="/bin/true",
+        default_device="AUTO",
+        gpu_order=["CPU"],
+        disable_worker=True,
+        session_cookie_name="renderfarm_session",
+        session_ttl_hours=24,
+        auth_cookie_secure="false",
+        admin_panel_path="control-tower",
+        admin_bootstrap_username=None,
+        admin_bootstrap_password=None,
+        allow_signups=True,
+        trusted_proxies=[],
+    )
+    store = JobStore(settings.database_path)
+    runner = RenderRunner(settings, store)
+    output_dir = settings.jobs_root / "step-video" / "outputs"
+    source_path = tmp_path / "scene.blend"
+    source_path.write_bytes(b"blend-data")
+    job = JobRecord(
+        id="step-video",
+        user_id=1,
+        file_id="file001",
+        source_filename="scene.blend",
+        source_path=str(source_path),
+        output_directory=str(output_dir),
+        render_mode=RenderMode.animation,
+        output_format=OutputFormat.png,
+        requested_device=RenderDevice.auto,
+        render_settings=RenderSettings(frame_step=2),
+        start_frame=1,
+        end_frame=24,
+        total_frames=12,
+    )
+    frames = [(frame, output_dir / f"{frame:05d}.png") for frame in range(1, 24, 2)]
+
+    durations = runner._video_frame_durations(job, frames, 24.0)
+
+    assert len(durations) == 12
+    assert abs(sum(durations) - 1.0) < 0.000001
+    assert durations[0] == 2 / 24
+    assert durations[-1] == 2 / 24
+
+
+def test_camera_named_videos_does_not_collide_with_video_folder(tmp_path: Path) -> None:
+    settings = Settings(
+        storage_root=tmp_path,
+        blender_binary="/bin/true",
+        default_device="AUTO",
+        gpu_order=["CPU"],
+        disable_worker=True,
+        session_cookie_name="renderfarm_session",
+        session_ttl_hours=24,
+        auth_cookie_secure="false",
+        admin_panel_path="control-tower",
+        admin_bootstrap_username=None,
+        admin_bootstrap_password=None,
+        allow_signups=True,
+        trusted_proxies=[],
+    )
+    store = JobStore(settings.database_path)
+    runner = RenderRunner(settings, store)
+    output_dir = settings.jobs_root / "reserved-video" / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source_path = tmp_path / "scene.blend"
+    source_path.write_bytes(b"blend-data")
+    job = JobRecord(
+        id="reserved-video",
+        user_id=1,
+        file_id="file001",
+        source_filename="scene.blend",
+        source_path=str(source_path),
+        output_directory=str(output_dir),
+        render_mode=RenderMode.still,
+        output_format=OutputFormat.png,
+        requested_device=RenderDevice.auto,
+        camera_names=["videos"],
+        frame=1,
+        total_frames=1,
+    )
+
+    output_pattern = runner._output_pattern(job, "videos", 0, 1)
+    output_path = Path(output_pattern.replace("#####", "00001") + ".png")
+    output_path.write_bytes(b"image")
+
+    assert output_path.relative_to(output_dir).as_posix() == "videos_Camera/scene_videos_Camera_00001.png"
+    assert runner._relative_output_paths(output_dir, runner._collect_outputs(output_dir)) == [
+        "videos_Camera/scene_videos_Camera_00001.png"
+    ]
+
 
 def test_auto_device_retries_cpu_when_cuda_error_scrolls_out_of_tail(
     tmp_path: Path,

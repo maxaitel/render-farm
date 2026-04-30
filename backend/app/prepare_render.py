@@ -39,6 +39,14 @@ def apply_render_settings(settings: dict) -> None:
     if isinstance(frame_step, int) and frame_step > 0:
         scene.frame_step = frame_step
 
+    fps = settings.get("fps")
+    if isinstance(fps, int) and fps > 0:
+        render.fps = fps
+
+    fps_base = settings.get("fps_base")
+    if isinstance(fps_base, (int, float)) and fps_base > 0:
+        render.fps_base = fps_base
+
     film_transparent = settings.get("film_transparent")
     if isinstance(film_transparent, bool):
         render.film_transparent = film_transparent

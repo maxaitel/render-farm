@@ -68,6 +68,9 @@ class RenderSettings(BaseModel):
     resolution_y: int | None = None
     resolution_percentage: int | None = None
     frame_step: int | None = None
+    fps: int | None = None
+    fps_base: float | None = None
+    frame_rate: float | None = None
     film_transparent: bool | None = None
     view_transform: str | None = None
     look: str | None = None

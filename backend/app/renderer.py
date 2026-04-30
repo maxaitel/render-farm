@@ -33,6 +33,8 @@ SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 RENDER_FARM_EVENT_PREFIX = "RENDER_FARM_EVENT "
 LOG_FLUSH_INTERVAL_SECONDS = 0.5
 LOG_FLUSH_LINE_COUNT = 25
+VIDEO_DIRECTORY_NAME = "videos"
+SCENE_INFO_FILENAME = "render-info.json"
 
 
 @dataclass(slots=True)
@@ -119,16 +121,53 @@ class RenderRunner:
                     packaging = await self.store.mutate(job_id, self._mark_packaging)
                     if packaging.phase != JobPhase.packaging:
                         return
-                    archive_started_at = monotonic()
-                    archive_path = await self._create_archive(packaging, outputs)
-                    await self.store.append_log(
-                        job_id,
-                        self._perf_log(
-                            "archive.created",
-                            duration_seconds=monotonic() - archive_started_at,
-                            count=len(outputs),
-                        ),
-                    )
+                    try:
+                        video_started_at = monotonic()
+                        video_outputs = await self._create_videos(packaging)
+                        await self.store.append_log(
+                            job_id,
+                            self._perf_log(
+                                "videos.created",
+                                duration_seconds=monotonic() - video_started_at,
+                                count=len(video_outputs),
+                            ),
+                        )
+                        archive_outputs = sorted([*outputs, *video_outputs])
+                        archive_started_at = monotonic()
+                        archive_path = await self._create_archive(packaging, archive_outputs)
+                        await self.store.append_log(
+                            job_id,
+                            self._perf_log(
+                                "archive.created",
+                                duration_seconds=monotonic() - archive_started_at,
+                                count=len(archive_outputs),
+                            ),
+                        )
+                    except Exception as exc:
+                        reason = str(exc) or "Packaging render outputs failed."
+                        failed = await self.store.mutate(
+                            job_id,
+                            lambda item, message=reason: self._mark_failed(item, message),
+                        )
+                        await self.store.append_log(job_id, f"Packaging failed: {reason}")
+                        await self.store.append_log(
+                            job_id,
+                            self._perf_log(
+                                "job.finished",
+                                duration_seconds=monotonic() - job_started_at,
+                                phase=failed.phase.value,
+                            ),
+                        )
+                        await self.store.create_activity(
+                            event_type="render.failed",
+                            description=f"Render {failed.id} failed.",
+                            actor_user_id=failed.user_id,
+                            subject_user_id=failed.user_id,
+                            file_id=failed.file_id,
+                            job_id=failed.id,
+                            metadata={"error": failed.error},
+                        )
+                        return
                     completed = await self.store.mutate(
                         job_id,
                         lambda item,
@@ -825,6 +864,7 @@ class RenderRunner:
             "start_frame": 1 if job.start_frame is None else job.start_frame,
             "end_frame": job.end_frame,
             "frame_step": max(1, job.render_settings.frame_step or 1),
+            "scene_info_path": str(self._scene_info_path(job)),
             "total_cameras": max(1, len(requested_cameras)),
             "cameras": [
                 {
@@ -1114,8 +1154,201 @@ class RenderRunner:
         return sorted(
             path
             for path in output_dir.rglob("*")
-            if path.is_file() and path.name not in {"metadata.json", "render-settings.json"}
+            if path.is_file()
+            and path.name not in {"metadata.json", "render-settings.json"}
+            and not self._is_video_output(output_dir, path)
         )
+
+    def _collect_video_outputs(self, output_dir: Path) -> list[Path]:
+        video_root = output_dir / VIDEO_DIRECTORY_NAME
+        if not video_root.exists():
+            return []
+        return sorted(path for path in video_root.rglob("*.mp4") if path.is_file())
+
+    def _is_video_output(self, output_dir: Path, output: Path) -> bool:
+        try:
+            return output.relative_to(output_dir).parts[:1] == (VIDEO_DIRECTORY_NAME,)
+        except ValueError:
+            return False
+
+    async def _create_videos(self, job: JobRecord) -> list[Path]:
+        if job.render_mode != RenderMode.animation or self._total_frames(job) <= 1:
+            return self._collect_video_outputs(job.output_dir)
+
+        frame_rate = self._video_frame_rate(job)
+        video_outputs: list[Path] = []
+        for camera_name in self._requested_cameras(job):
+            frames = self._camera_frame_sequence(job, camera_name)
+            if len(frames) < 2:
+                continue
+            output_path = self._video_output_path(job, camera_name)
+            if not output_path.exists():
+                await self._create_camera_video(output_path, frames, frame_rate, job)
+            video_outputs.append(output_path)
+        return sorted(video_outputs)
+
+    def _camera_frame_sequence(
+        self,
+        job: JobRecord,
+        camera_name: str | None,
+    ) -> list[tuple[int, Path]]:
+        frames: list[tuple[int, Path]] = []
+        missing_frames: list[int] = []
+        for frame_number in self._frame_numbers(job):
+            relative_path = self._expected_output_relative(job, camera_name, frame_number)
+            if relative_path is None:
+                continue
+            output_path = job.output_dir / relative_path
+            if output_path.exists() and output_path.is_file():
+                frames.append((frame_number, output_path))
+            else:
+                missing_frames.append(frame_number)
+
+        if missing_frames:
+            camera_label = self._camera_log_value(camera_name)
+            preview = ", ".join(str(frame) for frame in missing_frames[:5])
+            if len(missing_frames) > 5:
+                preview = f"{preview}, ..."
+            raise RuntimeError(
+                f"Cannot create video for {camera_label}; missing rendered frames: {preview}."
+            )
+        return frames
+
+    async def _create_camera_video(
+        self,
+        output_path: Path,
+        frames: list[tuple[int, Path]],
+        frame_rate: float,
+        job: JobRecord,
+    ) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        concat_path = output_path.with_suffix(".ffconcat")
+        concat_path.write_text(
+            self._video_concat_manifest(job, frames, frame_rate),
+            encoding="utf-8",
+        )
+        command = [
+            self.settings.ffmpeg_binary,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_path),
+            "-vf",
+            "scale=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-r",
+            self._ffmpeg_number(frame_rate),
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        try:
+            await self._run_video_command(command, output_path)
+        finally:
+            with suppress(FileNotFoundError):
+                concat_path.unlink()
+
+    async def _run_video_command(self, command: list[str], output_path: Path) -> None:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"FFmpeg binary not found: {self.settings.ffmpeg_binary}.") from exc
+
+        stdout, _ = await process.communicate()
+        output = stdout.decode("utf-8", errors="replace").strip()
+        if process.returncode == 0:
+            return
+
+        details = "\n".join(output.splitlines()[-8:]).strip()
+        message = details or f"ffmpeg exited with code {process.returncode}."
+        raise RuntimeError(f"FFmpeg failed creating {output_path.name}: {message}")
+
+    def _video_concat_manifest(
+        self,
+        job: JobRecord,
+        frames: list[tuple[int, Path]],
+        frame_rate: float,
+    ) -> str:
+        lines: list[str] = ["ffconcat version 1.0"]
+        durations = self._video_frame_durations(job, frames, frame_rate)
+        for (_, frame_path), duration in zip(frames, durations, strict=True):
+            lines.append(f"file {shlex.quote(str(frame_path))}")
+            lines.append(f"duration {self._ffmpeg_number(duration)}")
+        lines.append(f"file {shlex.quote(str(frames[-1][1]))}")
+        return "\n".join(lines) + "\n"
+
+    def _video_frame_durations(
+        self,
+        job: JobRecord,
+        frames: list[tuple[int, Path]],
+        frame_rate: float,
+    ) -> list[float]:
+        durations: list[float] = []
+        for index, (frame_number, _) in enumerate(frames):
+            if index < len(frames) - 1:
+                frame_span = max(1, frames[index + 1][0] - frame_number)
+            else:
+                end_frame = frame_number if job.end_frame is None else job.end_frame
+                frame_span = max(1, end_frame - frame_number + 1)
+            durations.append(frame_span / frame_rate)
+        return durations
+
+    def _video_frame_rate(self, job: JobRecord) -> float:
+        scene_info = self._read_scene_info(job)
+        for source in (
+            scene_info,
+            job.render_settings.model_dump(mode="json", exclude_none=True),
+        ):
+            frame_rate = source.get("frame_rate")
+            if isinstance(frame_rate, (int, float)) and frame_rate > 0:
+                return float(frame_rate)
+            fps = source.get("fps")
+            fps_base = source.get("fps_base")
+            if (
+                isinstance(fps, (int, float))
+                and isinstance(fps_base, (int, float))
+                and fps > 0
+                and fps_base > 0
+            ):
+                return float(fps) / float(fps_base)
+        return 24.0
+
+    def _read_scene_info(self, job: JobRecord) -> dict:
+        scene_info_path = self._scene_info_path(job)
+        if not scene_info_path.exists():
+            return {}
+        try:
+            payload = json.loads(scene_info_path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _scene_info_path(self, job: JobRecord) -> Path:
+        return job.output_dir.parent / SCENE_INFO_FILENAME
+
+    def _video_output_path(self, job: JobRecord, camera_name: str | None) -> Path:
+        safe_camera = self._safe_camera_output_name(camera_name)
+        safe_job = self._safe_output_name(Path(job.source_filename).stem, "render")
+        return job.output_dir / VIDEO_DIRECTORY_NAME / safe_camera / f"{safe_job}_{safe_camera}.mp4"
+
+    def _ffmpeg_number(self, value: float) -> str:
+        text = f"{value:.6f}".rstrip("0").rstrip(".")
+        return text or "0"
 
     async def _create_archive(self, job: JobRecord, outputs: Iterable[Path]) -> str | None:
         files = list(outputs)
@@ -1147,7 +1380,12 @@ class RenderRunner:
 
     async def create_archive_for_job(self, job: JobRecord) -> str | None:
         outputs = self._collect_outputs(job.output_dir)
-        return await self._create_archive(job, outputs)
+        video_outputs = (
+            await self._create_videos(job)
+            if job.phase == JobPhase.completed
+            else self._collect_video_outputs(job.output_dir)
+        )
+        return await self._create_archive(job, [*outputs, *video_outputs])
 
     def _total_frames(self, job: JobRecord) -> int:
         if job.render_mode == RenderMode.still:
@@ -1204,7 +1442,7 @@ class RenderRunner:
         total_cameras: int,
     ) -> str:
         del camera_index, total_cameras
-        safe_camera = self._safe_output_name(camera_name or "Default Camera", "Default_Camera")
+        safe_camera = self._safe_camera_output_name(camera_name)
         safe_job = self._safe_output_name(Path(job.source_filename).stem, "render")
         camera_dir = job.output_dir / safe_camera
         camera_dir.mkdir(parents=True, exist_ok=True)
@@ -1218,7 +1456,7 @@ class RenderRunner:
     ) -> str | None:
         if frame is None:
             return None
-        safe_camera = self._safe_output_name(camera_name or "Default Camera", "Default_Camera")
+        safe_camera = self._safe_camera_output_name(camera_name)
         safe_job = self._safe_output_name(Path(job.source_filename).stem, "render")
         extension = {
             "PNG": "png",
@@ -1270,8 +1508,14 @@ class RenderRunner:
         cleaned = SAFE_NAME_RE.sub("_", value).strip("._-")
         return cleaned or fallback
 
+    def _safe_camera_output_name(self, camera_name: str | None) -> str:
+        safe_camera = self._safe_output_name(camera_name or "Default Camera", "Default_Camera")
+        if safe_camera.lower() == VIDEO_DIRECTORY_NAME:
+            return f"{safe_camera}_Camera"
+        return safe_camera
+
     def _camera_log_value(self, camera_name: str | None) -> str:
-        return self._safe_output_name(camera_name or "Default Camera", "Default_Camera")
+        return self._safe_camera_output_name(camera_name)
 
     def _perf_log(
         self,

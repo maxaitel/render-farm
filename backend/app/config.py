@@ -27,6 +27,7 @@ class Settings:
     allow_signups: bool
     trusted_proxies: list[str]
     cycles_print_stats: bool = False
+    ffmpeg_binary: str = "ffmpeg"
 
     @property
     def database_path(self) -> Path:
@@ -70,4 +71,5 @@ def load_settings() -> Settings:
         allow_signups=_parse_bool(os.getenv("ALLOW_SIGNUPS"), default=True),
         trusted_proxies=trusted_proxies,
         cycles_print_stats=_parse_bool(os.getenv("BLENDER_CYCLES_PRINT_STATS")),
+        ffmpeg_binary=os.getenv("FFMPEG_BINARY", "ffmpeg"),
     )

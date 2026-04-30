@@ -59,6 +59,28 @@ def set_output_format(output_format: str) -> None:
     render.use_file_extension = True
 
 
+def scene_info_payload() -> dict[str, Any]:
+    scene = bpy.context.scene
+    render = scene.render
+    fps = int(render.fps)
+    fps_base = float(render.fps_base or 1.0)
+    return {
+        "fps": fps,
+        "fps_base": fps_base,
+        "frame_rate": fps / fps_base,
+        "frame_step": int(scene.frame_step),
+    }
+
+
+def write_scene_info(plan: dict[str, Any], payload: dict[str, Any]) -> None:
+    scene_info_path = plan.get("scene_info_path")
+    if not isinstance(scene_info_path, str) or not scene_info_path:
+        return
+    path = Path(scene_info_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def set_camera(camera_name: str | None) -> str | None:
     if not camera_name:
         camera = bpy.context.scene.camera
@@ -114,11 +136,16 @@ def main() -> None:
     plan = json.loads(Path(args.render_plan).read_text("utf-8"))
     configure_cycles_device(str(plan["device"]))
     set_output_format(str(plan["output_format"]))
+    scene_info = scene_info_payload()
+    write_scene_info(plan, scene_info)
 
     emit(
         "batch_started",
         device=plan["device"],
         cameras=len(plan["cameras"]),
+        fps=scene_info["fps"],
+        fps_base=scene_info["fps_base"],
+        frame_rate=scene_info["frame_rate"],
         render_mode=plan["render_mode"],
     )
     for camera in plan["cameras"]:

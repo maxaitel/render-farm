@@ -61,6 +61,8 @@ def render_settings_payload(scene: bpy.types.Scene) -> dict:
     cycles = getattr(scene, "cycles", None)
     simplify = render
     view_settings = scene.view_settings
+    fps = int(render.fps)
+    fps_base = float(render.fps_base or 1.0)
     return {
         "render_engine": render.engine,
         "output_format": render.image_settings.file_format,
@@ -70,6 +72,9 @@ def render_settings_payload(scene: bpy.types.Scene) -> dict:
         "resolution_y": render.resolution_y,
         "resolution_percentage": render.resolution_percentage,
         "frame_step": scene.frame_step,
+        "fps": fps,
+        "fps_base": fps_base,
+        "frame_rate": fps / fps_base,
         "film_transparent": render.film_transparent,
         "view_transform": view_settings.view_transform,
         "look": view_settings.look,

@@ -119,6 +119,12 @@ def positive_or_none(value: int | None) -> int | None:
     return max(1, value)
 
 
+def positive_float_or_none(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return value if value > 0 else None
+
+
 def bounded_or_none(value: int | None, low: int, high: int) -> int | None:
     if value is None:
         return None
@@ -778,6 +784,9 @@ async def create_file_run(
     resolution_y: int | None = Form(None),
     resolution_percentage: int | None = Form(None),
     frame_step: int | None = Form(None),
+    fps: int | None = Form(None),
+    fps_base: float | None = Form(None),
+    frame_rate: float | None = Form(None),
     film_transparent: bool | None = Form(None),
     view_transform: str | None = Form(None),
     look: str | None = Form(None),
@@ -805,6 +814,9 @@ async def create_file_run(
         resolution_y=positive_or_none(resolution_y),
         resolution_percentage=bounded_or_none(resolution_percentage, 1, 100),
         frame_step=positive_or_none(frame_step),
+        fps=positive_or_none(fps),
+        fps_base=positive_float_or_none(fps_base),
+        frame_rate=positive_float_or_none(frame_rate),
         film_transparent=film_transparent,
         view_transform=view_transform.strip() if view_transform and view_transform.strip() else None,
         look=look.strip() if look and look.strip() else None,

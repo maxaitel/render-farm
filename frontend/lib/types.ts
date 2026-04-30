@@ -26,6 +26,9 @@ export interface RenderSettings {
   resolution_y: number | null;
   resolution_percentage: number | null;
   frame_step: number | null;
+  fps: number | null;
+  fps_base: number | null;
+  frame_rate: number | null;
   film_transparent: boolean | null;
   view_transform: string | null;
   look: string | null;

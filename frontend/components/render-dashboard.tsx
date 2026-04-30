@@ -90,6 +90,9 @@ type JobFormState = {
   resolutionY: number;
   resolutionPercentage: number;
   frameStep: number;
+  fps: number;
+  fpsBase: number;
+  frameRate: number;
   filmTransparent: boolean;
   viewTransform: string;
   look: string;
@@ -118,6 +121,9 @@ const INITIAL_FORM: JobFormState = {
   resolutionY: 1080,
   resolutionPercentage: 100,
   frameStep: 1,
+  fps: 24,
+  fpsBase: 1,
+  frameRate: 24,
   filmTransparent: false,
   viewTransform: "Filmic",
   look: "Medium High Contrast",
@@ -240,7 +246,7 @@ function frameProgressLabel(job: RenderJob) {
 
 function timingSecondaryLabel(job: RenderJob) {
   if (job.phase === "completed") {
-    return "Complete";
+    return "Done";
   }
   if (job.phase === "failed" || job.phase === "cancelled") {
     return job.phase;
@@ -281,6 +287,9 @@ function mergeRenderSettingsIntoForm(
     resolutionPercentage:
       settings.resolution_percentage ?? current.resolutionPercentage,
     frameStep: settings.frame_step ?? current.frameStep,
+    fps: settings.fps ?? current.fps,
+    fpsBase: settings.fps_base ?? current.fpsBase,
+    frameRate: settings.frame_rate ?? current.frameRate,
     filmTransparent: settings.film_transparent ?? current.filmTransparent,
     viewTransform: settings.view_transform || current.viewTransform,
     look: settings.look || current.look,
@@ -2478,6 +2487,9 @@ export function RenderDashboard({
     formData.set("resolution_y", String(form.resolutionY));
     formData.set("resolution_percentage", String(form.resolutionPercentage));
     formData.set("frame_step", String(form.frameStep));
+    formData.set("fps", String(form.fps));
+    formData.set("fps_base", String(form.fpsBase));
+    formData.set("frame_rate", String(form.frameRate));
     formData.set("film_transparent", String(form.filmTransparent));
     formData.set("view_transform", form.viewTransform);
     formData.set("look", form.look);

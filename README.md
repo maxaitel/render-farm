@@ -13,7 +13,7 @@ Containerized Blender render queue. The stack exposes:
 - Lets users rerun the same source scene with different cameras or frame ranges
 - Runs Blender headless with Cycles inside the API container
 - Streams live job updates over SSE
-- Bundles finished output frames for download
+- Bundles finished output frames and per-camera animation MP4s for download
 - Exposes a LAN-only admin panel behind a non-obvious URL slug
 
 ## Run It
@@ -101,6 +101,7 @@ You can change that in [compose.yaml](/home/maxaitel/render-farm/compose.yaml) w
 - `BLENDER_CYCLES_DEVICE`
 - `BLENDER_GPU_ORDER`
 - `BLENDER_CYCLES_PRINT_STATS`
+- `FFMPEG_BINARY`
 - `WEB_PORT`
 - `CADDY_SITE_ADDRESS`
 - `LOCAL_UID`
@@ -137,3 +138,7 @@ Uploaded projects and renders are stored under:
 - `./data/files/<file-id>/source/` for reusable user-owned source trees
 - `./data/jobs/<job-id>/outputs/` for render outputs and archives
 - `./data/renderfarm.sqlite3` for users, sessions, activity, files, and runs
+
+Animation downloads include a `videos/` folder in the archive. Each rendered
+camera gets its own MP4 at `videos/<camera>/<scene>_<camera>.mp4`, encoded at
+the scene frame rate recorded from Blender.

@@ -24,6 +24,7 @@ services:
     environment:
       RENDER_STORAGE_ROOT: /data
       BLENDER_BINARY: /usr/local/bin/blender-wrapper
+      FFMPEG_BINARY: ${FFMPEG_BINARY:-/usr/bin/ffmpeg}
       BLENDER_CYCLES_DEVICE: AUTO
       BLENDER_GPU_ORDER: CUDA,OPTIX,CPU
       BLENDER_CYCLES_PRINT_STATS: ${BLENDER_CYCLES_PRINT_STATS:-false}

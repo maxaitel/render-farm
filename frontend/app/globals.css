@@ -4,6 +4,8 @@
 
 @layer base {
   :root {
+    color-scheme: light;
+    --app-background: 210 40% 98%;
     --background: 0 0% 100%;
     --foreground: 222.2 84% 4.9%;
     --card: 0 0% 100%;
@@ -38,7 +40,8 @@
   }
 
   body {
-    @apply bg-slate-50 text-foreground antialiased;
+    @apply text-foreground antialiased;
+    background: hsl(var(--app-background));
     margin: 0;
     min-height: 100vh;
     font-family: var(--font-body), sans-serif;
@@ -77,7 +80,75 @@
 
 .subtle-panel {
   border: 1px solid hsl(var(--border));
-  background: rgba(255, 255, 255, 0.92);
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  background: hsl(var(--card) / 0.92);
+  box-shadow: 0 1px 2px hsl(222.2 47.4% 11.2% / 0.04);
   backdrop-filter: blur(10px);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --app-background: 222 24% 7%;
+    --background: 222 22% 10%;
+    --foreground: 210 40% 96%;
+    --card: 222 20% 12%;
+    --card-foreground: 210 40% 96%;
+    --popover: 222 20% 12%;
+    --popover-foreground: 210 40% 96%;
+    --primary: 210 40% 96%;
+    --primary-foreground: 222.2 47.4% 11.2%;
+    --secondary: 217 19% 18%;
+    --secondary-foreground: 210 40% 96%;
+    --muted: 217 19% 18%;
+    --muted-foreground: 215 18% 70%;
+    --accent: 217 19% 20%;
+    --accent-foreground: 210 40% 96%;
+    --destructive: 2 72% 48%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 18% 24%;
+    --input: 217 18% 24%;
+    --ring: 213 94% 68%;
+  }
+
+  .subtle-panel {
+    box-shadow: 0 1px 2px hsl(222 47% 3% / 0.36);
+  }
+
+  .bg-emerald-50 {
+    background-color: hsl(158 64% 15% / 0.72);
+  }
+
+  .border-emerald-200 {
+    border-color: hsl(156 54% 35% / 0.7);
+  }
+
+  .text-emerald-700 {
+    color: hsl(152 76% 80%);
+  }
+
+  .bg-amber-50 {
+    background-color: hsl(38 78% 16% / 0.72);
+  }
+
+  .border-amber-200 {
+    border-color: hsl(39 70% 36% / 0.72);
+  }
+
+  .text-amber-700,
+  .text-amber-800 {
+    color: hsl(43 96% 78%);
+  }
+
+  .bg-rose-50 {
+    background-color: hsl(354 64% 17% / 0.72);
+  }
+
+  .border-rose-200 {
+    border-color: hsl(351 57% 36% / 0.72);
+  }
+
+  .text-rose-700,
+  .text-rose-800 {
+    color: hsl(354 90% 82%);
+  }
 }
