@@ -210,6 +210,27 @@ function outputUrl(job: RenderJob, outputPath: string) {
     .join("/")}`;
 }
 
+function outputArchiveUrl(job: RenderJob) {
+  return `/backend/api/jobs/${job.id}/download`;
+}
+
+function videoArchiveUrl(job: RenderJob) {
+  return `/backend/api/jobs/${job.id}/download/videos`;
+}
+
+function canDownloadOutputs(job: RenderJob) {
+  return Boolean(job.archive_path || job.outputs.length);
+}
+
+function canDownloadVideos(job: RenderJob) {
+  return (
+    canDownloadOutputs(job) &&
+    job.render_mode === "animation" &&
+    job.phase === "completed" &&
+    job.total_frames > 1
+  );
+}
+
 function isPreviewableOutput(outputPath: string) {
   return /\.(png|jpe?g|webp)$/i.test(outputPath);
 }
@@ -1075,11 +1096,19 @@ function JobProgressPanel({
       ) : null}
 
       <div className="flex flex-wrap gap-2">
-        {job.archive_path || job.outputs.length ? (
+        {canDownloadOutputs(job) ? (
           <Button asChild size="sm" variant="outline">
-            <a href={`/backend/api/jobs/${job.id}/download`}>
+            <a href={outputArchiveUrl(job)}>
               <Download />
-              Download {job.phase === "completed" ? "zip" : "partial zip"}
+              {job.phase === "completed" ? "Full zip" : "Partial zip"}
+            </a>
+          </Button>
+        ) : null}
+        {canDownloadVideos(job) ? (
+          <Button asChild size="sm" variant="outline">
+            <a href={videoArchiveUrl(job)}>
+              <Download />
+              Videos zip
             </a>
           </Button>
         ) : null}
@@ -1731,11 +1760,19 @@ function FileDetailView({
                       </p>
                     </div>
                     <div className="flex flex-wrap gap-2 md:justify-end">
-                      {job.archive_path || job.outputs.length ? (
+                      {canDownloadOutputs(job) ? (
                         <Button asChild size="sm" variant="outline">
-                          <a href={`/backend/api/jobs/${job.id}/download`}>
+                          <a href={outputArchiveUrl(job)}>
                             <Download />
-                            Download
+                            {job.phase === "completed" ? "Full zip" : "Partial zip"}
+                          </a>
+                        </Button>
+                      ) : null}
+                      {canDownloadVideos(job) ? (
+                        <Button asChild size="sm" variant="outline">
+                          <a href={videoArchiveUrl(job)}>
+                            <Download />
+                            Videos zip
                           </a>
                         </Button>
                       ) : null}
@@ -1993,11 +2030,19 @@ function AdminView({
                     {formatTimestamp(job.last_progress_at)}
                   </p>
                   <div className="mt-3 flex flex-wrap gap-2">
-                    {job.archive_path || job.outputs.length ? (
+                    {canDownloadOutputs(job) ? (
                       <Button asChild size="sm" variant="outline">
-                        <a href={`/backend/api/jobs/${job.id}/download`}>
+                        <a href={outputArchiveUrl(job)}>
                           <Download />
-                          Outputs
+                          {job.phase === "completed" ? "Full zip" : "Partial zip"}
+                        </a>
+                      </Button>
+                    ) : null}
+                    {canDownloadVideos(job) ? (
+                      <Button asChild size="sm" variant="outline">
+                        <a href={videoArchiveUrl(job)}>
+                          <Download />
+                          Videos zip
                         </a>
                       </Button>
                     ) : null}

@@ -1358,6 +1358,14 @@ class RenderRunner:
         await asyncio.to_thread(self._write_archive, archive_path, job, files)
         return str(archive_path)
 
+    async def _create_video_archive(self, job: JobRecord, outputs: Iterable[Path]) -> str | None:
+        files = list(outputs)
+        if not files:
+            return None
+        archive_path = self.settings.jobs_root / job.id / "videos.zip"
+        await asyncio.to_thread(self._write_video_archive, archive_path, job, files)
+        return str(archive_path)
+
     def _write_archive(self, archive_path: Path, job: JobRecord, outputs: list[Path]) -> None:
         root_name = self._archive_root_name(job)
         with ZipFile(archive_path, "w", compression=self._archive_compression(job)) as zip_file:
@@ -1373,6 +1381,13 @@ class RenderRunner:
                 json.dumps(job.render_settings.model_dump(mode="json"), indent=2, sort_keys=True),
             )
 
+    def _write_video_archive(self, archive_path: Path, job: JobRecord, outputs: list[Path]) -> None:
+        root_name = self._archive_root_name(job)
+        with ZipFile(archive_path, "w", compression=ZIP_STORED) as zip_file:
+            for output in outputs:
+                relative_path = self._relative_output_path(job.output_dir, output)
+                zip_file.write(output, arcname=f"{root_name}/{relative_path}")
+
     def _archive_compression(self, job: JobRecord) -> int:
         if job.output_format.value in {"PNG", "JPEG"}:
             return ZIP_STORED
@@ -1386,6 +1401,14 @@ class RenderRunner:
             else self._collect_video_outputs(job.output_dir)
         )
         return await self._create_archive(job, [*outputs, *video_outputs])
+
+    async def create_video_archive_for_job(self, job: JobRecord) -> str | None:
+        video_outputs = (
+            await self._create_videos(job)
+            if job.phase == JobPhase.completed
+            else self._collect_video_outputs(job.output_dir)
+        )
+        return await self._create_video_archive(job, video_outputs)
 
     def _total_frames(self, job: JobRecord) -> int:
         if job.render_mode == RenderMode.still:

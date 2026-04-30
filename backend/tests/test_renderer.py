@@ -299,6 +299,70 @@ def test_animation_archive_adds_per_camera_videos_without_counting_them_as_frame
     asyncio.run(scenario())
 
 
+def test_video_archive_contains_only_mp4_video_folder(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        settings = Settings(
+            storage_root=tmp_path,
+            blender_binary="/bin/true",
+            default_device="AUTO",
+            gpu_order=["CPU"],
+            disable_worker=True,
+            session_cookie_name="renderfarm_session",
+            session_ttl_hours=24,
+            auth_cookie_secure="false",
+            admin_panel_path="control-tower",
+            admin_bootstrap_username=None,
+            admin_bootstrap_password=None,
+            allow_signups=True,
+            trusted_proxies=[],
+        )
+        store = JobStore(settings.database_path)
+        runner = RenderRunner(settings, store)
+        job_id = "video-archive"
+        output_dir = settings.jobs_root / job_id / "outputs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        source_path = tmp_path / "scene.blend"
+        source_path.write_bytes(b"blend-data")
+
+        job = JobRecord(
+            id=job_id,
+            user_id=1,
+            file_id="file-video",
+            source_filename="scene.blend",
+            source_path=str(source_path),
+            output_directory=str(output_dir),
+            render_mode=RenderMode.animation,
+            output_format=OutputFormat.png,
+            render_settings=RenderSettings(frame_step=1),
+            requested_device=RenderDevice.auto,
+            camera_names=["Cam A"],
+            start_frame=1,
+            end_frame=2,
+            total_frames=2,
+            total_outputs_expected=2,
+        )
+        job.phase = JobPhase.completed
+
+        for frame in range(1, 3):
+            frame_path = output_dir / "Cam_A" / f"scene_Cam_A_{frame:05d}.png"
+            frame_path.parent.mkdir(parents=True, exist_ok=True)
+            frame_path.write_bytes(f"frame-{frame}".encode("utf-8"))
+
+        video_path = output_dir / "videos" / "Cam_A" / "scene_Cam_A.mp4"
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        video_path.write_bytes(b"fake-mp4")
+        (video_path.parent / "notes.txt").write_text("not an mp4", encoding="utf-8")
+
+        archive_path = await runner.create_video_archive_for_job(job)
+
+        assert archive_path is not None
+        with ZipFile(Path(archive_path)) as archive:
+            assert archive.namelist() == ["scene/videos/Cam_A/scene_Cam_A.mp4"]
+            assert archive.read("scene/videos/Cam_A/scene_Cam_A.mp4") == b"fake-mp4"
+
+    asyncio.run(scenario())
+
+
 def test_video_frame_durations_keep_stepped_animation_realtime(tmp_path: Path) -> None:
     settings = Settings(
         storage_root=tmp_path,

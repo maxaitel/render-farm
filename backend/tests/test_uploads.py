@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from io import BytesIO
 import os
 import sqlite3
 from pathlib import Path
+from zipfile import ZipFile
 
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.models import JobPhase
 
 
 def _set_test_env(
@@ -288,6 +291,85 @@ def test_animation_run_defaults_to_frame_one_when_start_is_omitted(tmp_path: Pat
             assert run_payload["start_frame"] == 1
             assert run_payload["end_frame"] == 60
             assert run_payload["total_frames"] == 60
+    finally:
+        _restore_env(previous)
+
+
+def test_user_can_download_video_archive_for_completed_animation(tmp_path: Path) -> None:
+    previous = _set_test_env(tmp_path)
+    try:
+        with _client() as client:
+            create_user_response = client.post(
+                "/api/auth/sign-up",
+                json={"username": "artist_video_zip", "password": "artist-password-999"},
+            )
+            assert create_user_response.status_code == 200
+            pending_user_id = create_user_response.json()["user"]["id"]
+
+            _sign_in(client, "admin", "admin-password-123")
+            approve_response = client.post(
+                f"/api/admin/users/{pending_user_id}/status",
+                json={"status": "approved"},
+                headers={"x-forwarded-for": "127.0.0.1"},
+            )
+            assert approve_response.status_code == 200
+
+        with _client() as user_client:
+            _sign_in(user_client, "artist_video_zip", "artist-password-999")
+
+            upload_response = user_client.post(
+                "/api/files",
+                data={"blend_file_path": "Scene Video.blend"},
+                files=[("blend_file", ("Scene Video.blend", b"blend-bytes", "application/octet-stream"))],
+            )
+            assert upload_response.status_code == 200, upload_response.text
+            file_payload = upload_response.json()
+
+            run_response = user_client.post(
+                f"/api/files/{file_payload['id']}/runs",
+                data={
+                    "render_mode": "animation",
+                    "output_format": "PNG",
+                    "start_frame": "1",
+                    "end_frame": "2",
+                },
+            )
+            assert run_response.status_code == 200, run_response.text
+            run_payload = run_response.json()
+
+            state = app.state.runtime
+            job = state.store._jobs[run_payload["id"]]
+            for frame in range(1, 3):
+                relative_output = state.runner._expected_output_relative(job, None, frame)
+                assert relative_output is not None
+                output_path = job.output_dir / relative_output
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(f"frame-{frame}".encode("utf-8"))
+            video_path = state.runner._video_output_path(job, None)
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            video_path.write_bytes(b"fake-mp4")
+            (video_path.parent / "notes.txt").write_text("not an mp4", encoding="utf-8")
+
+            job.phase = JobPhase.completed
+            job.outputs = state.runner._relative_output_paths(
+                job.output_dir,
+                state.runner._collect_outputs(job.output_dir),
+            )
+            job.completed_frames = len(job.outputs)
+            job.total_outputs_expected = len(job.outputs)
+
+            download_response = user_client.get(f"/api/jobs/{run_payload['id']}/download/videos")
+            assert download_response.status_code == 200, download_response.text
+            assert download_response.headers["content-type"] == "application/zip"
+            assert (
+                download_response.headers["content-disposition"]
+                == f'attachment; filename="{run_payload["id"]}-videos.zip"'
+            )
+            archive_root = state.runner._archive_root_name(job)
+            video_relative = state.runner._relative_output_path(job.output_dir, video_path)
+            with ZipFile(BytesIO(download_response.content)) as archive:
+                assert archive.namelist() == [f"{archive_root}/{video_relative}"]
+                assert archive.read(f"{archive_root}/{video_relative}") == b"fake-mp4"
     finally:
         _restore_env(previous)
 

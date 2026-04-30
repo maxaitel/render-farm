@@ -943,6 +943,24 @@ async def download_outputs(job_id: str, user: UserRecord = Depends(require_appro
     )
 
 
+@app.get("/api/jobs/{job_id}/download/videos")
+async def download_video_outputs(job_id: str, user: UserRecord = Depends(require_approved_user)) -> FileResponse:
+    state = runtime_state()
+    job = await state.store.get(job_id)
+    job = ensure_job_access(job, user)
+    archive_path_value = await state.runner.create_video_archive_for_job(job)
+    if not archive_path_value:
+        raise HTTPException(status_code=404, detail="Video archive not available for this run.")
+    archive_path = Path(archive_path_value)
+    if not archive_path.exists():
+        raise HTTPException(status_code=404, detail="Video archive file missing.")
+    return FileResponse(
+        archive_path,
+        media_type="application/zip",
+        filename=f"{job.id}-videos.zip",
+    )
+
+
 @app.get("/api/jobs/{job_id}/outputs/{output_path:path}")
 async def get_output_file(
     job_id: str,
