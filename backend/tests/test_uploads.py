@@ -146,6 +146,7 @@ def test_admin_can_approve_user_upload_scene_and_queue_run(tmp_path: Path) -> No
                     "use_denoising": "true",
                     "film_transparent": "true",
                     "frame_step": "2",
+                    "image_quality": "90",
                 },
             )
             assert run_response.status_code == 200, run_response.text
@@ -159,6 +160,7 @@ def test_admin_can_approve_user_upload_scene_and_queue_run(tmp_path: Path) -> No
             assert run_payload["render_settings"]["resolution_percentage"] == 50
             assert run_payload["render_settings"]["use_denoising"] is True
             assert run_payload["render_settings"]["film_transparent"] is True
+            assert run_payload["render_settings"]["image_quality"] == 100
             assert run_payload["total_cameras"] == 2
             assert run_payload["total_outputs_expected"] == 2
 
@@ -169,6 +171,7 @@ def test_admin_can_approve_user_upload_scene_and_queue_run(tmp_path: Path) -> No
             assert listed_files[0]["jobs"][0]["id"] == run_payload["id"]
             assert listed_files[0]["render_settings"]["samples"] == 64
             assert listed_files[0]["render_settings"]["output_format"] == "PNG"
+            assert listed_files[0]["render_settings"]["image_quality"] == 100
 
         with _client() as admin_client:
             _sign_in(admin_client, "admin", "admin-password-123")

@@ -42,6 +42,7 @@ from .store import JobStore
 
 FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+IMAGE_QUALITY_OVERRIDE = 100
 
 
 class SignUpRequest(BaseModel):
@@ -148,6 +149,16 @@ def compact_render_settings(settings: RenderSettings) -> RenderSettings:
 
 def render_settings_payload(settings: RenderSettings) -> dict:
     return settings.model_dump(mode="json", exclude_none=True)
+
+
+def apply_image_quality_override_to_inspection(payload: dict) -> None:
+    image_settings = payload.get("image_settings")
+    if isinstance(image_settings, dict):
+        image_settings["quality"] = IMAGE_QUALITY_OVERRIDE
+
+    render_settings = payload.get("render_settings")
+    if isinstance(render_settings, dict):
+        render_settings["image_quality"] = IMAGE_QUALITY_OVERRIDE
 
 
 def frame_numbers_for_run(render_mode: RenderMode, frame: int | None, start_frame: int | None, end_frame: int | None, frame_step: int | None) -> list[int]:
@@ -442,6 +453,7 @@ async def create_render_run(
 ) -> JobRecord:
     state = runtime_state()
     render_settings.output_format = output_format
+    render_settings.image_quality = IMAGE_QUALITY_OVERRIDE
     render_settings = compact_render_settings(render_settings)
     render_settings.frame_step = positive_or_none(render_settings.frame_step)
 
@@ -759,6 +771,7 @@ async def inspect_file(
             payload["render_settings_source"] = "saved"
         else:
             payload["render_settings_source"] = "blend"
+        apply_image_quality_override_to_inspection(payload)
         payload["file_size_bytes"] = file_record.original_size_bytes
         payload["source_filename"] = file_record.source_filename
         payload["processing_status"] = "complete"

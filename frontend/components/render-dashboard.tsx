@@ -108,6 +108,8 @@ type JobFormState = {
   seed: number;
 };
 
+const IMAGE_QUALITY_OVERRIDE = 100;
+
 const INITIAL_FORM: JobFormState = {
   renderMode: "still",
   frame: 1,
@@ -129,7 +131,7 @@ const INITIAL_FORM: JobFormState = {
   look: "Medium High Contrast",
   exposure: 0,
   gamma: 1,
-  imageQuality: 90,
+  imageQuality: IMAGE_QUALITY_OVERRIDE,
   compression: 15,
   useMotionBlur: false,
   useSimplify: false,
@@ -316,7 +318,7 @@ function mergeRenderSettingsIntoForm(
     look: settings.look || current.look,
     exposure: settings.exposure ?? current.exposure,
     gamma: settings.gamma ?? current.gamma,
-    imageQuality: settings.image_quality ?? current.imageQuality,
+    imageQuality: IMAGE_QUALITY_OVERRIDE,
     compression: settings.compression ?? current.compression,
     useMotionBlur: settings.use_motion_blur ?? current.useMotionBlur,
     useSimplify: settings.use_simplify ?? current.useSimplify,
@@ -1608,12 +1610,7 @@ function FileDetailView({
                       min={1}
                       type="number"
                       value={form.imageQuality}
-                      onChange={(event) =>
-                        setForm((current) => ({
-                          ...current,
-                          imageQuality: Number(event.target.value || 90),
-                        }))
-                      }
+                      readOnly
                     />
                   </label>
                   <label className="space-y-2 text-sm font-medium">
@@ -2520,7 +2517,7 @@ export function RenderDashboard({
             resolutionY: payload.resolution.y,
             resolutionPercentage: payload.resolution.percentage,
             frameStep: payload.frame_step,
-            imageQuality: payload.image_settings.quality ?? current.imageQuality,
+            imageQuality: IMAGE_QUALITY_OVERRIDE,
             compression: payload.image_settings.compression ?? current.compression,
           },
           payload.render_settings,
@@ -2566,7 +2563,7 @@ export function RenderDashboard({
     formData.set("look", form.look);
     formData.set("exposure", String(form.exposure));
     formData.set("gamma", String(form.gamma));
-    formData.set("image_quality", String(form.imageQuality));
+    formData.set("image_quality", String(IMAGE_QUALITY_OVERRIDE));
     formData.set("compression", String(form.compression));
     formData.set("use_motion_blur", String(form.useMotionBlur));
     formData.set("use_simplify", String(form.useSimplify));
